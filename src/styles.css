@@ -376,6 +376,39 @@ h2 {
   max-width: 1040px;
 }
 
+.media-drop-overlay {
+  align-items: center;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  border: 2px dashed var(--accent);
+  bottom: 28px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+  left: 28px;
+  position: fixed;
+  right: 28px;
+  top: 28px;
+  z-index: 40;
+}
+
+.media-drop-overlay .action-icon {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+  height: 52px;
+  width: 52px;
+}
+
+.media-drop-overlay strong {
+  font-size: 21px;
+}
+
+.media-drop-overlay small {
+  color: var(--text-secondary);
+}
+
 .welcome {
   max-width: 940px;
 }
@@ -1796,6 +1829,47 @@ input::placeholder {
   padding-top: 18px;
 }
 
+.style-presets > span {
+  color: var(--text-secondary);
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.style-presets > div {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.style-presets button {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  min-height: 56px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.style-presets button:hover {
+  border-color: var(--accent);
+}
+
+.style-presets button strong,
+.style-presets button small {
+  display: block;
+}
+
+.style-presets button strong {
+  font-size: 11px;
+}
+
+.style-presets button small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  margin-top: 3px;
+}
+
 .control-row {
   display: grid;
   gap: 10px;
@@ -2444,6 +2518,62 @@ input::placeholder {
   display: block;
   height: 100%;
   min-width: 2px;
+}
+
+.timeline-cut-list {
+  border-top: 1px solid var(--border-strong);
+  margin-top: 42px;
+  padding-top: 22px;
+}
+
+.timeline-cut-list > header {
+  align-items: end;
+  display: flex;
+  gap: 22px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.timeline-cut-list h3 {
+  font-size: 17px;
+  margin-top: 4px;
+}
+
+.timeline-cut-list > header > small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  text-align: right;
+}
+
+.timeline-cut-list > article {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 110px minmax(0, 1fr) auto;
+  min-height: 58px;
+  padding: 8px 4px;
+}
+
+.timeline-cut-time {
+  color: var(--danger);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-cut-list article strong,
+.timeline-cut-list article small {
+  display: block;
+}
+
+.timeline-cut-list article strong {
+  font-size: 11px;
+}
+
+.timeline-cut-list article small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  margin-top: 3px;
 }
 
 .transcript-paper {
@@ -4021,6 +4151,23 @@ pre.out {
 
   .duration-mark {
     display: none;
+  }
+
+  .timeline-cut-list > header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .timeline-cut-list > header > small {
+    text-align: left;
+  }
+
+  .timeline-cut-list > article {
+    grid-template-columns: 1fr auto;
+  }
+
+  .timeline-cut-time {
+    grid-column: 1 / -1;
   }
 
   .setup-primary {

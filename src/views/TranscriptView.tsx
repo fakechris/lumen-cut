@@ -235,6 +235,11 @@ function friendlyError(error: unknown, lang: Lang) {
       ? "媒体处理失败。请确认文件可以播放，并检查 ffmpeg 环境。"
       : "Media processing failed. Check that the file plays and ffmpeg is available.";
   }
+  if (/previous transcription was interrupted when lumen-cut closed/i.test(raw)) {
+    return lang === "zh"
+      ? "上次转写因 lumen-cut 关闭而中断。点击“重试”可以重新开始，现有项目不会被删除。"
+      : "The previous transcription was interrupted when lumen-cut closed. Retry to start again; the existing project is preserved.";
+  }
   if (/save the current project as a version before switching branches/i.test(raw)) {
     return lang === "zh"
       ? "当前项目有尚未保存的修改。请先在“版本”中保存当前版本，再切换分支。"
@@ -302,6 +307,7 @@ export function TranscriptView({
   const [speakerPreview, setSpeakerPreview] = useState<SpeakerReidentifyPreview | null>(null);
   const [transcriptionJob, setTranscriptionJob] =
     useState<TranscriptionJobStatus | null>(null);
+  const [transcriptionFailure, setTranscriptionFailure] = useState<string | null>(null);
   const [agentConfigured, setAgentConfigured] = useState(false);
   const [asrReadiness, setAsrReadiness] = useState<AsrStatus | null>(null);
   const [versionHistory, setVersionHistory] = useState<VersionHistory | null>(null);
@@ -355,6 +361,7 @@ export function TranscriptView({
     setTaskState(null);
     setOperation(null);
     setTranscriptionJob(null);
+    setTranscriptionFailure(null);
     setVersionHistory(null);
     setSpeakerEvidenceState({ speakers: [], turns: [], identified: false, unlabelled: 0 });
     setSpeakerPreview(null);
@@ -375,6 +382,10 @@ export function TranscriptView({
           if (status.state === "running" || status.state === "cancelling") {
             setTranscriptionJob(status);
             setOperation("transcribe");
+          } else if (status.state === "failed") {
+            const failure = friendlyError(status.error || "Transcription failed", lang);
+            setTranscriptionFailure(failure);
+            setFeedback({ tone: "error", text: failure });
           }
         })
         .catch(() => undefined),
@@ -419,30 +430,36 @@ export function TranscriptView({
           });
           setOperation(null);
           setTranscriptionJob(null);
+          setTranscriptionFailure(null);
           return;
         }
         if (status.state === "cancelled") {
           setFeedback({ tone: "info", text: c.cancelledTranscription });
           setOperation(null);
           setTranscriptionJob(null);
+          setTranscriptionFailure(null);
           return;
         }
         if (status.state === "failed") {
+          const failure = friendlyError(status.error || "Transcription failed", lang);
           setFeedback({
             tone: "error",
-            text: friendlyError(status.error || "Transcription failed", lang),
+            text: failure,
           });
           setOperation(null);
           setTranscriptionJob(null);
+          setTranscriptionFailure(failure);
           return;
         }
         setTranscriptionJob(status);
         timer = window.setTimeout(poll, 500);
       } catch (error) {
         if (disposed) return;
-        setFeedback({ tone: "error", text: friendlyError(error, lang) });
+        const failure = friendlyError(error, lang);
+        setFeedback({ tone: "error", text: failure });
         setOperation(null);
         setTranscriptionJob(null);
+        setTranscriptionFailure(failure);
       }
     };
     timer = window.setTimeout(poll, 350);
@@ -526,6 +543,7 @@ export function TranscriptView({
   const startTranscription = async () => {
     setOperation("transcribe");
     setFeedback(null);
+    setTranscriptionFailure(null);
     try {
       const readiness = await asrStatus();
       setAsrReadiness(readiness);
@@ -542,9 +560,11 @@ export function TranscriptView({
         pid,
       ));
     } catch (error) {
-      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+      const failure = friendlyError(error, lang);
+      setFeedback({ tone: "error", text: failure });
       setOperation(null);
       setTranscriptionJob(null);
+      setTranscriptionFailure(failure);
     }
   };
 
@@ -1063,7 +1083,11 @@ export function TranscriptView({
               ) : (
                 <>
                   <PlayIcon />
-                  {hasTranscript ? (lang === "zh" ? "重新转写" : "Transcribe again") : c.start}
+                  {transcriptionFailure
+                    ? c.retry
+                    : hasTranscript
+                      ? (lang === "zh" ? "重新转写" : "Transcribe again")
+                      : c.start}
                 </>
               )}
             </button>
@@ -1199,7 +1223,13 @@ export function TranscriptView({
       )}
 
       {activeTab === "timeline" && (
-        <TimelineWorkspace cuts={cuts} doc={doc} lang={lang} />
+        <TimelineWorkspace
+          busy={operation !== null}
+          cuts={cuts}
+          doc={doc}
+          lang={lang}
+          onRestoreCut={restoreCut}
+        />
       )}
 
       {activeTab === "broll" && (

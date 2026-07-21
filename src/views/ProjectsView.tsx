@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   pickMediaFile,
   projectCreate,
@@ -58,6 +59,8 @@ const COPY = {
     description: "选择视频或音频，lumen-cut 会建立项目。下一步会清楚告诉你何时开始转写。",
     chooseFile: "选择文件",
     chooseHint: "视频或音频",
+    dropMedia: "松开即可导入媒体",
+    dropMediaHint: "视频或音频会在后台读取，不会阻塞窗口",
     pasteUrl: "粘贴链接",
     urlHint: "YouTube 或媒体 URL",
     record: "录制音频",
@@ -109,6 +112,8 @@ const COPY = {
     description: "Choose a video or audio file and lumen-cut will create a project. The next step makes transcription explicit.",
     chooseFile: "Choose file",
     chooseHint: "Video or audio",
+    dropMedia: "Drop to import media",
+    dropMediaHint: "Video or audio is read in the background without blocking the window",
     pasteUrl: "Paste URL",
     urlHint: "YouTube or media URL",
     record: "Record audio",
@@ -249,6 +254,7 @@ export function ProjectsView({
   const [confirmDeletePid, setConfirmDeletePid] = useState<string | null>(null);
   const [confirmRepairPid, setConfirmRepairPid] = useState<string | null>(null);
   const [projectAction, setProjectAction] = useState<string | null>(null);
+  const [draggingMedia, setDraggingMedia] = useState(false);
   const recordingRef = useRef<ActiveRecording | null>(null);
   const projectRequestRef = useRef(0);
 
@@ -369,18 +375,44 @@ export function ProjectsView({
     [],
   );
 
-  const handleChooseFile = async () => {
+  useEffect(() => {
+    const nativeWindow = window as Window & {
+      __TAURI_INTERNALS__?: { metadata?: unknown };
+    };
+    if (!nativeWindow.__TAURI_INTERNALS__?.metadata) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onDragDropEvent((event) => {
+        if (disposed) return;
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDraggingMedia(true);
+          return;
+        }
+        if (event.payload.type === "leave") {
+          setDraggingMedia(false);
+          return;
+        }
+        setDraggingMedia(false);
+        const path = event.payload.paths[0];
+        if (path && busy === null && recording === null) void createFromPath(path);
+      })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // The browser-only development preview has no native drag/drop source.
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [busy, recording, lang]);
+
+  const createFromPath = async (path: string) => {
     setError(null);
     setMessage(null);
-    let path: string | null;
-    try {
-      path = await pickMediaFile();
-    } catch (nextError) {
-      setError(humanError(nextError, lang));
-      return;
-    }
-    if (!path) return;
-
     setBusy("file");
     try {
       const { pid, title } = identityFrom(path);
@@ -391,6 +423,17 @@ export function ProjectsView({
       setError(humanError(nextError, lang));
     } finally {
       setBusy(null);
+    }
+  };
+
+  const handleChooseFile = async () => {
+    setError(null);
+    setMessage(null);
+    try {
+      const path = await pickMediaFile();
+      if (path) await createFromPath(path);
+    } catch (nextError) {
+      setError(humanError(nextError, lang));
     }
   };
 
@@ -585,6 +628,13 @@ export function ProjectsView({
 
   return (
     <section className="projects-view">
+      {draggingMedia && (
+        <div className="media-drop-overlay" role="status">
+          <span className="action-icon"><UploadIcon /></span>
+          <strong>{c.dropMedia}</strong>
+          <small>{c.dropMediaHint}</small>
+        </div>
+      )}
       <div className="welcome">
         <p className="eyebrow">{c.eyebrow}</p>
         <h1>{c.title}</h1>

@@ -614,7 +614,7 @@ pub async fn run_auto(args: AutoArgs) -> AppResult<AutoResult> {
     run_auto_impl(args, |_, _| {}).await
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptionJobStatus {
     pub pid: String,
@@ -632,6 +632,48 @@ struct TranscriptionJob {
 #[derive(Clone, Default)]
 pub struct TranscriptionState {
     jobs: Arc<Mutex<HashMap<String, TranscriptionJob>>>,
+}
+
+fn transcription_status_path(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
+    // Reuse the project-id boundary check before using the id as a filename.
+    let _ = resolve_project_dir(pid, root.clone())?;
+    Ok(resolve_project_root(root)
+        .join(".jobs")
+        .join(format!("{pid}.json")))
+}
+
+fn save_transcription_status(
+    path: &std::path::Path,
+    status: &TranscriptionJobStatus,
+) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Schema("transcription status has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_transcription_status(path: &std::path::Path) -> AppResult<TranscriptionJobStatus> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn load_recovered_transcription_status(
+    path: &std::path::Path,
+) -> AppResult<TranscriptionJobStatus> {
+    let mut status = load_transcription_status(path)?;
+    if matches!(status.state.as_str(), "running" | "cancelling") {
+        status.state = "failed".into();
+        status.phase = "failed".into();
+        status.error = Some(
+            "the previous transcription was interrupted when lumen-cut closed; retry to start it again"
+                .into(),
+        );
+        save_transcription_status(path, &status)?;
+    }
+    Ok(status)
 }
 
 fn update_transcription_job(
@@ -664,6 +706,7 @@ pub async fn transcription_start(
         .to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let job_dir = resolve_project_root(args.out.clone()).join(&pid);
+    let status_path = transcription_status_path(&pid, args.out.clone())?;
     let remove_incomplete_url_project = (args.media.starts_with("http://")
         || args.media.starts_with("https://"))
         && !job_dir.join("doc.json").exists();
@@ -692,6 +735,20 @@ pub async fn transcription_start(
             },
         );
     }
+    let initial_status = status.clone();
+    let initial_status_path = status_path.clone();
+    if let Err(error) = run_blocking("save transcription status", move || {
+        save_transcription_status(&initial_status_path, &initial_status)
+    })
+    .await
+    {
+        state
+            .jobs
+            .lock()
+            .expect("transcription state poisoned")
+            .remove(&pid);
+        return Err(error);
+    }
 
     let jobs = state.jobs.clone();
     let task_pid = pid.clone();
@@ -705,28 +762,35 @@ pub async fn transcription_start(
         if result.is_err() && remove_incomplete_url_project {
             let _ = std::fs::remove_dir_all(&job_dir);
         }
-        let mut guard = jobs.lock().expect("transcription state poisoned");
-        let Some(job) = guard.get_mut(&task_pid) else {
-            return;
+        let final_status = {
+            let mut guard = jobs.lock().expect("transcription state poisoned");
+            let Some(job) = guard.get_mut(&task_pid) else {
+                return;
+            };
+            match result {
+                Ok(_) => {
+                    job.status.state = "completed".into();
+                    job.status.phase = "completed".into();
+                    job.status.progress = 100;
+                    job.status.error = None;
+                }
+                Err(AppError::Cancelled) => {
+                    job.status.state = "cancelled".into();
+                    job.status.phase = "cancelled".into();
+                    job.status.error = None;
+                }
+                Err(error) => {
+                    job.status.state = "failed".into();
+                    job.status.phase = "failed".into();
+                    job.status.error = Some(error.to_string());
+                }
+            }
+            job.status.clone()
         };
-        match result {
-            Ok(_) => {
-                job.status.state = "completed".into();
-                job.status.phase = "completed".into();
-                job.status.progress = 100;
-                job.status.error = None;
-            }
-            Err(AppError::Cancelled) => {
-                job.status.state = "cancelled".into();
-                job.status.phase = "cancelled".into();
-                job.status.error = None;
-            }
-            Err(error) => {
-                job.status.state = "failed".into();
-                job.status.phase = "failed".into();
-                job.status.error = Some(error.to_string());
-            }
-        }
+        let _ = tokio::task::spawn_blocking(move || {
+            save_transcription_status(&status_path, &final_status)
+        })
+        .await;
     });
     Ok(status)
 }
@@ -736,13 +800,25 @@ pub async fn transcription_status(
     pid: String,
     state: tauri::State<'_, TranscriptionState>,
 ) -> AppResult<TranscriptionJobStatus> {
-    state
+    if let Some(status) = state
         .jobs
         .lock()
         .expect("transcription state poisoned")
         .get(&pid)
         .map(|job| job.status.clone())
-        .ok_or_else(|| AppError::Schema("no transcription job for this project".into()))
+    {
+        return Ok(status);
+    }
+    let status_path = transcription_status_path(&pid, None)?;
+    run_blocking("load transcription status", move || {
+        load_recovered_transcription_status(&status_path).map_err(|error| match error {
+            AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                AppError::Schema("no transcription job for this project".into())
+            }
+            other => other,
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3006,6 +3082,39 @@ mod recording_tests {
             recording_output("recording-20260720", Some(root.clone())).unwrap(),
             root.join("recording-20260720/audio.wav")
         );
+    }
+}
+
+#[cfg(test)]
+mod transcription_status_tests {
+    use super::{
+        load_recovered_transcription_status, save_transcription_status, TranscriptionJobStatus,
+    };
+
+    #[test]
+    fn interrupted_job_becomes_a_retryable_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("job.json");
+        save_transcription_status(
+            &path,
+            &TranscriptionJobStatus {
+                pid: "project-1".into(),
+                state: "running".into(),
+                phase: "transcribing".into(),
+                progress: 52,
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let recovered = load_recovered_transcription_status(&path).unwrap();
+        assert_eq!(recovered.state, "failed");
+        assert_eq!(recovered.phase, "failed");
+        assert_eq!(recovered.progress, 52);
+        assert!(recovered.error.unwrap().contains("retry"));
+
+        let persisted = load_recovered_transcription_status(&path).unwrap();
+        assert_eq!(persisted.state, "failed");
     }
 }
 

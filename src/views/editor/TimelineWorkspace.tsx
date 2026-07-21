@@ -6,9 +6,11 @@ import type { Lang } from "../../i18n";
 import type { Doc } from "../../types";
 
 interface Props {
+  busy: boolean;
   cuts: CutSummary[];
   doc: Doc;
   lang: Lang;
+  onRestoreCut: (cutId: string) => Promise<void>;
 }
 
 function clock(seconds: number) {
@@ -17,7 +19,7 @@ function clock(seconds: number) {
   return `${minutes}:${rest.toFixed(1).padStart(4, "0")}`;
 }
 
-export function TimelineWorkspace({ cuts, doc, lang }: Props) {
+export function TimelineWorkspace({ busy, cuts, doc, lang, onRestoreCut }: Props) {
   const playerRef = useRef<HTMLMediaElement | null>(null);
   const [mediaSource, setMediaSource] = useState<string | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
@@ -212,6 +214,40 @@ export function TimelineWorkspace({ cuts, doc, lang }: Props) {
               <span className="duration-mark">
                 <span style={{ width: `${Math.min(((sentence.end - sentence.start) / 8) * 100, 100)}%` }} />
               </span>
+            </button>
+          </article>
+        ))}
+      </section>
+
+      <section className="timeline-cut-list">
+        <header>
+          <div>
+            <p className="eyebrow">{lang === "zh" ? "剪辑决定" : "Edit decisions"}</p>
+            <h3>
+              {cutRegions.length > 0
+                ? (lang === "zh" ? `${cutRegions.length} 个区间将在成片中移除` : `${cutRegions.length} regions will be removed`)
+                : (lang === "zh" ? "没有移除区间" : "No removed regions")}
+            </h3>
+          </div>
+          <small>
+            {lang === "zh"
+              ? "恢复后，该区间会重新出现在成片中。"
+              : "Restoring a region returns it to the exported video."}
+          </small>
+        </header>
+        {cutRegions.map((cut) => (
+          <article key={cut.id}>
+            <span className="timeline-cut-time">{clock(cut.start)}–{clock(cut.end)}</span>
+            <span>
+              <strong>{cut.kind === "silence" ? (lang === "zh" ? "静音" : "Silence") : (lang === "zh" ? "内容" : "Content")}</strong>
+              <small>{cut.note || `${cut.duration.toFixed(2)}s`}</small>
+            </span>
+            <button
+              className="button-quiet"
+              disabled={busy}
+              onClick={() => void onRestoreCut(cut.id)}
+            >
+              {lang === "zh" ? "恢复此区间" : "Restore region"}
             </button>
           </article>
         ))}

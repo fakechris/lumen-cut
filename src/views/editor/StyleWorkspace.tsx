@@ -20,6 +20,104 @@ function hexToAss(value: string) {
   return `&H00${clean.slice(4, 6)}${clean.slice(2, 4)}${clean.slice(0, 2)}`.toUpperCase();
 }
 
+const STYLE_PRESETS: Array<{
+  id: string;
+  zh: string;
+  en: string;
+  descriptionZh: string;
+  descriptionEn: string;
+  values: Partial<SubtitleStyle>;
+}> = [
+  {
+    id: "clean",
+    zh: "清晰白字",
+    en: "Clean white",
+    descriptionZh: "通用访谈与课程",
+    descriptionEn: "Interviews and courses",
+    values: {
+      name: "Clean white",
+      fontname: "PingFang SC",
+      fontsize: 52,
+      primaryColour: "&H00FFFFFF",
+      outlineColour: "&H00000000",
+      bold: false,
+      italic: false,
+      underline: false,
+      strikeOut: false,
+      alignment: 2,
+      outline: 2,
+      shadow: 1,
+      marginV: 80,
+    },
+  },
+  {
+    id: "creator",
+    zh: "创作者黄字",
+    en: "Creator yellow",
+    descriptionZh: "短视频与重点表达",
+    descriptionEn: "Short-form emphasis",
+    values: {
+      name: "Creator yellow",
+      fontname: "PingFang SC",
+      fontsize: 58,
+      primaryColour: "&H0000E8FF",
+      outlineColour: "&H00141414",
+      bold: true,
+      italic: false,
+      underline: false,
+      strikeOut: false,
+      alignment: 2,
+      outline: 3,
+      shadow: 1,
+      marginV: 92,
+    },
+  },
+  {
+    id: "minimal",
+    zh: "极简小字",
+    en: "Minimal",
+    descriptionZh: "纪录片与安静画面",
+    descriptionEn: "Documentary and quiet scenes",
+    values: {
+      name: "Minimal",
+      fontname: "Helvetica Neue",
+      fontsize: 42,
+      primaryColour: "&H00FFFFFF",
+      outlineColour: "&H00101010",
+      bold: false,
+      italic: false,
+      underline: false,
+      strikeOut: false,
+      alignment: 2,
+      outline: 1,
+      shadow: 0,
+      marginV: 68,
+    },
+  },
+  {
+    id: "top",
+    zh: "顶部标题",
+    en: "Top title",
+    descriptionZh: "避开画面底部信息",
+    descriptionEn: "Keeps the lower frame clear",
+    values: {
+      name: "Top title",
+      fontname: "PingFang SC",
+      fontsize: 50,
+      primaryColour: "&H00FFFFFF",
+      outlineColour: "&H00000000",
+      bold: true,
+      italic: false,
+      underline: false,
+      strikeOut: false,
+      alignment: 8,
+      outline: 2,
+      shadow: 1,
+      marginV: 72,
+    },
+  },
+];
+
 export function StyleWorkspace({ busy, lang, style, onSave }: Props) {
   const [draft, setDraft] = useState(style);
   const [saved, setSaved] = useState(false);
@@ -38,6 +136,11 @@ export function StyleWorkspace({ busy, lang, style, onSave }: Props) {
     } catch {
       setSaved(false);
     }
+  };
+
+  const applyPreset = (values: Partial<SubtitleStyle>) => {
+    setDraft((previous) => ({ ...previous, ...values }));
+    setSaved(false);
   };
 
   return (
@@ -66,6 +169,22 @@ export function StyleWorkspace({ busy, lang, style, onSave }: Props) {
       </section>
 
       <section className="style-controls">
+        <div className="style-presets">
+          <span>{lang === "zh" ? "快速样式" : "Quick styles"}</span>
+          <div>
+            {STYLE_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => applyPreset(preset.values)}
+              >
+                <strong>{lang === "zh" ? preset.zh : preset.en}</strong>
+                <small>{lang === "zh" ? preset.descriptionZh : preset.descriptionEn}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="control-row two-column">
           <label>
             <span>{lang === "zh" ? "字体" : "Typeface"}</span>

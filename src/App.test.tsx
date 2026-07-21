@@ -1,19 +1,41 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
 import serializedProject from "./test/fixtures/project.json";
 
-const { invoke } = vi.hoisted(() => ({
+const { invoke, nativeDrag } = vi.hoisted(() => ({
   invoke: vi.fn<(command: string) => Promise<unknown>>(),
+  nativeDrag: {
+    handler: null as null | ((event: {
+      payload:
+        | { type: "enter" | "drop"; paths: string[] }
+        | { type: "over" | "leave" };
+    }) => void),
+  },
 }));
 let projectDoc: Record<string, unknown>;
 let asrReady: boolean;
 let versionCommitError: Error | null;
+let transcriptionStatusState: {
+  pid: string;
+  state: string;
+  phase: string;
+  progress: number;
+  error?: string;
+};
 let finishCheckItems: Array<{
   code: string;
   ordinal: number;
   pass: boolean;
   blockers: string[];
+}>;
+let cutListState: Array<{
+  id: string;
+  kind: string;
+  a_word: string;
+  b_word: string;
+  duration: number;
+  note: string | null;
 }>;
 let brollOverview: {
   suggestions: Array<Record<string, unknown>>;
@@ -40,11 +62,31 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke,
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onDragDropEvent: async (handler: typeof nativeDrag.handler) => {
+      nativeDrag.handler = handler;
+      return () => {
+        nativeDrag.handler = null;
+      };
+    },
+  }),
+}));
+
 beforeEach(() => {
   localStorage.clear();
+  nativeDrag.handler = null;
+  delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   asrReady = true;
   versionCommitError = null;
+  transcriptionStatusState = {
+    pid: "project-1",
+    state: "completed",
+    phase: "completed",
+    progress: 100,
+  };
   finishCheckItems = [{ code: "delivery-ready", ordinal: 1, pass: true, blockers: [] }];
+  cutListState = [];
   brollOverview = { suggestions: [], accepted: [], errors: [] };
   brollListError = null;
   speakerEvidenceState = { speakers: [], turns: [], identified: false, unlabelled: 0 };
@@ -94,10 +136,23 @@ beforeEach(() => {
         return "3 fix(es)";
       case "project_show":
         return projectDoc;
+      case "project_create":
+        return {
+          pid: "drop-project",
+          title: "drop",
+          description: "",
+          path: "/projects/drop-project",
+          duration_seconds: 12,
+          word_count: 0,
+          paragraph_count: 0,
+          updated_at: "2026-07-21T00:00:00Z",
+          starred: false,
+        };
       case "subtitle_list":
       case "speakers_list":
-      case "cut_list":
         return [];
+      case "cut_list":
+        return cutListState;
       case "speaker_evidence":
         return speakerEvidenceState;
       case "speaker_reidentify_preview":
@@ -208,7 +263,9 @@ beforeEach(() => {
           ready: asrReady,
         };
       case "transcription_status":
-        return { pid: "project-1", state: "completed", phase: "completed", progress: 100 };
+        return transcriptionStatusState;
+      case "transcription_start":
+        return { pid: "project-1", state: "running", phase: "preparing", progress: 0 };
       case "media_asset_allow":
         return "/Users/example/Interview.mp4";
       default:
@@ -344,6 +401,24 @@ test("setup blocks transcription until the local runtime and models are ready", 
   expect(invoke).not.toHaveBeenCalledWith("transcription_start", expect.anything());
 });
 
+test("an interrupted transcription is explained and can be retried", async () => {
+  transcriptionStatusState = {
+    pid: "project-1",
+    state: "failed",
+    phase: "failed",
+    progress: 52,
+    error: "the previous transcription was interrupted when lumen-cut closed; retry to start it again",
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("上次转写因 lumen-cut 关闭而中断");
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("transcription_start", {
+    args: expect.objectContaining({ pid: "project-1" }),
+  }));
+});
+
 test("settings exposes the real local transcription status", async () => {
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
@@ -415,6 +490,74 @@ test("a failed delivery check needs an explicit draft override", async () => {
   expect(screen.getByRole("button", { name: /导出带字幕视频/ })).toBeEnabled();
 });
 
+test("subtitle presets are applied before saving the project style", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Style this line",
+        words: [{ id: "w1", text: "Style", start: 0, end: 1 }],
+      }],
+    }],
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "样式" }));
+  fireEvent.click(screen.getByRole("button", { name: /创作者黄字/ }));
+  fireEvent.click(screen.getByRole("button", { name: "保存样式" }));
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("style_set", {
+    pid: "project-1",
+    root: null,
+    style: expect.objectContaining({
+      name: "Creator yellow",
+      bold: true,
+      fontsize: 58,
+      primaryColour: "&H0000E8FF",
+    }),
+  }));
+});
+
+test("timeline edit decisions can be restored in place", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Keep this pause",
+        words: [
+          { id: "w1", text: "Keep", start: 0, end: 0.5 },
+          { id: "w2", text: "pause", start: 2, end: 2.5 },
+        ],
+      }],
+    }],
+  };
+  cutListState = [{
+    id: "cut-1",
+    kind: "silence",
+    a_word: "w1",
+    b_word: "w2",
+    duration: 1.5,
+    note: "Long pause",
+  }];
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "时间线" }));
+
+  expect(await screen.findByText("1 个区间将在成片中移除")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "恢复此区间" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("cut_restore", {
+    pid: "project-1",
+    cutId: "cut-1",
+    root: null,
+  }));
+});
+
 test("project library can search transcript content, star, and repair a project", async () => {
   render(<App />);
 
@@ -451,6 +594,30 @@ test("project library can search transcript content, star, and repair a project"
     pid: "project-2",
     root: null,
   });
+});
+
+test("dropping desktop media uses the same non-blocking import path", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", {
+    configurable: true,
+    value: { metadata: { currentWindow: { label: "main" } } },
+  });
+  render(<App />);
+  await waitFor(() => expect(nativeDrag.handler).not.toBeNull());
+
+  act(() => nativeDrag.handler?.({
+    payload: { type: "enter", paths: ["/Users/example/drop.mov"] },
+  }));
+  expect(screen.getByText("松开即可导入媒体")).toBeVisible();
+
+  act(() => nativeDrag.handler?.({
+    payload: { type: "drop", paths: ["/Users/example/drop.mov"] },
+  }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("project_create", {
+    args: expect.objectContaining({
+      from: "/Users/example/drop.mov",
+      title: "drop",
+    }),
+  }));
 });
 
 test("project editor exposes recoverable version snapshots", async () => {
