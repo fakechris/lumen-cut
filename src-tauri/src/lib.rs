@@ -41,6 +41,8 @@ pub fn run() {
             commands::project_create,
             commands::project_show,
             commands::project_list,
+            commands::project_search,
+            commands::project_set_star,
             commands::project_update_meta,
             commands::project_reveal,
             commands::project_delete,

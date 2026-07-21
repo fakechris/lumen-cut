@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import {
   audit,
   asrStatus,
+  branchCreate,
+  branchSwitch,
   configShow,
   cutAuto,
   cutList,
@@ -28,6 +30,9 @@ import {
   transcriptionCancel,
   transcriptionStart,
   transcriptionStatus,
+  versionCommit,
+  versionList,
+  versionRestore,
 } from "../api";
 import type { CutSummary } from "../api";
 import {
@@ -47,6 +52,7 @@ import type {
   SpeakerInfo,
   TaskStatus,
   TranscriptionJobStatus,
+  VersionHistory,
 } from "../types";
 import { StyleWorkspace } from "./editor/StyleWorkspace";
 import { EnhancementPanel } from "./editor/EnhancementPanel";
@@ -54,6 +60,7 @@ import { PropertiesWorkspace } from "./editor/PropertiesWorkspace";
 import { TimelineWorkspace } from "./editor/TimelineWorkspace";
 import { TranscriptEditor } from "./editor/TranscriptEditor";
 import { TranslationWorkspace } from "./editor/TranslationWorkspace";
+import { HistoryWorkspace } from "./editor/HistoryWorkspace";
 
 interface Props {
   lang: Lang;
@@ -68,6 +75,7 @@ type Tab =
   | "translate"
   | "style"
   | "properties"
+  | "history"
   | "timeline"
   | "review"
   | "export";
@@ -79,6 +87,7 @@ const COPY = {
     transcript: "转写稿",
     style: "样式",
     properties: "属性",
+    history: "版本",
     timeline: "时间线",
     review: "审查与修复",
     export: "导出",
@@ -127,6 +136,7 @@ const COPY = {
     transcript: "Transcript",
     style: "Style",
     properties: "Properties",
+    history: "Versions",
     timeline: "Timeline",
     review: "Review & Fix",
     export: "Export",
@@ -188,6 +198,11 @@ function friendlyError(error: unknown, lang: Lang) {
       ? "媒体处理失败。请确认文件可以播放，并检查 ffmpeg 环境。"
       : "Media processing failed. Check that the file plays and ffmpeg is available.";
   }
+  if (/save the current project as a version before switching branches/i.test(raw)) {
+    return lang === "zh"
+      ? "当前项目有尚未保存的修改。请先在“版本”中保存当前版本，再切换分支。"
+      : "This project has unsaved changes. Save the current version before switching branches.";
+  }
   return raw;
 }
 
@@ -244,6 +259,7 @@ export function TranscriptView({
     useState<TranscriptionJobStatus | null>(null);
   const [agentConfigured, setAgentConfigured] = useState(false);
   const [asrReadiness, setAsrReadiness] = useState<AsrStatus | null>(null);
+  const [versionHistory, setVersionHistory] = useState<VersionHistory | null>(null);
   const previousPending = useRef(0);
 
   const reload = async (projectId: string, resetTab = true) => {
@@ -275,6 +291,7 @@ export function TranscriptView({
     setTaskState(null);
     setOperation(null);
     setTranscriptionJob(null);
+    setVersionHistory(null);
     if (!pid) return;
     void Promise.all([
       reload(pid),
@@ -285,6 +302,7 @@ export function TranscriptView({
         ),
       ),
       asrStatus().then(setAsrReadiness),
+      versionList(pid).then(setVersionHistory),
       transcriptionStatus(pid)
         .then((status) => {
           if (status.state === "running" || status.state === "cancelling") {
@@ -417,6 +435,19 @@ export function TranscriptView({
       await action();
     } catch (error) {
       setFeedback({ tone: "error", text: friendlyError(error, lang) });
+    } finally {
+      setOperation(null);
+    }
+  };
+
+  const performRecoverable = async (name: string, action: () => Promise<void>) => {
+    setOperation(name);
+    setFeedback(null);
+    try {
+      await action();
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+      throw error;
     } finally {
       setOperation(null);
     }
@@ -610,6 +641,54 @@ export function TranscriptView({
     }
   };
 
+  const refreshVersionHistory = async () => {
+    setVersionHistory(await versionList(pid));
+  };
+
+  const commitVersion = async (name: string, note: string) => {
+    await performRecoverable("version", async () => {
+      await versionCommit(pid, name, note);
+      await refreshVersionHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "当前项目已保存为可恢复版本。" : "Saved a recoverable project version.",
+      });
+    });
+  };
+
+  const restoreVersion = async (id: string) => {
+    await performRecoverable("version", async () => {
+      await versionRestore(pid, id);
+      await Promise.all([reload(pid, false), refreshVersionHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "已恢复所选版本。" : "Restored the selected version.",
+      });
+    });
+  };
+
+  const createBranch = async (name: string) => {
+    await performRecoverable("version", async () => {
+      await branchCreate(pid, name);
+      await refreshVersionHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? `已创建并切换到分支“${name}”。` : `Created and switched to “${name}”.`,
+      });
+    });
+  };
+
+  const switchBranch = async (id: string) => {
+    await performRecoverable("version", async () => {
+      await branchSwitch(pid, id);
+      await Promise.all([reload(pid, false), refreshVersionHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "已切换分支。" : "Switched branch.",
+      });
+    });
+  };
+
   const renameSpeaker = async (from: string, to: string) => {
     setOperation(`speaker-rename-${from}`);
     setFeedback(null);
@@ -707,6 +786,7 @@ export function TranscriptView({
     { id: "translate", label: c.translate, disabled: !hasTranscript },
     { id: "style", label: c.style, disabled: !hasTranscript },
     { id: "properties", label: c.properties },
+    { id: "history", label: c.history },
     { id: "timeline", label: c.timeline, disabled: !hasTranscript },
     { id: "review", label: c.review, disabled: !hasTranscript },
     { id: "export", label: c.export, disabled: !hasTranscript },
@@ -919,6 +999,18 @@ export function TranscriptView({
           onMerge={mergeSpeaker}
           onRename={renameSpeaker}
           onSaveMeta={saveProjectMeta}
+        />
+      )}
+
+      {activeTab === "history" && versionHistory && (
+        <HistoryWorkspace
+          busy={operation !== null}
+          history={versionHistory}
+          lang={lang}
+          onCommit={commitVersion}
+          onCreateBranch={createBranch}
+          onRestore={restoreVersion}
+          onSwitchBranch={switchBranch}
         />
       )}
 

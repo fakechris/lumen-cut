@@ -96,6 +96,23 @@ export function ChevronRightIcon(props: IconProps) {
   );
 }
 
+export function SearchIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <circle {...stroke} cx="10.5" cy="10.5" r="6.5" />
+      <path {...stroke} d="m15.5 15.5 4.25 4.25" />
+    </IconBase>
+  );
+}
+
+export function StarIcon({ fill = "none", ...props }: IconProps) {
+  return (
+    <IconBase fill={fill} {...props}>
+      <path {...stroke} d="m12 3.5 2.6 5.27 5.82.85-4.21 4.1.99 5.8L12 16.78l-5.2 2.74.99-5.8-4.21-4.1 5.82-.85L12 3.5Z" />
+    </IconBase>
+  );
+}
+
 export function SunIcon(props: IconProps) {
   return (
     <IconBase {...props}>

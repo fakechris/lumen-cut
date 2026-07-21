@@ -22,11 +22,16 @@ pub struct RepairReport {
     pub fixed_inverted: usize,
     pub fixed_zero: usize,
     pub fixed_overlap: usize,
+    pub clamped_media: usize,
 }
 
 impl RepairReport {
     pub fn total(&self) -> usize {
-        self.clamped_negative + self.fixed_inverted + self.fixed_zero + self.fixed_overlap
+        self.clamped_negative
+            + self.fixed_inverted
+            + self.fixed_zero
+            + self.fixed_overlap
+            + self.clamped_media
     }
 }
 
@@ -63,6 +68,28 @@ pub fn repair(doc: &mut Doc) -> RepairReport {
             rep.fixed_overlap += 1;
         }
         prev_end = prev_end.max(w.end);
+    }
+
+    // Forced alignment can extend the tail a few frames past the media. Walk
+    // backwards so capping the last word never creates a new overlap with the
+    // word before it. This only compresses the affected tail.
+    let media_end = doc.media.duration_seconds;
+    if media_end > 0.0 {
+        let mut next_start = media_end;
+        for word in doc
+            .paragraphs
+            .iter_mut()
+            .rev()
+            .flat_map(|paragraph| paragraph.sentences.iter_mut().rev())
+            .flat_map(|sentence| sentence.words.iter_mut().rev())
+        {
+            if word.end > next_start {
+                word.end = next_start;
+                word.start = word.start.min((word.end - MIN_DUR).max(0.0));
+                rep.clamped_media += 1;
+            }
+            next_start = word.start;
+        }
     }
     rep
 }
@@ -142,5 +169,16 @@ mod tests {
             d.paragraphs[0].sentences[0].words[1].end - d.paragraphs[0].sentences[0].words[1].start
                 >= MIN_DUR
         );
+    }
+
+    #[test]
+    fn clamps_the_aligned_tail_inside_media_without_creating_overlap() {
+        let mut d = doc(vec![(8.0, 9.98), (9.98, 10.2)]);
+        let rep = repair(&mut d);
+        let words = &d.paragraphs[0].sentences[0].words;
+        assert_eq!(rep.clamped_media, 2);
+        assert!(words[1].end <= d.media.duration_seconds);
+        assert!(words[1].end - words[1].start >= MIN_DUR);
+        assert!(words[0].end <= words[1].start);
     }
 }

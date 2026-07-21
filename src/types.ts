@@ -8,10 +8,13 @@ export interface GreetResponse {
 export interface ProjectSummary {
   pid: string;
   title: string;
+  description: string;
   path: string;
   duration_seconds: number;
   word_count: number;
   paragraph_count: number;
+  updated_at: string;
+  starred: boolean;
 }
 
 export interface SpeakerInfo {
@@ -221,6 +224,34 @@ export interface ConflictSummary {
 export interface MergeSummary {
   merged: Record<string, string>;
   conflicts: ConflictSummary[];
+}
+
+export interface VersionNode {
+  id: string;
+  parent?: string | null;
+  branch: string;
+  name: string;
+  note: string;
+  at: string;
+  kind: "manual" | "agent" | "auto" | "restore";
+  diffs?: unknown[];
+}
+
+export interface ProjectBranch {
+  id: string;
+  name: string;
+  tip: string;
+  root: string;
+  createdAt: string;
+  note: string;
+}
+
+export interface VersionHistory {
+  v: number;
+  head?: string | null;
+  activeBranch?: string | null;
+  branches: ProjectBranch[];
+  versions: VersionNode[];
 }
 
 export interface Settings {

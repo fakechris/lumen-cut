@@ -20,6 +20,7 @@ import type {
   SubtitleStyle,
   TaskStatus,
   TranscriptionJobStatus,
+  VersionHistory,
 } from "./types";
 
 export interface CutSummary {
@@ -41,6 +42,17 @@ export async function pickMediaFile(): Promise<string | null> {
 
 export async function projectList(): Promise<ProjectSummary[]> {
   return invoke("project_list", { root: null });
+}
+
+export async function projectSearch(query: string): Promise<ProjectSummary[]> {
+  return invoke("project_search", { query, root: null });
+}
+
+export async function projectSetStar(
+  pid: string,
+  starred: boolean,
+): Promise<ProjectSummary> {
+  return invoke("project_set_star", { pid, starred, root: null });
 }
 
 export async function projectShow(pid: string): Promise<Doc> {
@@ -285,6 +297,10 @@ export async function diarize(
   return invoke("diarize_pid", { pid, root: null });
 }
 
+export async function timingRepair(pid: string): Promise<string> {
+  return invoke("timing_repair", { pid, root: null });
+}
+
 export async function exportSubtitles(
   pid: string,
 ): Promise<string[]> {
@@ -301,6 +317,30 @@ export async function versionMerge(
   theirs: Record<string, string>,
 ): Promise<MergeSummary> {
   return invoke("version_merge", { base, ours, theirs });
+}
+
+export async function versionList(pid: string): Promise<VersionHistory> {
+  return invoke("version_list", { pid, root: null });
+}
+
+export async function versionCommit(
+  pid: string,
+  name: string,
+  note: string,
+): Promise<string> {
+  return invoke("version_commit", { pid, name, note, root: null });
+}
+
+export async function versionRestore(pid: string, id: string): Promise<void> {
+  return invoke("version_restore", { pid, id, root: null });
+}
+
+export async function branchCreate(pid: string, name: string): Promise<string> {
+  return invoke("branch_create", { pid, name, root: null });
+}
+
+export async function branchSwitch(pid: string, id: string): Promise<void> {
+  return invoke("branch_switch", { pid, id, root: null });
 }
 
 export async function agentServe(port: number | null): Promise<number> {

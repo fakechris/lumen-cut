@@ -5,18 +5,23 @@ import {
   projectDelete,
   projectList,
   projectReveal,
+  projectSearch,
+  projectSetStar,
   recordingCancel,
   recordingStart,
   recordingStop,
   transcriptionCancel,
   transcriptionStart,
   transcriptionStatus,
+  timingRepair,
 } from "../api";
 import {
   ChevronRightIcon,
   FolderIcon,
   LinkIcon,
   MicrophoneIcon,
+  SearchIcon,
+  StarIcon,
   UploadIcon,
 } from "../components/Icons";
 import type { Lang } from "../i18n";
@@ -31,6 +36,7 @@ interface Props {
 
 type Composer = "url" | "record" | null;
 type BusyKind = "file" | "url" | "record" | null;
+type ProjectSort = "recent" | "name";
 interface ActiveRecording {
   pid: string;
   title: string;
@@ -43,6 +49,7 @@ interface UrlIngestJob {
 }
 
 const URL_JOB_KEY = "lumen-cut.activeUrlIngest";
+const PROJECT_SORT_KEY = "lumen-cut.projectSort";
 
 const COPY = {
   zh: {
@@ -71,12 +78,25 @@ const COPY = {
     downloading: "正在下载并转写，较长的视频需要一些时间…",
     recent: "项目",
     empty: "还没有项目。选择一个文件就能开始。",
+    search: "搜索项目、备注或转写内容",
+    starredOnly: "只看收藏",
+    sortLabel: "项目排序",
+    sortRecent: "最近更新",
+    sortName: "按名称",
+    noResults: "没有找到匹配的项目。可以换个关键词，或取消“只看收藏”。",
+    clearFilters: "清除筛选",
     open: "打开项目",
     words: "字词",
     paragraphs: "段落",
     ready: "等待转写",
     moreActions: "更多项目操作",
+    star: "收藏项目",
+    unstar: "取消收藏",
     reveal: "在 Finder 中显示",
+    repair: "修复转写时间轴",
+    repairConfirm: "修复会调整无效、重叠或超出媒体长度的时码，并在修改前自动保存恢复版本。",
+    confirmRepair: "确认修复",
+    repaired: "项目检查完成",
     delete: "删除项目",
     deleteConfirm: "删除项目文件？原始媒体不会被删除。",
     cancel: "取消",
@@ -109,12 +129,25 @@ const COPY = {
     downloading: "Downloading and transcribing. Longer media can take a while…",
     recent: "Projects",
     empty: "No projects yet. Choose a file to get started.",
+    search: "Search projects, notes, or transcript text",
+    starredOnly: "Starred only",
+    sortLabel: "Project sort",
+    sortRecent: "Recently updated",
+    sortName: "Name",
+    noResults: "No matching projects. Try another search or turn off the starred filter.",
+    clearFilters: "Clear filters",
     open: "Open project",
     words: "words",
     paragraphs: "paragraphs",
     ready: "Ready to transcribe",
     moreActions: "More project actions",
+    star: "Star project",
+    unstar: "Unstar project",
     reveal: "Show in Finder",
+    repair: "Repair transcript timing",
+    repairConfirm: "Repair adjusts invalid, overlapping, or out-of-media timing and saves a recovery version first.",
+    confirmRepair: "Repair timing",
+    repaired: "Project check complete",
     delete: "Delete project",
     deleteConfirm: "Delete project files? The original media will not be removed.",
     cancel: "Cancel",
@@ -198,6 +231,12 @@ export function ProjectsView({
 }: Props) {
   const c = COPY[lang];
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [query, setQuery] = useState("");
+  const [starredOnly, setStarredOnly] = useState(false);
+  const [projectSort, setProjectSort] = useState<ProjectSort>(() =>
+    window.localStorage.getItem(PROJECT_SORT_KEY) === "name" ? "name" : "recent",
+  );
+  const [searching, setSearching] = useState(true);
   const [composer, setComposer] = useState<Composer>(null);
   const [busy, setBusy] = useState<BusyKind>(null);
   const [error, setError] = useState<string | null>(null);
@@ -208,19 +247,29 @@ export function ProjectsView({
   const [message, setMessage] = useState<string | null>(null);
   const [menuPid, setMenuPid] = useState<string | null>(null);
   const [confirmDeletePid, setConfirmDeletePid] = useState<string | null>(null);
+  const [confirmRepairPid, setConfirmRepairPid] = useState<string | null>(null);
   const [projectAction, setProjectAction] = useState<string | null>(null);
   const recordingRef = useRef<ActiveRecording | null>(null);
+  const projectRequestRef = useRef(0);
 
-  const refresh = async () => {
+  const refresh = async (searchQuery = query) => {
+    const request = ++projectRequestRef.current;
+    setSearching(true);
     try {
-      setProjects(await projectList());
+      const next = searchQuery.trim()
+        ? await projectSearch(searchQuery.trim())
+        : await projectList();
+      if (request === projectRequestRef.current) setProjects(next);
     } catch (nextError) {
-      setError(humanError(nextError, lang));
+      if (request === projectRequestRef.current) {
+        setError(humanError(nextError, lang));
+      }
+    } finally {
+      if (request === projectRequestRef.current) setSearching(false);
     }
   };
 
   useEffect(() => {
-    void refresh();
     const saved = window.localStorage.getItem(URL_JOB_KEY);
     if (saved) {
       try {
@@ -240,6 +289,15 @@ export function ProjectsView({
       }
     }
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void refresh(query), 180);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    window.localStorage.setItem(PROJECT_SORT_KEY, projectSort);
+  }, [projectSort]);
 
   useEffect(() => {
     if (!urlJob || !["running", "cancelling"].includes(urlJob.status.state)) return;
@@ -442,6 +500,41 @@ export function ProjectsView({
     }
   };
 
+  const handleSetStar = async (project: ProjectSummary) => {
+    setError(null);
+    setMessage(null);
+    setProjectAction(`star-${project.pid}`);
+    try {
+      const updated = await projectSetStar(project.pid, !project.starred);
+      setProjects((current) =>
+        current
+          .map((candidate) => candidate.pid === updated.pid ? updated : candidate)
+          .sort((left, right) => Number(right.starred) - Number(left.starred)),
+      );
+    } catch (nextError) {
+      setError(humanError(nextError, lang));
+    } finally {
+      setProjectAction(null);
+    }
+  };
+
+  const handleRepairProject = async (pid: string) => {
+    setError(null);
+    setMessage(null);
+    setProjectAction(`repair-${pid}`);
+    try {
+      const result = await timingRepair(pid);
+      setMenuPid(null);
+      setConfirmRepairPid(null);
+      setMessage(`${c.repaired} · ${result}`);
+      await refresh();
+    } catch (nextError) {
+      setError(humanError(nextError, lang));
+    } finally {
+      setProjectAction(null);
+    }
+  };
+
   const handleDeleteProject = async (pid: string) => {
     setError(null);
     setMessage(null);
@@ -478,6 +571,17 @@ export function ProjectsView({
             : null
           : null;
   const creationLocked = busy !== null || recording !== null;
+  const visibleProjects = projects
+    .filter((project) => !starredOnly || project.starred)
+    .sort((left, right) => {
+      const starred = Number(right.starred) - Number(left.starred);
+      if (starred !== 0) return starred;
+      if (projectSort === "name") {
+        return left.title.localeCompare(right.title, lang === "zh" ? "zh-CN" : "en-US");
+      }
+      return Date.parse(right.updated_at || "") - Date.parse(left.updated_at || "");
+    });
+  const hasFilters = Boolean(query.trim()) || starredOnly;
 
   return (
     <section className="projects-view">
@@ -632,17 +736,64 @@ export function ProjectsView({
 
       <div className="project-library">
         <div className="section-heading">
-          <h2>{c.recent}</h2>
-          <span>{projects.length}</span>
+          <div>
+            <h2>{c.recent}</h2>
+            <span>{visibleProjects.length}</span>
+          </div>
+          <div className="project-filters">
+            <label className="project-search">
+              <SearchIcon />
+              <span className="sr-only">{c.search}</span>
+              <input
+                placeholder={c.search}
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+              {searching && <span className="spinner" aria-hidden="true" />}
+            </label>
+            <label className="project-sort">
+              <span className="sr-only">{c.sortLabel}</span>
+              <select
+                aria-label={c.sortLabel}
+                value={projectSort}
+                onChange={(event) => setProjectSort(event.target.value as ProjectSort)}
+              >
+                <option value="recent">{c.sortRecent}</option>
+                <option value="name">{c.sortName}</option>
+              </select>
+            </label>
+            <button
+              aria-pressed={starredOnly}
+              className={`starred-filter${starredOnly ? " active" : ""}`}
+              onClick={() => setStarredOnly((current) => !current)}
+            >
+              <StarIcon fill={starredOnly ? "currentColor" : "none"} />
+              {c.starredOnly}
+            </button>
+          </div>
         </div>
-        {projects.length === 0 ? (
+        {visibleProjects.length === 0 ? (
           <div className="empty-library">
             <FolderIcon />
-            <p>{c.empty}</p>
+            <div>
+              <p>{hasFilters ? c.noResults : c.empty}</p>
+              {hasFilters && (
+                <button
+                  className="button-quiet"
+                  onClick={() => {
+                    setQuery("");
+                    setStarredOnly(false);
+                  }}
+                >
+                  {c.clearFilters}
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <div className="project-rows">
-            {projects.map((project) => {
+            {visibleProjects.map((project) => {
               const isCurrent = project.pid === currentPid;
               const hasTranscript = project.word_count > 0;
               return (
@@ -658,6 +809,9 @@ export function ProjectsView({
                     <span className="project-file-icon"><FolderIcon /></span>
                     <span className="project-main">
                       <strong>{project.title}</strong>
+                      {project.description && (
+                        <small className="project-description">{project.description}</small>
+                      )}
                       <small>
                         {hasTranscript
                           ? `${project.word_count} ${c.words} · ${project.paragraph_count} ${c.paragraphs}`
@@ -670,6 +824,17 @@ export function ProjectsView({
                     <span className="sr-only">{c.open}</span>
                     <ChevronRightIcon />
                   </button>
+                  <button
+                    aria-label={`${project.starred ? c.unstar : c.star}: ${project.title}`}
+                    aria-pressed={project.starred}
+                    className={`project-star${project.starred ? " active" : ""}`}
+                    disabled={creationLocked || projectAction !== null}
+                    onClick={() => void handleSetStar(project)}
+                  >
+                    {projectAction === `star-${project.pid}`
+                      ? <span className="spinner" aria-hidden="true" />
+                      : <StarIcon fill={project.starred ? "currentColor" : "none"} />}
+                  </button>
                   <div className="project-more">
                     <button
                       aria-expanded={menuPid === project.pid}
@@ -678,6 +843,7 @@ export function ProjectsView({
                       disabled={creationLocked}
                       onClick={() => {
                         setConfirmDeletePid(null);
+                        setConfirmRepairPid(null);
                         setMenuPid((current) =>
                           current === project.pid ? null : project.pid,
                         );
@@ -709,6 +875,28 @@ export function ProjectsView({
                               </button>
                             </div>
                           </div>
+                        ) : confirmRepairPid === project.pid ? (
+                          <div className="project-delete-confirm">
+                            <p>{c.repairConfirm}</p>
+                            <div>
+                              <button
+                                className="button-quiet"
+                                disabled={projectAction !== null}
+                                onClick={() => setConfirmRepairPid(null)}
+                              >
+                                {c.cancel}
+                              </button>
+                              <button
+                                className="button-primary"
+                                disabled={projectAction !== null}
+                                onClick={() => void handleRepairProject(project.pid)}
+                              >
+                                {projectAction === `repair-${project.pid}`
+                                  ? lang === "zh" ? "正在修复…" : "Repairing…"
+                                  : c.confirmRepair}
+                              </button>
+                            </div>
+                          </div>
                         ) : (
                           <>
                             <button
@@ -718,6 +906,12 @@ export function ProjectsView({
                               {projectAction === `reveal-${project.pid}`
                                 ? lang === "zh" ? "正在打开…" : "Opening…"
                                 : c.reveal}
+                            </button>
+                            <button
+                              disabled={projectAction !== null || !hasTranscript}
+                              onClick={() => setConfirmRepairPid(project.pid)}
+                            >
+                              {c.repair}
                             </button>
                             <button
                               className="danger-action"

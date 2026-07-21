@@ -131,10 +131,98 @@ pub struct CreateProjectArgs {
 pub struct ProjectSummary {
     pub pid: String,
     pub title: String,
+    pub description: String,
     pub path: PathBuf,
     pub duration_seconds: f64,
     pub word_count: usize,
     pub paragraph_count: usize,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub starred: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ProjectLocalState {
+    starred: bool,
+}
+
+fn load_project_local_state(dir: &std::path::Path) -> ProjectLocalState {
+    std::fs::read_to_string(dir.join("project-state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_project_local_state(dir: &std::path::Path, state: &ProjectLocalState) -> AppResult<()> {
+    let target = dir.join("project-state.json");
+    let temporary = dir.join("project-state.json.tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(state)?)?;
+    std::fs::rename(temporary, target)?;
+    Ok(())
+}
+
+fn project_summary(dir: PathBuf, doc: &Doc) -> ProjectSummary {
+    let pid = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| doc.id.clone());
+    ProjectSummary {
+        pid,
+        title: doc.meta.title.clone(),
+        description: doc.meta.description.clone(),
+        path: dir.clone(),
+        duration_seconds: doc.media.duration_seconds,
+        word_count: doc.all_words().len(),
+        paragraph_count: doc.paragraphs.len(),
+        updated_at: doc.meta.updated_at,
+        starred: load_project_local_state(&dir).starred,
+    }
+}
+
+fn project_matches(doc: &Doc, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let contains = |value: &str| value.to_lowercase().contains(&query);
+    contains(&doc.id)
+        || contains(&doc.meta.title)
+        || contains(&doc.meta.description)
+        || doc.paragraphs.iter().any(|paragraph| {
+            paragraph.speaker.as_deref().is_some_and(contains)
+                || paragraph
+                    .sentences
+                    .iter()
+                    .any(|sentence| contains(&sentence.text))
+        })
+        || doc
+            .translations
+            .values()
+            .flat_map(|groups| groups.values())
+            .any(|translation| contains(&translation.text))
+}
+
+fn project_index(root: &std::path::Path, query: &str) -> AppResult<Vec<ProjectSummary>> {
+    if !root.exists() {
+        return Ok(vec![]);
+    }
+    let mut projects = std::fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let dir = entry.path();
+            let doc = Doc::load(&dir).ok()?;
+            project_matches(&doc, query).then(|| project_summary(dir, &doc))
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|left, right| {
+        right
+            .starred
+            .cmp(&left.starred)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+    });
+    Ok(projects)
 }
 
 #[tauri::command]
@@ -170,49 +258,50 @@ pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary
     Ok(ProjectSummary {
         pid: args.pid,
         title: doc.meta.title,
+        description: doc.meta.description,
         path: dir,
         duration_seconds: info.duration_seconds,
         word_count: 0,
         paragraph_count: 0,
+        updated_at: doc.meta.updated_at,
+        starred: false,
     })
 }
 
 #[tauri::command]
 pub async fn project_show(pid: String, root: Option<PathBuf>) -> AppResult<Doc> {
-    Doc::load(&resolve_project_dir(&pid, root)?)
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("project load", move || Doc::load(&dir)).await
 }
 
 #[tauri::command]
 pub async fn project_list(root: Option<PathBuf>) -> AppResult<Vec<ProjectSummary>> {
     let root = resolve_project_root(root);
-    let mut out = Vec::new();
-    if !root.exists() {
-        return Ok(out);
-    }
-    let entries = std::fs::read_dir(&root)?;
-    for e in entries.flatten() {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        if Doc::load(&p).is_ok() {
-            if let Ok(doc) = Doc::load(&p) {
-                let name = p
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                out.push(ProjectSummary {
-                    pid: name,
-                    title: doc.meta.title.clone(),
-                    path: p,
-                    duration_seconds: doc.media.duration_seconds,
-                    word_count: doc.all_words().len(),
-                    paragraph_count: doc.paragraphs.len(),
-                });
-            }
-        }
-    }
-    Ok(out)
+    run_blocking("project index", move || project_index(&root, "")).await
+}
+
+#[tauri::command]
+pub async fn project_search(
+    query: String,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<ProjectSummary>> {
+    let root = resolve_project_root(root);
+    run_blocking("project search", move || project_index(&root, &query)).await
+}
+
+#[tauri::command]
+pub async fn project_set_star(
+    pid: String,
+    starred: bool,
+    root: Option<PathBuf>,
+) -> AppResult<ProjectSummary> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("project star update", move || {
+        let doc = Doc::load(&dir)?;
+        save_project_local_state(&dir, &ProjectLocalState { starred })?;
+        Ok(project_summary(dir, &doc))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -224,34 +313,42 @@ pub async fn project_update_meta(
     root: Option<PathBuf>,
 ) -> AppResult<Doc> {
     let dir = resolve_project_dir(&pid, root)?;
-    let mut doc = Doc::load(&dir)?;
-    let title = title.trim();
-    if title.is_empty() {
-        return Err(AppError::Schema("project title cannot be empty".into()));
-    }
-    doc.meta.title = title.to_string();
-    doc.meta.description = description.trim().to_string();
-    doc.meta.language = language
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    doc.meta.updated_at = chrono::Utc::now();
-    doc.save(&dir)?;
-    Ok(doc)
+    run_blocking("project metadata update", move || {
+        let mut doc = Doc::load(&dir)?;
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(AppError::Schema("project title cannot be empty".into()));
+        }
+        doc.meta.title = title.to_string();
+        doc.meta.description = description.trim().to_string();
+        doc.meta.language = language
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        doc.meta.updated_at = chrono::Utc::now();
+        doc.save(&dir)?;
+        Ok(doc)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn project_reveal(pid: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_dir(&pid, root)?;
-    if !dir.is_dir() {
-        return Err(AppError::ProjectNotFound(dir));
+    match tokio::fs::metadata(&dir).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(AppError::ProjectNotFound(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::ProjectNotFound(dir));
+        }
+        Err(error) => return Err(AppError::Io(error)),
     }
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
+    tokio::process::Command::new("open")
         .args(["-R"])
         .arg(dir.join("doc.json"))
         .spawn()?;
     #[cfg(not(target_os = "macos"))]
-    std::process::Command::new("open").arg(&dir).spawn()?;
+    tokio::process::Command::new("open").arg(&dir).spawn()?;
     Ok(dir.to_string_lossy().into_owned())
 }
 
@@ -285,10 +382,10 @@ pub async fn project_delete(
         ));
     }
     let dir = resolve_project_dir(&pid, root)?;
-    if !dir.exists() {
+    if !tokio::fs::try_exists(&dir).await? {
         return Ok(false);
     }
-    std::fs::remove_dir_all(dir)?;
+    tokio::fs::remove_dir_all(dir).await?;
     Ok(true)
 }
 
@@ -1509,10 +1606,33 @@ pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<Diariz
 #[tauri::command]
 pub async fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let rep = crate::pipeline::timing::repair(&mut doc);
-    doc.save(&dir)?;
-    Ok(format!("{} fix(es)", rep.total()))
+    run_blocking("timing repair", move || {
+        let original = Doc::load(&dir)?;
+        let mut doc = original.clone();
+        let rep = crate::pipeline::timing::repair(&mut doc);
+        if rep.total() > 0 {
+            if !working_head_is_committed(&dir, &original)? {
+                let mut lineage = crate::data::version::Lineage::load(&dir)?;
+                let branch = lineage
+                    .active_branch
+                    .clone()
+                    .unwrap_or_else(|| "main".into());
+                crate::data::version::commit_snapshot(
+                    &dir,
+                    &original,
+                    &mut lineage,
+                    &branch,
+                    "before timing repair",
+                    "automatic recovery snapshot",
+                    crate::data::version::VersionKind::Auto,
+                )?;
+            }
+            doc.meta.updated_at = chrono::Utc::now();
+            doc.save(&dir)?;
+        }
+        Ok(format!("{} fix(es)", rep.total()))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1875,12 +1995,35 @@ pub async fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<V
 }
 
 #[tauri::command]
-pub async fn version_list(
-    pid: String,
-    root: Option<PathBuf>,
-) -> AppResult<crate::data::version::Lineage> {
+pub async fn version_list(pid: String, root: Option<PathBuf>) -> AppResult<VersionHistory> {
     let dir = resolve_project_root(root).join(&pid);
-    crate::data::version::Lineage::load(&dir)
+    run_blocking("version history load", move || {
+        let lineage = crate::data::version::Lineage::load(&dir)?;
+        Ok(VersionHistory::from(lineage))
+    })
+    .await
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionHistory {
+    pub v: u32,
+    pub head: Option<String>,
+    pub active_branch: Option<String>,
+    pub branches: Vec<crate::data::version::Branch>,
+    pub versions: Vec<crate::data::version::VersionNode>,
+}
+
+impl From<crate::data::version::Lineage> for VersionHistory {
+    fn from(lineage: crate::data::version::Lineage) -> Self {
+        Self {
+            v: lineage.v,
+            head: lineage.head().map(|node| node.id.clone()),
+            active_branch: lineage.active_branch,
+            branches: lineage.branches,
+            versions: lineage.nodes,
+        }
+    }
 }
 
 #[tauri::command]
@@ -1891,42 +2034,102 @@ pub async fn version_commit(
     root: Option<PathBuf>,
 ) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    let mut lineage = crate::data::version::Lineage::load(&dir)?;
-    let branch = lineage
-        .active_branch
-        .clone()
-        .unwrap_or_else(|| "main".into());
-    crate::data::version::commit_snapshot(
-        &dir,
-        &doc,
-        &mut lineage,
-        &branch,
-        &name,
-        &note,
-        crate::data::version::VersionKind::Manual,
-    )
+    run_blocking("version snapshot", move || {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Schema("version name cannot be empty".into()));
+        }
+        let doc = Doc::load(&dir)?;
+        let mut lineage = crate::data::version::Lineage::load(&dir)?;
+        let branch = lineage
+            .active_branch
+            .clone()
+            .unwrap_or_else(|| "main".into());
+        crate::data::version::commit_snapshot(
+            &dir,
+            &doc,
+            &mut lineage,
+            &branch,
+            name,
+            note.trim(),
+            crate::data::version::VersionKind::Manual,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn version_restore(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
     let dir = resolve_project_root(root).join(&pid);
-    let mut lineage = crate::data::version::Lineage::load(&dir)?;
-    crate::data::version::restore_snapshot(&dir, &mut lineage, &id)
+    run_blocking("version restore", move || {
+        let doc = Doc::load(&dir)?;
+        let mut lineage = crate::data::version::Lineage::load(&dir)?;
+        if !working_head_is_committed(&dir, &doc)? {
+            let branch = lineage
+                .active_branch
+                .clone()
+                .unwrap_or_else(|| "main".into());
+            crate::data::version::commit_snapshot(
+                &dir,
+                &doc,
+                &mut lineage,
+                &branch,
+                &format!("before restore {id}"),
+                "automatic recovery snapshot",
+                crate::data::version::VersionKind::Auto,
+            )?;
+        }
+        crate::data::version::restore_snapshot(&dir, &mut lineage, &id)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn branch_create(pid: String, name: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
-    let mut lineage = crate::data::version::Lineage::load(&dir)?;
-    crate::data::version::create_branch(&dir, &mut lineage, &name, "")
+    run_blocking("branch create", move || {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Schema("branch name cannot be empty".into()));
+        }
+        let doc = Doc::load(&dir)?;
+        let mut lineage = crate::data::version::Lineage::load(&dir)?;
+        if !working_head_is_committed(&dir, &doc)? {
+            let current_branch = lineage
+                .active_branch
+                .clone()
+                .unwrap_or_else(|| "main".into());
+            crate::data::version::commit_snapshot(
+                &dir,
+                &doc,
+                &mut lineage,
+                &current_branch,
+                "before branch",
+                "automatic recovery snapshot",
+                crate::data::version::VersionKind::Auto,
+            )?;
+        }
+        let id = crate::data::version::create_branch(&dir, &mut lineage, name, "")?;
+        crate::data::version::switch_branch(&dir, &mut lineage, &id)?;
+        Ok(id)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn branch_switch(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
     let dir = resolve_project_root(root).join(&pid);
-    let mut lineage = crate::data::version::Lineage::load(&dir)?;
-    crate::data::version::switch_branch(&dir, &mut lineage, &id)
+    run_blocking("branch switch", move || {
+        let doc = Doc::load(&dir)?;
+        if !working_head_is_committed(&dir, &doc)? {
+            return Err(AppError::Schema(
+                "save the current project as a version before switching branches".into(),
+            ));
+        }
+        let mut lineage = crate::data::version::Lineage::load(&dir)?;
+        crate::data::version::switch_branch(&dir, &mut lineage, &id)
+    })
+    .await
 }
 
 // ---- line editing, style, and cloud configuration ----
@@ -2151,6 +2354,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_reveal_rejects_a_regular_file_as_project_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("p1"), "not a project directory").unwrap();
+        assert!(project_reveal("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn project_metadata_update_is_trimmed_and_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("p1");
@@ -2201,6 +2413,190 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    fn save_index_project(
+        root: &std::path::Path,
+        pid: &str,
+        title: &str,
+        description: &str,
+        transcript: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        Doc {
+            id: pid.into(),
+            schema: 1,
+            media: MediaRef {
+                path: root.join(format!("{pid}.mp4")),
+                duration_seconds: 10.0,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: title.into(),
+                description: description.into(),
+                language: Some("en".into()),
+                created_at: updated_at,
+                updated_at,
+            },
+            paragraphs: vec![crate::data::Paragraph {
+                id: 1,
+                speaker: Some("Guest".into()),
+                sentences: vec![crate::data::Sentence {
+                    id: "s1".into(),
+                    text: transcript.into(),
+                    words: vec![],
+                }],
+            }],
+            translations: Default::default(),
+        }
+        .save(&root.join(pid))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_index_searches_content_and_persists_starred_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        save_index_project(
+            tmp.path(),
+            "older",
+            "Design interview",
+            "Customer notes",
+            "A phrase only in the transcript",
+            now - chrono::Duration::hours(1),
+        );
+        save_index_project(
+            tmp.path(),
+            "newer",
+            "Weekly update",
+            "Shipping notes",
+            "Nothing special",
+            now,
+        );
+
+        let transcript_matches = project_search(
+            "ONLY IN THE TRANSCRIPT".into(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(transcript_matches.len(), 1);
+        assert_eq!(transcript_matches[0].pid, "older");
+        assert_eq!(transcript_matches[0].description, "Customer notes");
+
+        let starred = project_set_star("older".into(), true, Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(starred.starred);
+        let projects = project_list(Some(tmp.path().to_path_buf())).await.unwrap();
+        assert_eq!(projects[0].pid, "older");
+        assert!(projects[0].starred);
+
+        let persisted: ProjectLocalState = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("older/project-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(persisted.starred);
+    }
+
+    #[tokio::test]
+    async fn version_commands_expose_head_and_active_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "A recoverable transcript",
+            chrono::Utc::now(),
+        );
+
+        let version = version_commit(
+            "p1".into(),
+            "Baseline".into(),
+            "Before editing".into(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let initial = version_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(initial.head.as_deref(), Some(version.as_str()));
+        assert_eq!(initial.versions.len(), 1);
+        let wire = serde_json::to_value(&initial).unwrap();
+        assert_eq!(wire.get("v").and_then(serde_json::Value::as_u64), Some(1));
+        assert!(wire.get("versions").is_some());
+        assert!(wire.get("activeBranch").is_some());
+
+        let project = tmp.path().join("p1");
+        let mut edited = Doc::load(&project).unwrap();
+        edited.meta.title = "Unsaved branch work".into();
+        edited.save(&project).unwrap();
+
+        let branch = branch_create(
+            "p1".into(),
+            "Alternative".into(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let branched = version_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(branched.active_branch.as_deref(), Some(branch.as_str()));
+        assert!(branched.branches.iter().any(|item| item.id == branch));
+        assert_eq!(
+            Doc::load(&project).unwrap().meta.title,
+            "Unsaved branch work"
+        );
+        assert_eq!(branched.versions.len(), 2);
+
+        let mut dirty = Doc::load(&project).unwrap();
+        dirty.meta.title = "Still editing".into();
+        dirty.save(&project).unwrap();
+        assert!(
+            branch_switch("p1".into(), "main".into(), Some(tmp.path().to_path_buf()),)
+                .await
+                .is_err()
+        );
+        assert_eq!(Doc::load(&project).unwrap().meta.title, "Still editing");
+    }
+
+    #[tokio::test]
+    async fn timing_repair_caps_media_tail_and_saves_a_recovery_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "tail",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.media.duration_seconds = 10.0;
+        doc.paragraphs[0].sentences[0].words = vec![crate::data::Word {
+            id: "w0".into(),
+            text: "tail".into(),
+            start: 9.98,
+            end: 10.2,
+        }];
+        doc.save(&project).unwrap();
+
+        let result = timing_repair("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(result, "1 fix(es)");
+        let repaired = Doc::load(&project).unwrap();
+        assert!(repaired.all_words()[0].end <= repaired.media.duration_seconds);
+        let history = version_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(history.versions.len(), 1);
+        assert_eq!(history.versions[0].name, "before timing repair");
     }
 
     fn settings() -> SettingsPayload {
