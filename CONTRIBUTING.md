@@ -7,14 +7,14 @@ Thanks for helping improve lumen-cut.
 Install the requirements listed in the README, then run:
 
 ```bash
-npm install
-npm run tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 Before submitting a change, run:
 
 ```bash
-npm run build
+pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets

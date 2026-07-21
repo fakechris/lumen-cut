@@ -30,23 +30,32 @@ Model files are downloaded separately and are not stored in this repository.
 ## Development
 
 ```bash
-npm install
-npm run tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 Build the frontend and run the complete Rust test suite:
 
 ```bash
-npm run build
+pnpm build
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
-Create a release bundle:
+Create and package all local release artifacts:
 
 ```bash
-npm run tauri -- build
+pnpm release:local
 ```
+
+Raw Tauri output is written under `src-tauri/target/release/`. Installable
+bundles are under `src-tauri/target/release/bundle/`. The packaging script
+collects the distributable DMG, zipped app, CLI archive, and SHA-256 checksums
+in the top-level `build/` directory.
+
+GitHub Actions runs the same checks and packaging process for pushes and pull
+requests. Pushing a version tag such as `v0.1.0` creates a GitHub Release and
+attaches every file from `build/`.
 
 ## Project layout
 
@@ -55,6 +64,7 @@ src/             React desktop interface
 src-tauri/       Rust application, CLI, pipeline, exports, and tests
 sidecars/        Python entry points for ASR and speaker diarization
 task-specs/      JSON response specifications for background AI tasks
+scripts/         Local release packaging helpers
 ```
 
 Project data is stored under
