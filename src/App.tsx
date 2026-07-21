@@ -7,6 +7,7 @@ import {
   SunIcon,
   TranscriptIcon,
 } from "./components/Icons";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { t, type Lang } from "./i18n";
 import { ProjectsView } from "./views/ProjectsView";
 import { SettingsView } from "./views/SettingsView";
@@ -168,4 +169,10 @@ function App() {
   );
 }
 
-export default App;
+export default function AppWithErrorBoundary() {
+  return (
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
+  );
+}

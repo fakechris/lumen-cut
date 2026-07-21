@@ -30,8 +30,8 @@ export interface RecordingStopped extends RecordingStarted {
 
 export interface DocMedia {
   path: string;
-  duration_seconds: number;
-  sample_rate?: number;
+  durationSeconds: number;
+  sampleRate?: number;
   channels?: number;
 }
 
@@ -58,8 +58,8 @@ export interface DocMeta {
   title: string;
   description: string;
   language?: string | null;
-  created_at: string;
-  updated_at: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Doc {

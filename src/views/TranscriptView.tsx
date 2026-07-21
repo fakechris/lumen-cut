@@ -704,7 +704,7 @@ export function TranscriptView({
           <p className="eyebrow">{mediaName(doc.media.path)}</p>
           <h1>{doc.meta.title}</h1>
           <p className="editor-meta">
-            {doc.media.duration_seconds.toFixed(1)}s
+            {doc.media.durationSeconds.toFixed(1)}s
             {hasTranscript && ` · ${doc.paragraphs.length} ${c.paragraphs} · ${doc.paragraphs.flatMap((p) => p.sentences.flatMap((s) => s.words)).length} ${c.words}`}
           </p>
         </div>
@@ -820,7 +820,7 @@ export function TranscriptView({
             </div>
             <div>
               <dt>{c.duration}</dt>
-              <dd>{doc.media.duration_seconds.toFixed(1)}s</dd>
+              <dd>{doc.media.durationSeconds.toFixed(1)}s</dd>
             </div>
             <div>
               <dt>{c.language}</dt>

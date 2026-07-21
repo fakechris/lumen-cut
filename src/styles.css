@@ -2451,6 +2451,40 @@ input::placeholder {
   text-align: center;
 }
 
+.app-error-boundary {
+  --accent: #1f6feb;
+  --accent-hover: #195fc8;
+  --text: #20242b;
+  --text-tertiary: #707782;
+  align-items: center;
+  background: var(--surface, #f7f8fa);
+  color: var(--text, #20242b);
+  display: flex;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 32px;
+}
+
+.app-error-boundary > div {
+  max-width: 520px;
+}
+
+.app-error-boundary h1 {
+  font-size: 30px;
+  margin: 8px 0 12px;
+}
+
+.app-error-boundary p {
+  line-height: 1.6;
+  margin: 0 0 6px;
+}
+
+.app-error-boundary small {
+  color: var(--text-tertiary, #707782);
+  display: block;
+  margin-bottom: 22px;
+}
+
 .editor-empty svg {
   height: 28px;
   width: 28px;

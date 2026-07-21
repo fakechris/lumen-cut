@@ -22,7 +22,7 @@ export function TimelineWorkspace({ cuts, doc, lang }: Props) {
   const [mediaSource, setMediaSource] = useState<string | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
-  const duration = Math.max(doc.media.duration_seconds, 0.001);
+  const duration = Math.max(doc.media.durationSeconds, 0.001);
   const words = doc.paragraphs.flatMap((paragraph) =>
     paragraph.sentences.flatMap((sentence) => sentence.words),
   );

@@ -8,6 +8,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "vitest run",
     "build": "tsc && vite build",
     "build:desktop": "tauri build",
     "package:release": "./scripts/package-release.sh",
@@ -22,11 +23,15 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.1.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "25.0.1",
     "typescript": "^5.5.3",
-    "vite": "^5.4.2"
+    "vite": "^5.4.2",
+    "vitest": "2.1.9"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
