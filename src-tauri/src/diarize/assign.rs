@@ -8,9 +8,28 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::data::{Doc, Paragraph};
 
 use super::DiarSegment;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerMatch {
+    pub speaker: String,
+    pub covered_seconds: f64,
+    pub timed_seconds: f64,
+    pub coverage: f64,
+    pub margin: f64,
+}
+
+pub const MIN_SPEAKER_COVERAGE: f64 = 0.5;
+pub const MIN_SPEAKER_MARGIN: f64 = 0.15;
+
+pub fn reliable_speaker_match(coverage: f64, margin: f64) -> bool {
+    coverage >= MIN_SPEAKER_COVERAGE && margin >= MIN_SPEAKER_MARGIN
+}
 
 /// Assign each paragraph its dominant speaker. Returns the number of
 /// paragraphs that received a speaker. Paragraphs whose words overlap no
@@ -19,8 +38,8 @@ use super::DiarSegment;
 pub fn assign_speakers(doc: &mut Doc, segments: &[DiarSegment]) -> usize {
     let mut assigned = 0;
     for para in &mut doc.paragraphs {
-        if let Some(speaker) = paragraph_speaker(para, segments) {
-            para.speaker = Some(speaker);
+        if let Some(matched) = match_paragraph(para, segments) {
+            para.speaker = Some(matched.speaker);
             assigned += 1;
         }
     }
@@ -31,8 +50,14 @@ pub fn assign_speakers(doc: &mut Doc, segments: &[DiarSegment]) -> usize {
 /// timestamps and return the speaker with the largest total. Deterministic:
 /// on exact ties the lexicographically largest label wins (`BTreeMap`
 /// iteration order + `Iterator::max_by` returning the last maximum).
-fn paragraph_speaker(para: &Paragraph, segments: &[DiarSegment]) -> Option<String> {
+pub fn match_paragraph(para: &Paragraph, segments: &[DiarSegment]) -> Option<SpeakerMatch> {
     let mut coverage: BTreeMap<&str, f64> = BTreeMap::new();
+    let timed_seconds = para
+        .sentences
+        .iter()
+        .flat_map(|sentence| sentence.words.iter())
+        .map(|word| (word.end - word.start).max(0.0))
+        .sum::<f64>();
     for seg in segments {
         for sent in &para.sentences {
             for w in &sent.words {
@@ -43,10 +68,33 @@ fn paragraph_speaker(para: &Paragraph, segments: &[DiarSegment]) -> Option<Strin
             }
         }
     }
-    coverage
-        .into_iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(speaker, _)| speaker.to_string())
+    let mut ranked = coverage.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.0.cmp(left.0))
+    });
+    let (speaker, covered_seconds) = ranked.first().copied()?;
+    let runner_up = ranked.get(1).map(|(_, seconds)| *seconds).unwrap_or(0.0);
+    let coverage = if timed_seconds > 0.0 {
+        (covered_seconds / timed_seconds).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let margin = if timed_seconds > 0.0 {
+        ((covered_seconds - runner_up) / timed_seconds).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    reliable_speaker_match(coverage, margin).then(|| SpeakerMatch {
+        speaker: speaker.to_string(),
+        covered_seconds,
+        timed_seconds,
+        coverage,
+        margin,
+    })
 }
 
 #[cfg(test)]
@@ -131,6 +179,10 @@ mod tests {
         let segs = vec![seg("A", 0.0, 1.0), seg("B", 1.0, 3.0)];
         assign_speakers(&mut d, &segs);
         assert_eq!(d.paragraphs[0].speaker.as_deref(), Some("B"));
+        let matched = match_paragraph(&d.paragraphs[0], &segs).unwrap();
+        assert_eq!(matched.speaker, "B");
+        assert!((matched.covered_seconds - 1.5).abs() < 0.001);
+        assert!((matched.coverage - 0.75).abs() < 0.001);
     }
 
     #[test]
@@ -159,12 +211,11 @@ mod tests {
     }
 
     #[test]
-    fn ties_resolve_deterministically() {
-        // Identical coverage for A and B → deterministic pick (largest label).
+    fn ties_are_left_for_manual_review() {
         let mut d = doc(vec![para(1, vec![word("w0", 0.0, 2.0)])]);
         let segs = vec![seg("A", 0.0, 2.0), seg("B", 0.0, 2.0)];
-        assign_speakers(&mut d, &segs);
-        assert_eq!(d.paragraphs[0].speaker.as_deref(), Some("B"));
+        assert_eq!(assign_speakers(&mut d, &segs), 0);
+        assert_eq!(d.paragraphs[0].speaker, None);
     }
 
     #[test]
@@ -187,5 +238,17 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(d.paragraphs[0].speaker.as_deref(), Some("A"));
         assert_eq!(d.paragraphs[1].speaker.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn tiny_overlap_is_not_a_reliable_assignment() {
+        let paragraph = para(1, vec![word("w0", 0.0, 10.0)]);
+        assert!(match_paragraph(&paragraph, &[seg("A", 0.0, 0.2)]).is_none());
+    }
+
+    #[test]
+    fn near_tied_candidates_are_not_a_reliable_assignment() {
+        let paragraph = para(1, vec![word("w0", 0.0, 10.0)]);
+        assert!(match_paragraph(&paragraph, &[seg("A", 0.0, 5.1), seg("B", 5.1, 10.0)]).is_none());
     }
 }

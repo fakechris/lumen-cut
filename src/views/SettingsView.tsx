@@ -4,6 +4,8 @@ import {
   asrRuntimeInstall,
   asrStatus,
   configShow,
+  diarizeModelDownload,
+  diarizeRuntimeInstall,
   loadSettings,
   saveSettings,
   settingsExport,
@@ -22,21 +24,30 @@ const COPY = {
     eyebrow: "偏好设置",
     title: "设置",
     intro: "首次转写请按下方状态引导准备本地引擎和模型；完成后，转写与其他后台任务会按需自动运行。",
-    localTitle: "本地转写",
-    localDescription: "语音识别在 Mac 本机运行。这里显示真实的运行环境与模型状态。",
+    localTitle: "本地模型与运行环境",
+    localDescription: "转写、词级对齐和说话人识别都在 Mac 本机运行。这里显示每一项真实状态。",
     asrModel: "转写模型",
     aligner: "字词对齐模型",
     runtime: "转写引擎",
+    diarizeModel: "说话人模型",
+    diarizeRuntime: "说话人识别引擎",
+    hfToken: "Hugging Face 授权",
+    tokenReady: "已检测到访问令牌",
+    tokenMissing: "未检测到 HF_TOKEN",
     installed: "已就绪",
     missing: "未就绪",
     modelCached: "模型已下载",
     modelMissing: "模型尚未完整下载",
-    installRuntime: "安装转写引擎",
+    installRuntime: "安装或修复转写引擎",
     installingRuntime: "正在安装转写引擎…",
-    downloadModels: "下载所需模型",
-    downloadingModels: "正在下载模型（约 3 GB）…",
+    downloadModels: "下载转写模型",
+    downloadingModels: "正在下载转写模型（可能需要数 GB）…",
+    installSpeakerRuntime: "启用说话人识别",
+    installingSpeakerRuntime: "正在安装说话人识别引擎…",
+    downloadSpeakerModel: "下载说话人模型",
+    downloadingSpeakerModel: "正在下载说话人模型…",
     refreshStatus: "重新检查",
-    localHint: "首次准备需要联网。安装和下载都在后台执行，界面不会被阻塞。",
+    localHint: "先准备转写即可开始工作；说话人识别是可选能力，需要另行接受模型条款并设置 HF_TOKEN。安装和下载都在后台执行。",
     agentTitle: "AI 功能",
     agentDescription: "用于翻译、润色、章节和 B-roll 建议。基础转写与字幕导出不需要配置。",
     automatic: "无需手动启动 Pipeline 或服务器。保存服务地址和模型后，使用相关功能时会自动启动后台任务。",
@@ -59,21 +70,30 @@ const COPY = {
     eyebrow: "Preferences",
     title: "Settings",
     intro: "Before the first transcript, use the status below to prepare the local runtime and models. Later jobs start automatically.",
-    localTitle: "Local transcription",
-    localDescription: "Speech recognition runs on this Mac. This reports the real runtime and model state.",
+    localTitle: "Local models and runtimes",
+    localDescription: "Transcription, word alignment, and speaker identification run on this Mac. Every real dependency is reported here.",
     asrModel: "Transcription model",
     aligner: "Word alignment model",
     runtime: "Transcription runtime",
+    diarizeModel: "Speaker model",
+    diarizeRuntime: "Speaker runtime",
+    hfToken: "Hugging Face access",
+    tokenReady: "Access token detected",
+    tokenMissing: "HF_TOKEN is not set",
     installed: "Ready",
     missing: "Not ready",
     modelCached: "Model downloaded",
     modelMissing: "Model download is missing or incomplete",
-    installRuntime: "Install transcription runtime",
+    installRuntime: "Install or repair transcription runtime",
     installingRuntime: "Installing transcription runtime…",
-    downloadModels: "Download required models",
-    downloadingModels: "Downloading models (about 3 GB)…",
+    downloadModels: "Download transcription models",
+    downloadingModels: "Downloading transcription models (several GB may be needed)…",
+    installSpeakerRuntime: "Enable speaker identification",
+    installingSpeakerRuntime: "Installing speaker identification runtime…",
+    downloadSpeakerModel: "Download speaker model",
+    downloadingSpeakerModel: "Downloading speaker model…",
     refreshStatus: "Check again",
-    localHint: "First-time setup needs a network connection. Installation and downloads run in the background.",
+    localHint: "Prepare transcription first and start working. Speaker identification is optional and separately requires accepting model terms and setting HF_TOKEN. All setup runs in the background.",
     agentTitle: "AI features",
     agentDescription: "Used for translation, polish, chapters, and B-roll suggestions. Basic transcription and subtitle export need no configuration.",
     automatic: "You never need to start a Pipeline or server manually. Save an endpoint and model; the background worker starts when a feature needs it.",
@@ -100,7 +120,7 @@ export function SettingsView({ lang, pid }: Props) {
   const [state, setState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [asr, setAsr] = useState<AsrStatus | null>(null);
-  const [asrAction, setAsrAction] = useState<"install" | "download" | "check" | null>("check");
+  const [asrAction, setAsrAction] = useState<"install" | "download" | "install-speakers" | "download-speakers" | "check" | null>("check");
 
   useEffect(() => {
     let disposed = false;
@@ -111,6 +131,7 @@ export function SettingsView({ lang, pid }: Props) {
           asrModel: config.asrModel,
           asrAligner: config.asrAligner,
           diarizeModel: config.diarizeModel,
+          hfToken: config.hfToken,
           llmEndpoint: config.llmEndpoint,
           llmApiKey: config.llmApiKey,
           llmModel: config.llmModel,
@@ -138,6 +159,7 @@ export function SettingsView({ lang, pid }: Props) {
     try {
       const normalized = {
         ...settings,
+        hfToken: settings.hfToken.trim(),
         llmEndpoint: settings.llmEndpoint.trim(),
         llmApiKey: settings.llmApiKey.trim(),
         llmModel: settings.llmModel.trim(),
@@ -195,6 +217,32 @@ export function SettingsView({ lang, pid }: Props) {
     }
   };
 
+  const installSpeakers = async () => {
+    setAsrAction("install-speakers");
+    setMessage(null);
+    try {
+      setAsr(await diarizeRuntimeInstall());
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAsrAction(null);
+    }
+  };
+
+  const downloadSpeakerModel = async () => {
+    setAsrAction("download-speakers");
+    setMessage(null);
+    try {
+      saveSettings(settings);
+      await settingsExport(settings);
+      setAsr(await diarizeModelDownload());
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAsrAction(null);
+    }
+  };
+
   const refreshAsr = async () => {
     setAsrAction("check");
     setMessage(null);
@@ -209,6 +257,22 @@ export function SettingsView({ lang, pid }: Props) {
 
   const selectAsrModel = async (asrModel: string) => {
     const next = { ...settings, asrModel };
+    setSettings(next);
+    setAsrAction("check");
+    setMessage(null);
+    try {
+      saveSettings(next);
+      await settingsExport(next);
+      setAsr(await asrStatus());
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAsrAction(null);
+    }
+  };
+
+  const selectDiarizeModel = async (diarizeModel: string) => {
+    const next = { ...settings, diarizeModel };
     setSettings(next);
     setAsrAction("check");
     setMessage(null);
@@ -253,6 +317,26 @@ export function SettingsView({ lang, pid }: Props) {
             <span>{c.aligner}</span>
             <input value={settings.asrAligner} readOnly />
           </label>
+          <label>
+            <span>{c.diarizeModel}</span>
+            <select
+              disabled={asrAction !== null}
+              value={settings.diarizeModel}
+              onChange={(event) => void selectDiarizeModel(event.target.value)}
+            >
+              <option value="pyannote/speaker-diarization-3.1">Speaker Diarization 3.1 · {lang === "zh" ? "已验证" : "verified"}</option>
+            </select>
+          </label>
+          <label>
+            <span>{c.hfToken}</span>
+            <input
+              autoComplete="off"
+              placeholder="hf_…"
+              type="password"
+              value={settings.hfToken}
+              onChange={(event) => update("hfToken", event.target.value)}
+            />
+          </label>
 
           <div className="asr-health" aria-live="polite">
             <div>
@@ -270,6 +354,21 @@ export function SettingsView({ lang, pid }: Props) {
               <strong>{settings.asrAligner}</strong>
               <small>{asr?.alignerCached ? c.modelCached : c.modelMissing}</small>
             </div>
+            <div>
+              <span className={asr?.diarizeRuntimeReady ? "status-dot ready" : "status-dot"} />
+              <strong>{c.diarizeRuntime}</strong>
+              <small>{asr?.diarizeRuntimeReady ? `${c.installed} · ${asr.diarizeRuntimeDetail}` : asr?.diarizeRuntimeDetail || c.missing}</small>
+            </div>
+            <div>
+              <span className={asr?.diarizeModelCached ? "status-dot ready" : "status-dot"} />
+              <strong>{settings.diarizeModel}</strong>
+              <small>{asr?.diarizeModelCached ? c.modelCached : c.modelMissing}</small>
+            </div>
+            <div>
+              <span className={asr?.huggingFaceTokenSet ? "status-dot ready" : "status-dot"} />
+              <strong>{c.hfToken}</strong>
+              <small>{asr?.huggingFaceTokenSet ? c.tokenReady : c.tokenMissing}</small>
+            </div>
           </div>
 
           <div className="settings-save asr-actions">
@@ -279,8 +378,26 @@ export function SettingsView({ lang, pid }: Props) {
               </button>
             )}
             {asr?.runtimeReady && (!asr.modelCached || !asr.alignerCached) && (
-              <button className="button-primary" disabled={asrAction !== null} onClick={downloadAsrModels}>
+              <button
+                className="button-primary"
+                disabled={asrAction !== null}
+                onClick={downloadAsrModels}
+              >
                 {asrAction === "download" ? c.downloadingModels : c.downloadModels}
+              </button>
+            )}
+            {!asr?.diarizeRuntimeReady && (
+              <button className="button-quiet" disabled={asrAction !== null} onClick={installSpeakers}>
+                {asrAction === "install-speakers" ? c.installingSpeakerRuntime : c.installSpeakerRuntime}
+              </button>
+            )}
+            {asr?.diarizeRuntimeReady && !asr.diarizeModelCached && (
+              <button
+                className="button-quiet"
+                disabled={asrAction !== null || (!settings.hfToken.trim() && !asr.huggingFaceTokenSet)}
+                onClick={downloadSpeakerModel}
+              >
+                {asrAction === "download-speakers" ? c.downloadingSpeakerModel : c.downloadSpeakerModel}
               </button>
             )}
             <button className="button-quiet" disabled={asrAction !== null} onClick={refreshAsr}>

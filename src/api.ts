@@ -19,7 +19,10 @@ import type {
   RecordingStopped,
   ReportSummary,
   Settings,
+  SpeakerEvidence,
   SpeakerInfo,
+  SpeakerReidentifyPreview,
+  SpeakerReidentifyProposal,
   SubtitleRow,
   SubtitleStyle,
   TaskStatus,
@@ -251,12 +254,24 @@ export async function asrModelsDownload(): Promise<AsrStatus> {
   return invoke("asr_models_download");
 }
 
+export async function diarizeRuntimeInstall(): Promise<AsrStatus> {
+  return invoke("diarize_runtime_install");
+}
+
+export async function diarizeModelDownload(): Promise<AsrStatus> {
+  return invoke("diarize_model_download");
+}
+
 export async function runDoctor(): Promise<DoctorCheck[]> {
   return invoke("run_doctor");
 }
 
 export async function speakersList(pid: string): Promise<SpeakerInfo[]> {
   return invoke("speakers_list", { pid, root: null });
+}
+
+export async function speakerEvidence(pid: string): Promise<SpeakerEvidence> {
+  return invoke("speaker_evidence", { pid, root: null });
 }
 
 export async function speakerRename(
@@ -273,6 +288,31 @@ export async function speakerMerge(
   into: string,
 ): Promise<number> {
   return invoke("speaker_merge", { pid, from, into, root: null });
+}
+
+export async function speakerAssign(
+  pid: string,
+  paragraphId: number,
+  speaker: string | null,
+): Promise<void> {
+  return invoke("speaker_assign", {
+    pid,
+    input: { paragraphId, speaker },
+    root: null,
+  });
+}
+
+export async function speakerReidentifyPreview(
+  pid: string,
+): Promise<SpeakerReidentifyPreview> {
+  return invoke("speaker_reidentify_preview", { pid, root: null });
+}
+
+export async function speakerReidentifyApply(
+  pid: string,
+  proposals: SpeakerReidentifyProposal[],
+): Promise<number> {
+  return invoke("speaker_reidentify_apply", { pid, proposals, root: null });
 }
 
 export async function brollList(pid: string): Promise<BrollOverview> {
@@ -405,6 +445,7 @@ export async function settingsExport(s: Settings): Promise<string> {
       asr_model: s.asrModel,
       asr_aligner: s.asrAligner,
       diarize_model: s.diarizeModel,
+      hf_token: s.hfToken,
       llm_endpoint: s.llmEndpoint,
       llm_api_key: s.llmApiKey,
       llm_model: s.llmModel,
@@ -428,7 +469,8 @@ export function loadSettings(): Settings {
 }
 
 export function saveSettings(s: Settings) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  const { hfToken: _hfToken, llmApiKey: _llmApiKey, ...nonSensitive } = s;
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(nonSensitive));
 }
 
 function defaultSettings(): Settings {
@@ -436,6 +478,7 @@ function defaultSettings(): Settings {
     asrModel: "Qwen/Qwen3-ASR-0.6B",
     asrAligner: "Qwen/Qwen3-ForcedAligner-0.6B",
     diarizeModel: "pyannote/speaker-diarization-3.1",
+    hfToken: "",
     llmEndpoint: "",
     llmApiKey: "",
     llmModel: "",

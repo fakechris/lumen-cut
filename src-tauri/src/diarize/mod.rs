@@ -15,7 +15,7 @@ use tracing::info;
 use crate::error::{AppError, AppResult};
 use crate::proc;
 
-pub use assign::assign_speakers;
+pub use assign::{assign_speakers, match_paragraph, reliable_speaker_match, SpeakerMatch};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizeOutV1 {
@@ -45,13 +45,23 @@ pub async fn diarize_file_with_model(wav: &Path, model: &str) -> AppResult<Diari
              sidecars/diarize/main.py, or install a bundle containing Resources/sidecars"
             .into(),
     })?;
-    let py = std::env::var("LUMEN_CUT_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let py = std::env::var("LUMEN_CUT_PYTHON")
+        .unwrap_or_else(|_| crate::asr::resolve_python().to_string_lossy().into_owned());
 
     info!(bin = %py, path = %sidecar.display(), "spawning diarize sidecar");
 
     let args = build_sidecar_args(wav, model, &sidecar);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let raw = proc::run(&py, &arg_refs).await?;
+    let config_token = crate::data::modelconfig::load().hf_token;
+    let token = (!config_token.trim().is_empty())
+        .then_some(config_token)
+        .or_else(|| std::env::var("HF_TOKEN").ok())
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+    let environment = token
+        .as_deref()
+        .map(|token| vec![("HF_TOKEN", token)])
+        .unwrap_or_default();
+    let raw = proc::run_with_env(&py, &arg_refs, &environment).await?;
     let parsed: DiarizeOutV1 = serde_json::from_str(&raw).map_err(|e| AppError::Sidecar {
         sidecar: "lumen_cut_diarize",
         message: format!("json: {e}"),

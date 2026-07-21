@@ -14,7 +14,6 @@ import {
   cutAuto,
   cutList,
   cutRestore,
-  diarize,
   exportSubtitles,
   exportVideo,
   finishCheck,
@@ -22,9 +21,12 @@ import {
   pickBrollFile,
   projectUpdateMeta,
   projectShow,
+  speakerAssign,
+  speakerEvidence,
   speakerMerge,
+  speakerReidentifyApply,
+  speakerReidentifyPreview,
   speakerRename,
-  speakersList,
   splitSubtitle,
   styleGet,
   styleSet,
@@ -59,7 +61,10 @@ import type {
   SubtitleRow,
   SubtitleStyle,
   ReportSummary,
+  SpeakerEvidence,
+  SpeakerReidentifyProposal,
   SpeakerInfo,
+  SpeakerReidentifyPreview,
   TaskStatus,
   TranscriptionJobStatus,
   VersionHistory,
@@ -269,6 +274,13 @@ export function TranscriptView({
   const [subtitleRows, setSubtitleRows] = useState<SubtitleRow[]>([]);
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle | null>(null);
   const [speakers, setSpeakers] = useState<SpeakerInfo[]>([]);
+  const [speakerEvidenceState, setSpeakerEvidenceState] = useState<SpeakerEvidence>({
+    speakers: [],
+    turns: [],
+    identified: false,
+    unlabelled: 0,
+  });
+  const [speakerPreview, setSpeakerPreview] = useState<SpeakerReidentifyPreview | null>(null);
   const [transcriptionJob, setTranscriptionJob] =
     useState<TranscriptionJobStatus | null>(null);
   const [agentConfigured, setAgentConfigured] = useState(false);
@@ -282,11 +294,11 @@ export function TranscriptView({
   const previousPending = useRef(0);
 
   const reload = async (projectId: string, resetTab = true) => {
-    const [nextDoc, nextRows, nextStyle, nextSpeakers, nextBroll] = await Promise.all([
+    const [nextDoc, nextRows, nextStyle, nextEvidence, nextBroll] = await Promise.all([
       projectShow(projectId),
       subtitleList(projectId),
       styleGet(projectId),
-      speakersList(projectId),
+      speakerEvidence(projectId),
       brollList(projectId).catch((error) => {
         setFeedback({
           tone: "error",
@@ -300,7 +312,8 @@ export function TranscriptView({
     setDoc(nextDoc);
     setSubtitleRows(nextRows);
     setSubtitleStyle(nextStyle);
-    setSpeakers(nextSpeakers);
+    setSpeakers(nextEvidence.speakers);
+    setSpeakerEvidenceState(nextEvidence);
     setBrollOverview(nextBroll);
     if (resetTab) {
       setActiveTab(nextDoc.paragraphs.length > 0 ? "transcript" : "setup");
@@ -321,6 +334,8 @@ export function TranscriptView({
     setOperation(null);
     setTranscriptionJob(null);
     setVersionHistory(null);
+    setSpeakerEvidenceState({ speakers: [], turns: [], identified: false, unlabelled: 0 });
+    setSpeakerPreview(null);
     setBrollOverview({ suggestions: [], accepted: [], errors: [] });
     if (!pid) return;
     void Promise.all([
@@ -635,18 +650,46 @@ export function TranscriptView({
     }
   };
 
-  const identifySpeakers = () =>
-    perform("speakers", async () => {
-      const result = await diarize(pid);
-      await reload(pid);
+  const previewSpeakers = async () => {
+    await performRecoverable("speakers-preview", async () => {
+      const preview = await speakerReidentifyPreview(pid);
+      setSpeakerPreview(preview);
+      setActiveTab("properties");
       setFeedback({
-        tone: "success",
-        text:
-          lang === "zh"
-            ? `已为 ${result.paragraphs_assigned} 个段落识别说话人。`
-            : `Identified speakers for ${result.paragraphs_assigned} paragraphs.`,
+        tone: "info",
+        text: lang === "zh"
+          ? `分析完成：${preview.changed} 个段落标签可能改变。项目尚未被修改。`
+          : `Analysis complete: ${preview.changed} paragraph labels may change. The project is unchanged.`,
       });
     });
+  };
+
+  const applySpeakerPreview = async (proposals: SpeakerReidentifyProposal[]) => {
+    if (!speakerPreview || proposals.length === 0) return;
+    await performRecoverable("speakers-apply", async () => {
+      const changed = await speakerReidentifyApply(pid, proposals);
+      setSpeakerPreview(null);
+      await Promise.all([reload(pid, false), refreshVersionHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? `已应用 ${changed} 个说话人标签；应用前状态可在“版本”中恢复。`
+          : `Applied ${changed} speaker labels. The prior state is recoverable from Versions.`,
+      });
+    });
+  };
+
+  const assignSpeaker = async (paragraphId: number, speaker: string | null) => {
+    await performRecoverable(`speaker-assign-${paragraphId}`, async () => {
+      await speakerAssign(pid, paragraphId, speaker);
+      await reload(pid, false);
+      setSpeakerPreview(null);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "此段说话人已保存。" : "Saved the speaker for this turn.",
+      });
+    });
+  };
 
   const saveProjectMeta = async (
     title: string,
@@ -781,6 +824,7 @@ export function TranscriptView({
       const changed = await speakerRename(pid, from, to);
       if (changed < 1) throw new Error(`speaker ${from} was not found`);
       await reload(pid, false);
+      setSpeakerPreview(null);
       setFeedback({
         tone: "success",
         text:
@@ -803,6 +847,7 @@ export function TranscriptView({
       const changed = await speakerMerge(pid, from, into);
       if (changed < 1) throw new Error(`speaker ${from} was not found`);
       await reload(pid, false);
+      setSpeakerPreview(null);
       setFeedback({
         tone: "success",
         text:
@@ -1025,8 +1070,14 @@ export function TranscriptView({
           <aside className="editor-actions">
             <section>
               <h2>{lang === "zh" ? "增强转写" : "Enhance transcript"}</h2>
-              <button disabled={operation !== null} onClick={identifySpeakers}>
-                {operation === "speakers" ? <span className="spinner" /> : null}
+              <button
+                disabled={operation !== null}
+                onClick={() => {
+                  if (asrReadiness?.diarizeReady) void previewSpeakers();
+                  else setActiveTab("properties");
+                }}
+              >
+                {operation === "speakers-preview" ? <span className="spinner" /> : null}
                 {c.speaker}
               </button>
             </section>
@@ -1078,11 +1129,17 @@ export function TranscriptView({
       {activeTab === "properties" && (
         <PropertiesWorkspace
           busy={operation !== null}
+          diarizeReady={asrReadiness?.diarizeReady ?? false}
           doc={doc}
+          evidence={speakerEvidenceState}
           lang={lang}
+          preview={speakerPreview}
           speakers={speakers}
-          onIdentify={identifySpeakers}
+          onApplyPreview={applySpeakerPreview}
+          onAssign={assignSpeaker}
           onMerge={mergeSpeaker}
+          onOpenSettings={onOpenSettings}
+          onPreview={previewSpeakers}
           onRename={renameSpeaker}
           onSaveMeta={saveProjectMeta}
         />

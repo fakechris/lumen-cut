@@ -3,7 +3,7 @@
 //! Stage 5 wires every Stage-3 + Stage-4 entry point into a `#[tauri::command]`
 //! so the React frontend can drive the editor in-process.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -279,6 +279,7 @@ pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary
     };
     let save_doc = doc.clone();
     let save_dir = dir.clone();
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("project save", move || save_doc.save(&save_dir)).await?;
     Ok(ProjectSummary {
         pid: args.pid,
@@ -321,6 +322,7 @@ pub async fn project_set_star(
     root: Option<PathBuf>,
 ) -> AppResult<ProjectSummary> {
     let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("project star update", move || {
         let doc = Doc::load(&dir)?;
         save_project_local_state(&dir, &ProjectLocalState { starred })?;
@@ -338,6 +340,7 @@ pub async fn project_update_meta(
     root: Option<PathBuf>,
 ) -> AppResult<Doc> {
     let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("project metadata update", move || {
         let mut doc = Doc::load(&dir)?;
         let title = title.trim();
@@ -407,6 +410,7 @@ pub async fn project_delete(
         ));
     }
     let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     if !tokio::fs::try_exists(&dir).await? {
         return Ok(false);
     }
@@ -436,11 +440,16 @@ pub async fn media_asset_allow(
     app: tauri::AppHandle,
     state: tauri::State<'_, MediaAssetState>,
 ) -> AppResult<String> {
-    let doc = Doc::load(&resolve_project_root(root).join(&pid))?;
-    let media_path = std::fs::canonicalize(&doc.media.path)?;
-    if !media_path.is_file() {
-        return Err(AppError::ProjectNotFound(media_path));
-    }
+    let dir = resolve_project_dir(&pid, root)?;
+    let media_path = run_blocking("media asset validation", move || {
+        let doc = Doc::load(&dir)?;
+        let media_path = std::fs::canonicalize(&doc.media.path)?;
+        if !media_path.is_file() {
+            return Err(AppError::ProjectNotFound(media_path));
+        }
+        Ok(media_path)
+    })
+    .await?;
 
     let scope = app.asset_protocol_scope();
     let mut current = state.current.lock().expect("media asset state poisoned");
@@ -536,6 +545,7 @@ where
     });
     let pid_dir = out_dir.join(&pid_stem);
     tokio::fs::create_dir_all(&pid_dir).await?;
+    let _mutation = lock_project_mutation(&pid_dir).await;
     let wav = pid_dir.join("audio.wav");
     // A recording project already uses `<pid>/audio.wav` as its media source.
     // Avoid asking ffmpeg to overwrite its own input.
@@ -781,8 +791,7 @@ pub async fn task_start(
     state: tauri::State<'_, AgentServerState>,
     args: TaskStartArgs,
 ) -> AppResult<TaskStartResult> {
-    let root = resolve_project_root(args.root);
-    let dir = root.join(&args.pid);
+    let dir = resolve_project_dir(&args.pid, args.root.clone())?;
     let kind = args.kind;
     let lang = args.lang;
     let task = run_blocking("task preparation", move || {
@@ -800,15 +809,17 @@ pub async fn task_start(
     .await?;
     let pending = task.calls.len();
     let ai_dir = task.ai_dir.clone();
+    let project_mutation = project_mutation_mutex(&task.project_dir).await;
     let (agent_port, allocator) = ensure_agent_server(&state, None).await?;
     for prepared in &task.calls {
         allocator.enqueue(prepared.call.clone());
     }
     tokio::spawn(async move {
-        if let Err(error) = crate::agent::task::wait_and_apply(
+        if let Err(error) = crate::agent::task::wait_and_apply_with_lock(
             allocator,
             task,
             std::time::Duration::from_secs(30 * 60),
+            project_mutation,
         )
         .await
         {
@@ -928,20 +939,22 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
 
 #[tauri::command]
 pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> {
-    let root = resolve_project_root(root);
-    let project_dir = root.join(&pid);
-    let (pending, done) = crate::agent::task::task_counts(&project_dir);
-    let kinds = task_kind_statuses(&project_dir);
-    let polish_quality = crate::pipeline::polish::PolishQualityArtifact::load(
-        &project_dir.join("ai/polish-quality.json"),
-    )
-    .ok();
-    Ok(TaskStatus {
-        pending,
-        done,
-        kinds,
-        polish_quality,
+    let project_dir = resolve_project_dir(&pid, root)?;
+    run_blocking("task status", move || {
+        let (pending, done) = crate::agent::task::task_counts(&project_dir);
+        let kinds = task_kind_statuses(&project_dir);
+        let polish_quality = crate::pipeline::polish::PolishQualityArtifact::load(
+            &project_dir.join("ai/polish-quality.json"),
+        )
+        .ok();
+        Ok(TaskStatus {
+            pending,
+            done,
+            kinds,
+            polish_quality,
+        })
     })
+    .await
 }
 
 // ============================================================================
@@ -953,32 +966,34 @@ pub async fn finish_check_pid(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<Vec<FinishCheckItem>> {
-    let root = resolve_project_root(root);
-    let dir = root.join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts_path = dir.join("cuts.json");
-    let cuts: ClipCuts = if cuts_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-    } else {
-        ClipCuts::new()
-    };
-    let broll = crate::data::broll::load(&dir)?;
-    let items = finish_check_emit_for_project(
-        &doc,
-        &cuts,
-        &broll,
-        &dir,
-        working_head_is_committed(&dir, &doc)?,
-    );
-    Ok(items
-        .into_iter()
-        .map(|i| FinishCheckItem {
-            code: i.code.label().to_string(),
-            ordinal: i.code as u32,
-            pass: i.pass,
-            blockers: i.blockers.iter().map(|b| b.message.clone()).collect(),
-        })
-        .collect())
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("finish check", move || {
+        let doc = Doc::load(&dir)?;
+        let cuts_path = dir.join("cuts.json");
+        let cuts: ClipCuts = if cuts_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+        } else {
+            ClipCuts::new()
+        };
+        let broll = crate::data::broll::load(&dir)?;
+        let items = finish_check_emit_for_project(
+            &doc,
+            &cuts,
+            &broll,
+            &dir,
+            working_head_is_committed(&dir, &doc)?,
+        );
+        Ok(items
+            .into_iter()
+            .map(|i| FinishCheckItem {
+                code: i.code.label().to_string(),
+                ordinal: i.code as u32,
+                pass: i.pass,
+                blockers: i.blockers.iter().map(|b| b.message.clone()).collect(),
+            })
+            .collect())
+    })
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -991,35 +1006,41 @@ pub struct FinishCheckItem {
 
 #[tauri::command]
 pub async fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
-    let root = resolve_project_root(root);
-    let dir = root.join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts_path = dir.join("cuts.json");
-    let mut cuts: ClipCuts = if cuts_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-    } else {
-        ClipCuts::new()
-    };
-    let added = crate::pipeline::cleanup::apply(&doc, &mut cuts);
-    std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
-    Ok(added)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("automatic cut save", move || {
+        let doc = Doc::load(&dir)?;
+        let cuts_path = dir.join("cuts.json");
+        let mut cuts: ClipCuts = if cuts_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+        } else {
+            ClipCuts::new()
+        };
+        let added = crate::pipeline::cleanup::apply(&doc, &mut cuts);
+        std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+        Ok(added)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> AppResult<bool> {
-    let root = resolve_project_root(root);
-    let dir = root.join(&pid);
-    let cuts_path = dir.join("cuts.json");
-    let mut cuts: ClipCuts = if cuts_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-    } else {
-        return Ok(false);
-    };
-    let removed = cuts.restore(&cut_id);
-    if removed {
-        std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
-    }
-    Ok(removed)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("cut restore", move || {
+        let cuts_path = dir.join("cuts.json");
+        let mut cuts: ClipCuts = if cuts_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+        } else {
+            return Ok(false);
+        };
+        let removed = cuts.restore(&cut_id);
+        if removed {
+            std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+        }
+        Ok(removed)
+    })
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -1034,31 +1055,33 @@ pub struct CutSummary {
 
 #[tauri::command]
 pub async fn cut_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<CutSummary>> {
-    let root = resolve_project_root(root);
-    let dir = root.join(&pid);
-    let cuts_path = dir.join("cuts.json");
-    let cuts: ClipCuts = if cuts_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-    } else {
-        return Ok(vec![]);
-    };
-    Ok(cuts
-        .cuts
-        .iter()
-        .map(|c| CutSummary {
-            id: c.id.clone(),
-            kind: format!("{:?}", c.kind).to_lowercase(),
-            a_word: c.a_word.clone(),
-            b_word: c.b_word.clone(),
-            duration: c.duration,
-            note: c.note.clone(),
-        })
-        .collect())
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("cut list", move || {
+        let cuts_path = dir.join("cuts.json");
+        let cuts: ClipCuts = if cuts_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+        } else {
+            return Ok(vec![]);
+        };
+        Ok(cuts
+            .cuts
+            .iter()
+            .map(|c| CutSummary {
+                id: c.id.clone(),
+                kind: format!("{:?}", c.kind).to_lowercase(),
+                a_word: c.a_word.clone(),
+                b_word: c.b_word.clone(),
+                duration: c.duration,
+                note: c.note.clone(),
+            })
+            .collect())
+    })
+    .await
 }
 
 /// Settings as sent by the frontend over IPC (snake_case) and persisted
 /// to `~/.lumen-cut/settings.json` in camelCase.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     rename_all(serialize = "camelCase", deserialize = "snake_case"),
     default
@@ -1067,11 +1090,14 @@ pub struct SettingsPayload {
     pub asr_model: String,
     pub asr_aligner: String,
     pub diarize_model: String,
+    pub hf_token: String,
     pub llm_endpoint: String,
     pub llm_api_key: String,
     pub llm_model: String,
     pub worker_count: u32,
 }
+
+static SETTINGS_MUTATIONS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 impl Default for SettingsPayload {
     fn default() -> Self {
@@ -1080,6 +1106,7 @@ impl Default for SettingsPayload {
             asr_model: config.asr_model,
             asr_aligner: config.asr_aligner,
             diarize_model: config.diarize_model,
+            hf_token: config.hf_token,
             llm_endpoint: config.llm_endpoint,
             llm_api_key: config.llm_api_key,
             llm_model: config.llm_model,
@@ -1091,22 +1118,59 @@ impl Default for SettingsPayload {
 #[tauri::command]
 pub async fn settings_export(
     state: tauri::State<'_, AgentServerState>,
-    settings: SettingsPayload,
+    mut settings: SettingsPayload,
 ) -> AppResult<String> {
-    apply_worker_count(&state, &settings);
+    let _mutation = SETTINGS_MUTATIONS
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    // Secrets are write-only to the webview. An empty field means "leave the
+    // stored token unchanged", so an unrelated save cannot erase it.
+    if settings.hf_token.trim().is_empty() {
+        settings.hf_token = crate::data::modelconfig::load().hf_token;
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let path = write_settings_file(&home, &settings)?;
-    Ok(path.to_string_lossy().into_owned())
+    let persisted = settings.clone();
+    let path = run_blocking("settings save", move || {
+        let path = write_settings_file(&home, &settings)?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await?;
+    apply_worker_count(&state, &persisted);
+    Ok(path)
 }
 
 fn write_settings_file(home: &std::path::Path, settings: &SettingsPayload) -> AppResult<PathBuf> {
     let dir = home.join(".lumen-cut");
     std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let path = dir.join("settings.json");
+    let temporary = dir.join(format!(
+        "settings.json.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
     let body = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&temporary, body)?;
+    std::fs::rename(temporary, &path)?;
     Ok(path)
 }
 
@@ -1122,16 +1186,18 @@ fn apply_worker_count(state: &AgentServerState, settings: &SettingsPayload) {
 
 #[tauri::command]
 pub async fn audit_pid(pid: String, root: Option<PathBuf>) -> AppResult<ReportSummary> {
-    let root = resolve_project_root(root);
-    let dir = root.join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
-    let broll = crate::data::broll::load(&dir)?;
-    let r = audit_project(&doc, &cuts, &broll, &dir);
-    Ok(ReportSummary::from(&r))
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("project audit", move || {
+        let doc = Doc::load(&dir)?;
+        let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let broll = crate::data::broll::load(&dir)?;
+        let r = audit_project(&doc, &cuts, &broll, &dir);
+        Ok(ReportSummary::from(&r))
+    })
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -1230,6 +1296,7 @@ struct RecordingSession {
     pid: String,
     wav: PathBuf,
     child: tokio::process::Child,
+    _mutation: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Default for RecordingState {
@@ -1354,13 +1421,18 @@ pub async fn agent_enqueue(
     problems: Option<Vec<String>>,
 ) -> AppResult<()> {
     let contract = crate::agent::contract::contract_for_kind(&kind).map(str::to_string);
+    let payload_path = payload_ref.clone();
+    let char_count = run_blocking("agent payload sizing", move || {
+        Ok(payload_char_count(&payload_path))
+    })
+    .await?;
     enqueue_call(
         &state,
         crate::agent::PendingCall {
             id: call_id,
             kind,
             word_count,
-            char_count: payload_char_count(&payload_ref),
+            char_count,
             payload_ref,
             problems: problems.unwrap_or_default(),
             contract,
@@ -1425,10 +1497,13 @@ pub async fn subtitle_list(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<Vec<crate::data::subtitle::SubtitleRow>> {
-    let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    let hidden = crate::data::subtitle::load_hidden(&dir);
-    Ok(crate::data::subtitle::list(&doc, &hidden, None))
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("subtitle list", move || {
+        let doc = Doc::load(&dir)?;
+        let hidden = crate::data::subtitle::load_hidden(&dir);
+        Ok(crate::data::subtitle::list(&doc, &hidden, None))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1438,13 +1513,17 @@ pub async fn subtitle_set(
     text: String,
     root: Option<PathBuf>,
 ) -> AppResult<bool> {
-    let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let changed = crate::data::subtitle::set(&mut doc, &id, &text);
-    if changed {
-        doc.save(&dir)?;
-    }
-    Ok(changed)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle update", move || {
+        let mut doc = Doc::load(&dir)?;
+        let changed = crate::data::subtitle::set(&mut doc, &id, &text);
+        if changed {
+            doc.save(&dir)?;
+        }
+        Ok(changed)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1454,12 +1533,16 @@ pub async fn subtitle_visibility(
     hidden: bool,
     root: Option<PathBuf>,
 ) -> AppResult<bool> {
-    let dir = resolve_project_root(root).join(&pid);
-    if hidden {
-        crate::data::subtitle::hide(&dir, &id)
-    } else {
-        crate::data::subtitle::restore(&dir, &id)
-    }
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle visibility", move || {
+        if hidden {
+            crate::data::subtitle::hide(&dir, &id)
+        } else {
+            crate::data::subtitle::restore(&dir, &id)
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1470,13 +1553,17 @@ pub async fn subtitle_replace(
     regex: bool,
     root: Option<PathBuf>,
 ) -> AppResult<usize> {
-    let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let changed = crate::data::edit::find_replace(&mut doc, &query, &replacement, regex)?;
-    if changed > 0 {
-        doc.save(&dir)?;
-    }
-    Ok(changed)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle replacement", move || {
+        let mut doc = Doc::load(&dir)?;
+        let changed = crate::data::edit::find_replace(&mut doc, &query, &replacement, regex)?;
+        if changed > 0 {
+            doc.save(&dir)?;
+        }
+        Ok(changed)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1484,9 +1571,38 @@ pub async fn speakers_list(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<Vec<crate::data::speakers::SpeakerInfo>> {
-    let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    Ok(crate::data::speakers::list(&doc))
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("speaker list", move || {
+        let doc = Doc::load(&dir)?;
+        Ok(crate::data::speakers::list(&doc))
+    })
+    .await
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerEvidence {
+    pub speakers: Vec<crate::data::speakers::SpeakerInfo>,
+    pub turns: Vec<crate::data::speakers::SpeakerTurn>,
+    pub identified: bool,
+    pub unlabelled: usize,
+}
+
+#[tauri::command]
+pub async fn speaker_evidence(pid: String, root: Option<PathBuf>) -> AppResult<SpeakerEvidence> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("speaker evidence", move || {
+        let doc = Doc::load(&dir)?;
+        let turns = crate::data::speakers::turns(&doc);
+        let unlabelled = turns.iter().filter(|turn| turn.speaker.is_none()).count();
+        Ok(SpeakerEvidence {
+            speakers: crate::data::speakers::list(&doc),
+            identified: unlabelled == 0 && !turns.is_empty(),
+            turns,
+            unlabelled,
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1496,18 +1612,22 @@ pub async fn speaker_rename(
     to: String,
     root: Option<PathBuf>,
 ) -> AppResult<usize> {
-    let from = from.trim();
-    let to = to.trim();
+    let from = from.trim().to_owned();
+    let to = to.trim().to_owned();
     if from.is_empty() || to.is_empty() {
         return Err(AppError::Schema("speaker names cannot be empty".into()));
     }
-    let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let changed = crate::data::speakers::rename(&mut doc, from, to);
-    if changed > 0 {
-        doc.save(&dir)?;
-    }
-    Ok(changed)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("speaker rename", move || {
+        let mut doc = Doc::load(&dir)?;
+        let changed = crate::data::speakers::rename(&mut doc, &from, &to);
+        if changed > 0 {
+            doc.save(&dir)?;
+        }
+        Ok(changed)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1517,20 +1637,308 @@ pub async fn speaker_merge(
     into: String,
     root: Option<PathBuf>,
 ) -> AppResult<usize> {
-    let from = from.trim();
-    let into = into.trim();
+    let from = from.trim().to_owned();
+    let into = into.trim().to_owned();
     if from.is_empty() || into.is_empty() || from == into {
         return Err(AppError::Schema(
             "speaker merge requires two different non-empty names".into(),
         ));
     }
-    let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let changed = crate::data::speakers::merge(&mut doc, from, into);
-    if changed > 0 {
-        doc.save(&dir)?;
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("speaker merge", move || {
+        let original = Doc::load(&dir)?;
+        let mut doc = original.clone();
+        let changed = crate::data::speakers::merge(&mut doc, &from, &into);
+        if changed > 0 {
+            if !working_head_is_committed(&dir, &original)? {
+                let mut lineage = crate::data::version::Lineage::load(&dir)?;
+                let branch = lineage
+                    .active_branch
+                    .clone()
+                    .unwrap_or_else(|| "main".into());
+                crate::data::version::commit_snapshot(
+                    &dir,
+                    &original,
+                    &mut lineage,
+                    &branch,
+                    "Before speaker merge",
+                    "automatic recovery snapshot",
+                    crate::data::version::VersionKind::Auto,
+                )?;
+            }
+            doc.save(&dir)?;
+        }
+        Ok(changed)
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerAssignmentInput {
+    pub paragraph_id: u32,
+    pub speaker: Option<String>,
+}
+
+#[tauri::command]
+pub async fn speaker_assign(
+    pid: String,
+    input: SpeakerAssignmentInput,
+    root: Option<PathBuf>,
+) -> AppResult<()> {
+    let speaker = input
+        .speaker
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("speaker assignment", move || {
+        let mut doc = Doc::load(&dir)?;
+        if !crate::data::speakers::assign(&mut doc, input.paragraph_id, speaker.as_deref()) {
+            return Err(AppError::Schema(format!(
+                "paragraph {} was not found",
+                input.paragraph_id
+            )));
+        }
+        doc.save(&dir)
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerReidentifyProposal {
+    pub paragraph_id: u32,
+    pub current: Option<String>,
+    pub cluster: String,
+    pub proposed: String,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    pub coverage: f64,
+    pub margin: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerReidentifyPreview {
+    pub segments: usize,
+    pub changed: usize,
+    pub unassigned: usize,
+    pub proposals: Vec<SpeakerReidentifyProposal>,
+}
+
+fn paragraph_bounds(paragraph: &crate::data::Paragraph) -> Option<(f64, f64)> {
+    let mut words = paragraph
+        .sentences
+        .iter()
+        .flat_map(|sentence| sentence.words.iter());
+    let first = words.next()?;
+    let end = words.last().unwrap_or(first).end;
+    Some((first.start, end))
+}
+
+#[tauri::command]
+pub async fn speaker_reidentify_preview(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<SpeakerReidentifyPreview> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let audio_mutation = lock_project_mutation(&dir).await;
+    let load_dir = dir.clone();
+    let (doc, model) = run_blocking("speaker preview preparation", move || {
+        Ok((
+            Doc::load(&load_dir)?,
+            crate::data::modelconfig::load().diarize_model,
+        ))
+    })
+    .await?;
+    let wav = dir.join("audio.wav");
+    if !tokio::fs::try_exists(&wav).await? {
+        extract_audio_wav(&doc.media.path, &wav).await?;
     }
-    Ok(changed)
+    drop(audio_mutation);
+    let output = crate::diarize::diarize_file_with_model(&wav, &model).await?;
+    let segment_count = output.segments.len();
+    run_blocking("speaker preview", move || {
+        let mut unassigned = 0;
+        let matches = doc
+            .paragraphs
+            .iter()
+            .filter_map(|paragraph| {
+                let Some((start, end)) = paragraph_bounds(paragraph) else {
+                    unassigned += 1;
+                    return None;
+                };
+                let Some(matched) = crate::diarize::match_paragraph(paragraph, &output.segments)
+                else {
+                    unassigned += 1;
+                    return None;
+                };
+                Some((paragraph, matched, start, end))
+            })
+            .collect::<Vec<_>>();
+        // A fresh diarizer uses anonymous cluster ids. Preserve human names by
+        // greedily matching each new cluster to the current label with the
+        // greatest measured overlap, while keeping the mapping one-to-one.
+        let mut scores = BTreeMap::<(String, String), f64>::new();
+        for (paragraph, matched, _, _) in &matches {
+            if let Some(current) = paragraph.speaker.as_ref() {
+                *scores
+                    .entry((matched.speaker.clone(), current.clone()))
+                    .or_default() += matched.covered_seconds;
+            }
+        }
+        let mut ranked = scores.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut cluster_names = HashMap::<String, String>::new();
+        let mut used_names = HashSet::<String>::new();
+        for ((cluster, current), _) in ranked {
+            if !cluster_names.contains_key(&cluster) && used_names.insert(current.clone()) {
+                cluster_names.insert(cluster, current);
+            }
+        }
+        let proposals = matches
+            .into_iter()
+            .map(|(paragraph, matched, start, end)| {
+                let cluster = matched.speaker;
+                SpeakerReidentifyProposal {
+                    paragraph_id: paragraph.id,
+                    current: paragraph.speaker.clone(),
+                    proposed: cluster_names
+                        .get(&cluster)
+                        .cloned()
+                        .unwrap_or_else(|| cluster.clone()),
+                    cluster,
+                    start,
+                    end,
+                    text: paragraph
+                        .sentences
+                        .iter()
+                        .map(|sentence| sentence.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    coverage: matched.coverage,
+                    margin: matched.margin,
+                }
+            })
+            .collect::<Vec<_>>();
+        let changed = proposals
+            .iter()
+            .filter(|proposal| proposal.current.as_deref() != Some(proposal.proposed.as_str()))
+            .count();
+        Ok(SpeakerReidentifyPreview {
+            segments: segment_count,
+            changed,
+            unassigned,
+            proposals,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn speaker_reidentify_apply(
+    pid: String,
+    proposals: Vec<SpeakerReidentifyProposal>,
+    root: Option<PathBuf>,
+) -> AppResult<usize> {
+    if proposals.is_empty() {
+        return Err(AppError::Schema("speaker proposal is empty".into()));
+    }
+    let mut paragraph_ids = HashSet::new();
+    for proposal in &proposals {
+        if proposal.proposed.trim().is_empty()
+            || !proposal.start.is_finite()
+            || !proposal.end.is_finite()
+            || proposal.end <= proposal.start
+            || !crate::diarize::reliable_speaker_match(proposal.coverage, proposal.margin)
+            || !paragraph_ids.insert(proposal.paragraph_id)
+        {
+            return Err(AppError::Schema("speaker proposal is invalid".into()));
+        }
+    }
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("speaker proposal apply", move || {
+        let original = Doc::load(&dir)?;
+        let mut doc = original.clone();
+        for proposal in &proposals {
+            let paragraph = doc
+                .paragraphs
+                .iter()
+                .find(|paragraph| paragraph.id == proposal.paragraph_id)
+                .ok_or_else(|| {
+                    AppError::Schema(format!(
+                        "speaker proposal is stale: paragraph {} is missing",
+                        proposal.paragraph_id
+                    ))
+                })?;
+            let bounds = paragraph_bounds(paragraph).ok_or_else(|| {
+                AppError::Schema(format!(
+                    "speaker proposal is stale: paragraph {} has no timed words",
+                    proposal.paragraph_id
+                ))
+            })?;
+            let current_text = paragraph
+                .sentences
+                .iter()
+                .map(|sentence| sentence.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if paragraph.speaker != proposal.current
+                || (bounds.0 - proposal.start).abs() > 0.001
+                || (bounds.1 - proposal.end).abs() > 0.001
+                || current_text != proposal.text
+            {
+                return Err(AppError::Schema(
+                    "speaker proposal is stale; run identification again".into(),
+                ));
+            }
+        }
+        if !working_head_is_committed(&dir, &original)? {
+            let mut lineage = crate::data::version::Lineage::load(&dir)?;
+            let branch = lineage
+                .active_branch
+                .clone()
+                .unwrap_or_else(|| "main".into());
+            crate::data::version::commit_snapshot(
+                &dir,
+                &original,
+                &mut lineage,
+                &branch,
+                "Before speaker re-identification",
+                "automatic recovery snapshot",
+                crate::data::version::VersionKind::Auto,
+            )?;
+        }
+        let mut changed = 0;
+        for proposal in proposals {
+            let paragraph = doc
+                .paragraphs
+                .iter_mut()
+                .find(|paragraph| paragraph.id == proposal.paragraph_id)
+                .expect("speaker proposals were validated");
+            if paragraph.speaker.as_deref() != Some(proposal.proposed.as_str()) {
+                paragraph.speaker = Some(proposal.proposed);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            doc.save(&dir)?;
+        }
+        Ok(changed)
+    })
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -1566,13 +1974,13 @@ pub struct BrollPlacementInput {
     pub name: Option<String>,
 }
 
-static BROLL_MUTATIONS: OnceLock<
+static PROJECT_MUTATIONS: OnceLock<
     tokio::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
 
-async fn lock_broll_project(dir: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
-    let registry = BROLL_MUTATIONS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
-    let project_lock = {
+async fn project_mutation_mutex(dir: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = PROJECT_MUTATIONS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    {
         let mut locks = registry.lock().await;
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(dir).and_then(Weak::upgrade) {
@@ -1582,8 +1990,11 @@ async fn lock_broll_project(dir: &std::path::Path) -> tokio::sync::OwnedMutexGua
             locks.insert(dir.to_path_buf(), Arc::downgrade(&lock));
             lock
         }
-    };
-    project_lock.lock_owned().await
+    }
+}
+
+async fn lock_project_mutation(dir: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
+    project_mutation_mutex(dir).await.lock_owned().await
 }
 
 const fn default_pip_rect() -> crate::data::broll::Rect {
@@ -1693,7 +2104,7 @@ pub async fn broll_add(
     root: Option<PathBuf>,
 ) -> AppResult<crate::data::broll::BrollPlacement> {
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_broll_project(&dir).await;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll add", move || {
         let doc = Doc::load(&dir)?;
         let mut placements = crate::data::broll::load(&dir)?;
@@ -1715,7 +2126,7 @@ pub async fn broll_accept_suggestion(
     root: Option<PathBuf>,
 ) -> AppResult<crate::data::broll::BrollPlacement> {
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_broll_project(&dir).await;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll suggestion accept", move || {
         let doc = Doc::load(&dir)?;
         let suggestions = crate::pipeline::broll::load_artifact(&dir)?;
@@ -1792,7 +2203,7 @@ pub async fn broll_update(
     root: Option<PathBuf>,
 ) -> AppResult<crate::data::broll::BrollPlacement> {
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_broll_project(&dir).await;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll update", move || {
         let doc = Doc::load(&dir)?;
         let mut placements = crate::data::broll::load(&dir)?;
@@ -1827,7 +2238,7 @@ pub async fn broll_update(
 #[tauri::command]
 pub async fn broll_remove(pid: String, id: String, root: Option<PathBuf>) -> AppResult<bool> {
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_broll_project(&dir).await;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll remove", move || {
         let mut placements = crate::data::broll::load(&dir)?;
         let before = placements.len();
@@ -1872,6 +2283,7 @@ pub async fn broll_preview(
     state: tauri::State<'_, BrollPreviewState>,
 ) -> AppResult<Vec<String>> {
     let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     let prepare_dir = dir.clone();
     let (doc, cuts, placements, ass) = run_blocking("B-roll preview preparation", move || {
         let doc = Doc::load(&prepare_dir)?;
@@ -1939,7 +2351,8 @@ pub struct DiarizeResult {
 
 #[tauri::command]
 pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<DiarizeResult> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     let load_dir = dir.clone();
     let (mut doc, model) = run_blocking("diarization preparation", move || {
         Ok((
@@ -1969,7 +2382,8 @@ pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<Diariz
 
 #[tauri::command]
 pub async fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<String> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("timing repair", move || {
         let original = Doc::load(&dir)?;
         let mut doc = original.clone();
@@ -2004,14 +2418,20 @@ pub async fn model_list() -> Vec<String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    std::fs::read_dir(home.join(".cache/huggingface/hub"))
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("models--"))
-                .collect()
-        })
-        .unwrap_or_default()
+    run_blocking("model cache list", move || {
+        Ok(
+            std::fs::read_dir(crate::data::modelconfig::hugging_face_cache_root(&home))
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n.starts_with("models--"))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Report whether local ASR can really run. This imports the Python package
@@ -2024,36 +2444,52 @@ pub async fn asr_status() -> AppResult<crate::asr::RuntimeStatus> {
 /// Create an app-owned Python 3.12 environment and install the ASR runtime.
 #[tauri::command]
 pub async fn asr_runtime_install() -> AppResult<crate::asr::RuntimeStatus> {
-    crate::asr::install_runtime().await
+    crate::asr::install_asr_runtime().await
 }
 
 /// Download the configured ASR and word-alignment model snapshots.
 #[tauri::command]
 pub async fn asr_models_download() -> AppResult<crate::asr::RuntimeStatus> {
-    crate::asr::download_models().await
+    crate::asr::download_asr_models().await
+}
+
+/// Install the optional, separately-failing speaker identification runtime.
+#[tauri::command]
+pub async fn diarize_runtime_install() -> AppResult<crate::asr::RuntimeStatus> {
+    crate::asr::install_diarize_runtime().await
+}
+
+/// Download the gated speaker pipeline after the user supplies authorization.
+#[tauri::command]
+pub async fn diarize_model_download() -> AppResult<crate::asr::RuntimeStatus> {
+    crate::asr::download_diarize_model().await
 }
 
 #[tauri::command]
 pub async fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(String, usize)>> {
-    let dir = resolve_project_root(root).join(&pid).join("ai");
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.filter_map(|e| e.ok()) {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let k = e.file_name().to_string_lossy().into_owned();
-                let n = std::fs::read_dir(e.path())
-                    .map(|rd| rd.count())
-                    .unwrap_or(0);
-                out.push((k, n));
+    let dir = resolve_project_dir(&pid, root)?.join("ai");
+    run_blocking("task log list", move || {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.filter_map(|e| e.ok()) {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let k = e.file_name().to_string_lossy().into_owned();
+                    let n = std::fs::read_dir(e.path())
+                        .map(|rd| rd.count())
+                        .unwrap_or(0);
+                    out.push((k, n));
+                }
             }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn record_audio(pid: String, seconds: u32, root: Option<PathBuf>) -> AppResult<String> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     tokio::fs::create_dir_all(&dir).await?;
     let wav = dir.join("audio.wav");
     let st = tokio::process::Command::new("ffmpeg")
@@ -2141,6 +2577,10 @@ pub async fn recording_start(
     }
 
     let started = async {
+        let project_dir = wav
+            .parent()
+            .ok_or_else(|| AppError::Schema("recording path has no project directory".into()))?;
+        let mutation = lock_project_mutation(project_dir).await;
         if let Some(dir) = wav.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
@@ -2191,6 +2631,7 @@ pub async fn recording_start(
             pid: pid.clone(),
             wav: wav.clone(),
             child,
+            _mutation: mutation,
         })
     }
     .await;
@@ -2297,7 +2738,8 @@ pub async fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
 /// Burn-in export: write export.ass then ffmpeg → export.mp4.
 #[tauri::command]
 pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<String> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     let prepare_dir = dir.clone();
     let (doc, cuts, ass, broll) = run_blocking("video export preparation", move || {
         let doc = Doc::load(&prepare_dir)?;
@@ -2320,47 +2762,55 @@ pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<Strin
 
 #[tauri::command]
 pub async fn export_fcp(pid: String, root: Option<PathBuf>) -> AppResult<String> {
-    let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts_path = dir.join("cuts.json");
-    let cuts: ClipCuts = if cuts_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
-    } else {
-        ClipCuts::new()
-    };
-    let path = dir.join("export.fcpxml");
-    let broll = crate::data::broll::load(&dir)?;
-    crate::export::write_fcp_with_broll(&doc, &cuts.cuts, &broll, &path, 1920, 1080)?;
-    Ok(path.to_string_lossy().into_owned())
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("Final Cut export", move || {
+        let doc = Doc::load(&dir)?;
+        let cuts_path = dir.join("cuts.json");
+        let cuts: ClipCuts = if cuts_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
+        } else {
+            ClipCuts::new()
+        };
+        let path = dir.join("export.fcpxml");
+        let broll = crate::data::broll::load(&dir)?;
+        crate::export::write_fcp_with_broll(&doc, &cuts.cuts, &broll, &path, 1920, 1080)?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<Vec<String>> {
-    let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
-    let paths = [
-        dir.join("export.srt"),
-        dir.join("export.vtt"),
-        dir.join("export.ass"),
-        dir.join("export.md"),
-    ];
-    crate::export::write_srt_with(&doc, &cuts.cuts, &paths[0])?;
-    crate::export::write_vtt_with(&doc, &cuts.cuts, &paths[1])?;
-    crate::export::write_ass_with(&doc, &cuts.cuts, &paths[2], 1920, 1080)?;
-    crate::export::write_md_with_chapters(&doc, &cuts.cuts, &dir, &paths[3])?;
-    Ok(paths
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect())
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle export", move || {
+        let doc = Doc::load(&dir)?;
+        let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let paths = [
+            dir.join("export.srt"),
+            dir.join("export.vtt"),
+            dir.join("export.ass"),
+            dir.join("export.md"),
+        ];
+        crate::export::write_srt_with(&doc, &cuts.cuts, &paths[0])?;
+        crate::export::write_vtt_with(&doc, &cuts.cuts, &paths[1])?;
+        crate::export::write_ass_with(&doc, &cuts.cuts, &paths[2], 1920, 1080)?;
+        crate::export::write_md_with_chapters(&doc, &cuts.cuts, &dir, &paths[3])?;
+        Ok(paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn version_list(pid: String, root: Option<PathBuf>) -> AppResult<VersionHistory> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
     run_blocking("version history load", move || {
         let lineage = crate::data::version::Lineage::load(&dir)?;
         Ok(VersionHistory::from(lineage))
@@ -2397,7 +2847,8 @@ pub async fn version_commit(
     note: String,
     root: Option<PathBuf>,
 ) -> AppResult<String> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("version snapshot", move || {
         let name = name.trim();
         if name.is_empty() {
@@ -2424,7 +2875,8 @@ pub async fn version_commit(
 
 #[tauri::command]
 pub async fn version_restore(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("version restore", move || {
         let doc = Doc::load(&dir)?;
         let mut lineage = crate::data::version::Lineage::load(&dir)?;
@@ -2450,7 +2902,8 @@ pub async fn version_restore(pid: String, id: String, root: Option<PathBuf>) -> 
 
 #[tauri::command]
 pub async fn branch_create(pid: String, name: String, root: Option<PathBuf>) -> AppResult<String> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("branch create", move || {
         let name = name.trim();
         if name.is_empty() {
@@ -2482,7 +2935,8 @@ pub async fn branch_create(pid: String, name: String, root: Option<PathBuf>) -> 
 
 #[tauri::command]
 pub async fn branch_switch(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
     run_blocking("branch switch", move || {
         let doc = Doc::load(&dir)?;
         if !working_head_is_committed(&dir, &doc)? {
@@ -2505,13 +2959,17 @@ pub async fn split_line(
     at: usize,
     root: Option<PathBuf>,
 ) -> AppResult<bool> {
-    let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let ok = crate::data::edit::split_sentence(&mut doc, &id, at);
-    if ok {
-        doc.save(&dir)?;
-    }
-    Ok(ok)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle split", move || {
+        let mut doc = Doc::load(&dir)?;
+        let ok = crate::data::edit::split_sentence(&mut doc, &id, at);
+        if ok {
+            doc.save(&dir)?;
+        }
+        Ok(ok)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2521,13 +2979,17 @@ pub async fn merge_lines(
     id2: String,
     root: Option<PathBuf>,
 ) -> AppResult<bool> {
-    let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
-    let ok = crate::data::edit::merge_sentences(&mut doc, &id1, &id2);
-    if ok {
-        doc.save(&dir)?;
-    }
-    Ok(ok)
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle merge", move || {
+        let mut doc = Doc::load(&dir)?;
+        let ok = crate::data::edit::merge_sentences(&mut doc, &id1, &id2);
+        if ok {
+            doc.save(&dir)?;
+        }
+        Ok(ok)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2620,8 +3082,11 @@ pub async fn style_get(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<crate::data::substyle::SubStyle> {
-    let dir = resolve_project_root(root).join(&pid);
-    Ok(crate::data::substyle::SubStyle::load_or_default(&dir))
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("subtitle style load", move || {
+        Ok(crate::data::substyle::SubStyle::load_or_default(&dir))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2630,18 +3095,27 @@ pub async fn style_set(
     style: crate::data::substyle::SubStyle,
     root: Option<PathBuf>,
 ) -> AppResult<()> {
-    let dir = resolve_project_root(root).join(&pid);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join("style.json"),
-        serde_json::to_string_pretty(&style)?,
-    )?;
-    Ok(())
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle style save", move || {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("style.json"),
+            serde_json::to_string_pretty(&style)?,
+        )?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn config_show() -> crate::data::modelconfig::ModelConfig {
-    crate::data::modelconfig::load()
+pub async fn config_show() -> AppResult<crate::data::modelconfig::ModelConfig> {
+    run_blocking("settings load", || {
+        let mut config = crate::data::modelconfig::load();
+        config.hf_token.clear();
+        Ok(config)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2872,6 +3346,102 @@ mod tests {
         )
         .unwrap();
         assert!(persisted.starred);
+    }
+
+    #[tokio::test]
+    async fn speaker_evidence_assignment_and_preview_apply_are_recoverable() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "Hello there",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].speaker = Some("Alice".into());
+        doc.paragraphs[0].sentences[0].words = vec![
+            crate::data::Word {
+                id: "w0".into(),
+                text: "Hello".into(),
+                start: 1.0,
+                end: 1.4,
+            },
+            crate::data::Word {
+                id: "w1".into(),
+                text: "there".into(),
+                start: 1.5,
+                end: 2.0,
+            },
+        ];
+        doc.save(&project).unwrap();
+
+        let evidence = speaker_evidence("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(evidence.identified);
+        assert_eq!(evidence.turns[0].text, "Hello there");
+        assert_eq!((evidence.turns[0].start, evidence.turns[0].end), (1.0, 2.0));
+
+        speaker_assign(
+            "p1".into(),
+            SpeakerAssignmentInput {
+                paragraph_id: 1,
+                speaker: Some("Host".into()),
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Doc::load(&project).unwrap().paragraphs[0]
+                .speaker
+                .as_deref(),
+            Some("Host")
+        );
+
+        let proposals = vec![SpeakerReidentifyProposal {
+            paragraph_id: 1,
+            current: Some("Host".into()),
+            cluster: "SPEAKER_00".into(),
+            proposed: "SPEAKER_00".into(),
+            start: 1.0,
+            end: 2.0,
+            text: "Hello there".into(),
+            coverage: 0.95,
+            margin: 0.9,
+        }];
+        assert_eq!(
+            speaker_reidentify_apply(
+                "p1".into(),
+                proposals.clone(),
+                Some(tmp.path().to_path_buf()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            Doc::load(&project).unwrap().paragraphs[0]
+                .speaker
+                .as_deref(),
+            Some("SPEAKER_00")
+        );
+        assert_eq!(
+            version_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .versions
+                .len(),
+            1
+        );
+        assert!(
+            speaker_reidentify_apply("p1".into(), proposals, Some(tmp.path().to_path_buf()),)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3146,6 +3716,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_doc_edits_share_one_project_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "original",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].sentences = (0..24)
+            .map(|index| crate::data::Sentence {
+                id: format!("s{index}"),
+                text: format!("original {index}"),
+                words: vec![],
+            })
+            .collect();
+        doc.save(&project).unwrap();
+
+        let mut edits = tokio::task::JoinSet::new();
+        for index in 0..24 {
+            let root = tmp.path().to_path_buf();
+            edits.spawn(async move {
+                subtitle_set(
+                    "p1".into(),
+                    format!("s{index}"),
+                    format!("edited {index}"),
+                    Some(root),
+                )
+                .await
+            });
+        }
+        while let Some(result) = edits.join_next().await {
+            assert!(result.unwrap().unwrap());
+        }
+
+        let saved = Doc::load(&project).unwrap();
+        for index in 0..24 {
+            assert_eq!(
+                saved.paragraphs[0].sentences[index].text,
+                format!("edited {index}")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn broll_list_rejects_project_path_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(
@@ -3173,6 +3791,7 @@ mod tests {
             "asrModel",
             "asrAligner",
             "diarizeModel",
+            "hfToken",
             "llmEndpoint",
             "llmApiKey",
             "llmModel",
@@ -3189,6 +3808,7 @@ mod tests {
         // The IPC payload the frontend sends today keeps working.
         let back: SettingsPayload = serde_json::from_value(serde_json::json!({
             "llm_endpoint": "e",
+            "hf_token": "hf_test",
             "llm_api_key": "k",
             "llm_model": "m",
             "worker_count": 2
@@ -3196,6 +3816,7 @@ mod tests {
         .unwrap();
         assert_eq!(back.worker_count, 2);
         assert_eq!(back.llm_model, "m");
+        assert_eq!(back.hf_token, "hf_test");
     }
 
     #[test]
@@ -3206,6 +3827,7 @@ mod tests {
         assert!(raw.contains("\"llmEndpoint\""), "got: {raw}");
         assert!(raw.contains("\"llmApiKey\""), "got: {raw}");
         assert!(raw.contains("\"llmModel\""), "got: {raw}");
+        assert!(raw.contains("\"hfToken\""), "got: {raw}");
         assert!(raw.contains("\"workerCount\""), "got: {raw}");
         assert!(!raw.contains("llm_endpoint"), "got: {raw}");
     }

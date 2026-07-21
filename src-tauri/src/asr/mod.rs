@@ -15,6 +15,10 @@ use crate::error::{AppError, AppResult};
 use crate::proc;
 
 const ASR_PACKAGE: &str = "mlx-qwen3-asr[aligner]==0.3.5";
+const DIARIZE_PACKAGE: &str = "pyannote.audio==3.4.0";
+const TORCH_PACKAGE: &str = "torch==2.5.1";
+const TORCHAUDIO_PACKAGE: &str = "torchaudio==2.5.1";
+const HUGGING_FACE_HUB_PACKAGE: &str = "huggingface-hub==0.36.2";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +30,13 @@ pub struct RuntimeStatus {
     pub model_cached: bool,
     pub aligner_id: String,
     pub aligner_cached: bool,
+    pub diarize_model_id: String,
+    pub diarize_model_cached: bool,
+    pub diarize_python_path: Option<String>,
+    pub diarize_runtime_ready: bool,
+    pub diarize_runtime_detail: String,
+    pub hugging_face_token_set: bool,
+    pub diarize_ready: bool,
     pub ready: bool,
 }
 
@@ -65,6 +76,67 @@ fn package_version(python: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn diarize_package_version(python: &Path) -> Option<String> {
+    let output = Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; import pyannote.audio, torch, torchaudio, huggingface_hub; print('|'.join([m.version('pyannote.audio'), m.version('torch'), m.version('torchaudio'), m.version('huggingface-hub')]))",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let versions = raw.trim().split('|').collect::<Vec<_>>();
+    let [pyannote, torch, torchaudio, hugging_face_hub] = versions.as_slice() else {
+        return None;
+    };
+    if !compatible_diarize_versions(pyannote, torch, torchaudio, hugging_face_hub) {
+        return None;
+    }
+    Some(format!(
+        "pyannote.audio {pyannote} · torch {torch} · torchaudio {torchaudio} · hub {hugging_face_hub}"
+    ))
+}
+
+fn compatible_diarize_versions(
+    pyannote: &str,
+    torch: &str,
+    torchaudio: &str,
+    hugging_face_hub: &str,
+) -> bool {
+    // pyannote.audio 3.x still depends on top-level AudioMetaData (removed in
+    // torchaudio 2.9), its trusted legacy checkpoints predate PyTorch 2.6's
+    // `weights_only` default, and it uses Hub's pre-1.0 authentication API.
+    let mut audio_parts = torchaudio
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok());
+    let audio_major = audio_parts.next().unwrap_or(u32::MAX);
+    let audio_minor = audio_parts.next().unwrap_or(u32::MAX);
+    let mut torch_parts = torch.split('.').filter_map(|part| part.parse::<u32>().ok());
+    let torch_major = torch_parts.next().unwrap_or(u32::MAX);
+    let torch_minor = torch_parts.next().unwrap_or(u32::MAX);
+    let torch_too_new = torch_major > 2 || (torch_major == 2 && torch_minor >= 6);
+    if pyannote.starts_with("3.")
+        && (audio_major > 2 || (audio_major == 2 && audio_minor >= 9) || torch_too_new)
+    {
+        return false;
+    }
+    if pyannote.starts_with("3.")
+        && hugging_face_hub
+            .split('.')
+            .next()
+            .and_then(|part| part.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+            >= 1
+    {
+        return false;
+    }
+    true
+}
+
 pub fn resolve_python() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -80,12 +152,25 @@ pub fn runtime_status() -> RuntimeStatus {
         .map(PathBuf::from)
         .unwrap_or_default();
     let config = crate::data::modelconfig::load();
-    let runtime = python_candidates(&home)
+    let candidates = python_candidates(&home);
+    let runtime = candidates
+        .iter()
+        .cloned()
         .into_iter()
         .find_map(|candidate| package_version(&candidate).map(|version| (candidate, version)));
     let model_cached = crate::data::modelconfig::model_cached(&home, &config.asr_model);
     let aligner_cached = crate::data::modelconfig::model_cached(&home, &config.asr_aligner);
     let runtime_ready = runtime.is_some();
+    let diarize_runtime = candidates.into_iter().find_map(|candidate| {
+        diarize_package_version(&candidate).map(|version| (candidate, version))
+    });
+    let diarize_runtime_ready = diarize_runtime.is_some();
+    let diarize_model_cached =
+        crate::data::modelconfig::diarize_model_cached(&home, &config.diarize_model);
+    let hugging_face_token_set = !config.hf_token.trim().is_empty()
+        || ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+            .into_iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
     RuntimeStatus {
         python_path: runtime
             .as_ref()
@@ -100,6 +185,20 @@ pub fn runtime_status() -> RuntimeStatus {
         model_cached,
         aligner_id: config.asr_aligner,
         aligner_cached,
+        diarize_model_id: config.diarize_model,
+        diarize_model_cached,
+        diarize_python_path: diarize_runtime
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned()),
+        diarize_runtime_ready,
+        diarize_runtime_detail: diarize_runtime
+            .map(|(_, version)| version)
+            .unwrap_or_else(|| "pyannote.audio is not installed in the selected runtime".into()),
+        hugging_face_token_set,
+        // A token is download authorization, not a runtime dependency. Once
+        // every gated snapshot is cached the pipeline must remain usable
+        // offline and after the user removes the token.
+        diarize_ready: diarize_runtime_ready && diarize_model_cached,
         ready: runtime_ready && model_cached && aligner_cached,
     }
 }
@@ -123,20 +222,12 @@ fn find_uv(home: &Path) -> Option<PathBuf> {
     })
 }
 
-pub async fn install_runtime() -> AppResult<RuntimeStatus> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let uv = find_uv(&home).ok_or_else(|| AppError::Sidecar {
-        sidecar: "lumen_cut_asr",
-        message: "the `uv` installer was not found; install uv from https://docs.astral.sh/uv/ and try again"
-            .into(),
-    })?;
+async fn ensure_managed_runtime(home: &Path, uv: &Path) -> AppResult<PathBuf> {
     let runtime_dir = home.join(".lumen-cut/runtime");
     tokio::fs::create_dir_all(home.join(".lumen-cut")).await?;
-    let python = managed_python(&home);
+    let python = managed_python(home);
     if !python.is_file() {
-        let output = tokio::process::Command::new(&uv)
+        let output = tokio::process::Command::new(uv)
             .args(["venv", "--python", "3.12"])
             .arg(&runtime_dir)
             .output()
@@ -148,24 +239,101 @@ pub async fn install_runtime() -> AppResult<RuntimeStatus> {
             });
         }
     }
-    let output = tokio::process::Command::new(&uv)
+    Ok(python)
+}
+
+async fn install_packages(
+    uv: &Path,
+    python: &Path,
+    packages: &[&str],
+    sidecar: &'static str,
+) -> AppResult<()> {
+    let output = tokio::process::Command::new(uv)
         .arg("pip")
         .arg("install")
         .arg("--python")
-        .arg(&python)
-        .arg(ASR_PACKAGE)
+        .arg(python)
+        .args(packages)
         .output()
         .await?;
     if !output.status.success() {
         return Err(AppError::Sidecar {
-            sidecar: "lumen_cut_asr",
+            sidecar,
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub async fn install_asr_runtime() -> AppResult<RuntimeStatus> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let uv = find_uv(&home).ok_or_else(|| AppError::Sidecar {
+        sidecar: "lumen_cut_asr",
+        message: "the `uv` installer was not found; install uv from https://docs.astral.sh/uv/ and try again"
+            .into(),
+    })?;
+    let python = ensure_managed_runtime(&home, &uv).await?;
+    install_packages(&uv, &python, &[ASR_PACKAGE], "lumen_cut_asr").await?;
+    let validation = tokio::process::Command::new(&python)
+        .args(["-c", "import mlx_qwen3_asr"])
+        .output()
+        .await?;
+    if !validation.status.success() {
+        return Err(AppError::Sidecar {
+            sidecar: "lumen_cut_asr",
+            message: format!(
+                "installed packages could not be imported: {}",
+                String::from_utf8_lossy(&validation.stderr).trim()
+            ),
         });
     }
     Ok(runtime_status())
 }
 
-pub async fn download_models() -> AppResult<RuntimeStatus> {
+pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let uv = find_uv(&home).ok_or_else(|| AppError::Sidecar {
+        sidecar: "lumen_cut_diarize",
+        message: "the `uv` installer was not found; install uv from https://docs.astral.sh/uv/ and try again"
+            .into(),
+    })?;
+    let python = ensure_managed_runtime(&home, &uv).await?;
+    install_packages(
+        &uv,
+        &python,
+        &[
+            DIARIZE_PACKAGE,
+            TORCH_PACKAGE,
+            TORCHAUDIO_PACKAGE,
+            HUGGING_FACE_HUB_PACKAGE,
+        ],
+        "lumen_cut_diarize",
+    )
+    .await?;
+    let validation = tokio::process::Command::new(&python)
+        .args([
+            "-c",
+            "import pyannote.audio, torch, torchaudio, huggingface_hub",
+        ])
+        .output()
+        .await?;
+    if !validation.status.success() {
+        return Err(AppError::Sidecar {
+            sidecar: "lumen_cut_diarize",
+            message: format!(
+                "installed packages could not be imported: {}",
+                String::from_utf8_lossy(&validation.stderr).trim()
+            ),
+        });
+    }
+    Ok(runtime_status())
+}
+
+pub async fn download_asr_models() -> AppResult<RuntimeStatus> {
     let status = runtime_status();
     let python = status.python_path.ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_asr",
@@ -174,16 +342,58 @@ pub async fn download_models() -> AppResult<RuntimeStatus> {
     let script =
         "from huggingface_hub import snapshot_download; import sys; snapshot_download(sys.argv[1])";
     for model in [&status.model_id, &status.aligner_id] {
-        let output = tokio::process::Command::new(&python)
-            .args(["-c", script, model])
-            .output()
-            .await?;
+        let mut command = tokio::process::Command::new(&python);
+        command.args(["-c", script, model]);
+        let output = command.output().await?;
         if !output.status.success() {
             return Err(AppError::Sidecar {
                 sidecar: "lumen_cut_asr",
                 message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
+    }
+    Ok(runtime_status())
+}
+
+pub async fn download_diarize_model() -> AppResult<RuntimeStatus> {
+    let status = runtime_status();
+    if status.diarize_model_cached {
+        return Ok(status);
+    }
+    if !status.diarize_runtime_ready {
+        return Err(AppError::Sidecar {
+            sidecar: "lumen_cut_diarize",
+            message: "install the speaker identification runtime before downloading its model"
+                .into(),
+        });
+    }
+    let python = status
+        .diarize_python_path
+        .ok_or_else(|| AppError::Sidecar {
+            sidecar: "lumen_cut_diarize",
+            message: "install the local runtime before downloading the speaker model".into(),
+        })?;
+    let config = crate::data::modelconfig::load();
+    let token = (!config.hf_token.trim().is_empty())
+        .then_some(config.hf_token)
+        .or_else(|| std::env::var("HF_TOKEN").ok())
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+        .ok_or_else(|| AppError::Sidecar {
+            sidecar: "lumen_cut_diarize",
+            message: "set a Hugging Face token and accept the speaker-diarization-3.1 model terms before downloading"
+                .into(),
+        })?;
+    let diarize_script =
+        "from pyannote.audio import Pipeline; import sys; Pipeline.from_pretrained(sys.argv[1])";
+    let mut command = tokio::process::Command::new(&python);
+    command.args(["-c", diarize_script, &status.diarize_model_id]);
+    command.env("HF_TOKEN", token);
+    let output = command.output().await?;
+    if !output.status.success() {
+        return Err(AppError::Sidecar {
+            sidecar: "lumen_cut_diarize",
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
     }
     Ok(runtime_status())
 }
@@ -385,6 +595,22 @@ fn locate_sidecar(rel: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_diarization_versions_reject_known_broken_combinations() {
+        assert!(compatible_diarize_versions(
+            "3.4.0", "2.5.1", "2.5.1", "0.36.2"
+        ));
+        assert!(!compatible_diarize_versions(
+            "3.4.0", "2.6.0", "2.6.0", "0.36.2"
+        ));
+        assert!(!compatible_diarize_versions(
+            "3.4.0", "2.5.1", "2.9.0", "0.36.2"
+        ));
+        assert!(!compatible_diarize_versions(
+            "3.4.0", "2.5.1", "2.5.1", "1.0.0"
+        ));
+    }
 
     #[test]
     fn parses_asr_out_v1() {

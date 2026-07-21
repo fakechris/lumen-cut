@@ -16,6 +16,7 @@ fn defaults() -> ModelConfig {
         asr_model: "Qwen/Qwen3-ASR-0.6B".into(),
         asr_aligner: "Qwen/Qwen3-ForcedAligner-0.6B".into(),
         diarize_model: "pyannote/speaker-diarization-3.1".into(),
+        hf_token: String::new(),
         llm_endpoint: String::new(),
         llm_api_key: String::new(),
         llm_model: "gpt-4o-mini".into(),
@@ -29,6 +30,7 @@ pub struct ModelConfig {
     pub asr_model: String,
     pub asr_aligner: String,
     pub diarize_model: String,
+    pub hf_token: String,
     pub llm_endpoint: String,
     pub llm_api_key: String,
     pub llm_model: String,
@@ -58,7 +60,18 @@ pub fn load() -> ModelConfig {
                     };
                 }
                 if let Some(s) = v.get("diarizeModel").and_then(|x| x.as_str()) {
-                    cfg.diarize_model = s.into();
+                    cfg.diarize_model = match s {
+                        // Community-1 requires the incompatible pyannote 4.x
+                        // runtime. Keep persisted prerelease settings on the
+                        // only pipeline this build installs and validates.
+                        "pyannote/speaker-diarization-community-1" => {
+                            "pyannote/speaker-diarization-3.1".into()
+                        }
+                        _ => s.into(),
+                    };
+                }
+                if let Some(s) = v.get("hfToken").and_then(|x| x.as_str()) {
+                    cfg.hf_token = s.into();
                 }
                 if let Some(s) = v.get("asrAligner").and_then(|x| x.as_str()) {
                     cfg.asr_aligner = match s {
@@ -95,56 +108,113 @@ pub fn llm_configured(cfg: &ModelConfig) -> bool {
 
 /// Hugging Face uses `models--org--name` directories for cached repos.
 pub fn cache_path(home: &std::path::Path, model_id: &str) -> std::path::PathBuf {
-    home.join(".cache")
-        .join("huggingface")
-        .join("hub")
-        .join(format!("models--{}", model_id.replace('/', "--")))
+    hugging_face_cache_root(home).join(format!("models--{}", model_id.replace('/', "--")))
 }
 
-pub fn model_cached(home: &std::path::Path, model_id: &str) -> bool {
-    let snapshots = cache_path(home, model_id).join("snapshots");
-    let Ok(revisions) = std::fs::read_dir(snapshots) else {
-        return false;
-    };
+pub fn hugging_face_cache_root(home: &std::path::Path) -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("HF_HUB_CACHE").filter(|value| !value.is_empty()) {
+        return path.into();
+    }
+    if let Some(path) = std::env::var_os("HF_HOME").filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(path).join("hub");
+    }
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache"));
+    cache_home.join("huggingface").join("hub")
+}
 
-    // Hugging Face creates the repository directory and refs before the large
-    // files have finished downloading. Require a usable snapshot with config
-    // plus at least one materialized weight file so an interrupted download is
-    // not shown as "cached" in the UI or doctor output.
-    revisions.filter_map(Result::ok).any(|revision| {
-        let snapshot = revision.path();
-        let json_config = snapshot.join("config.json").is_file();
-        let pipeline_config = snapshot
+fn snapshot_has_config(snapshot: &std::path::Path) -> bool {
+    snapshot
+        .join("config.json")
+        .metadata()
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+        || snapshot
             .join("config.yaml")
             .metadata()
             .map(|metadata| metadata.len() > 0)
-            .unwrap_or(false);
-        if !json_config && !pipeline_config {
-            return false;
-        }
-        let has_weights = walkdir::WalkDir::new(snapshot)
-            .max_depth(2)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .any(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                let is_weight = name.ends_with(".safetensors")
-                    || name.ends_with(".npz")
-                    || name.ends_with(".bin")
-                    || name.ends_with(".ckpt")
-                    || name.ends_with(".pt")
-                    || name.ends_with(".pth")
-                    || name.ends_with(".onnx");
-                is_weight
-                    && entry
-                        .metadata()
-                        .map(|metadata| metadata.len() > 1_000_000)
-                        .unwrap_or(false)
-            });
-        has_weights || pipeline_config
+            .unwrap_or(false)
+}
+
+fn snapshot_has_weights(snapshot: &std::path::Path) -> bool {
+    walkdir::WalkDir::new(snapshot)
+        .max_depth(2)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .any(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            let is_weight = name.ends_with(".safetensors")
+                || name.ends_with(".npz")
+                || name.ends_with(".bin")
+                || name.ends_with(".ckpt")
+                || name.ends_with(".pt")
+                || name.ends_with(".pth")
+                || name.ends_with(".onnx");
+            is_weight
+                && entry
+                    .metadata()
+                    .map(|metadata| metadata.len() > 1_000_000)
+                    .unwrap_or(false)
+        })
+}
+
+fn cached_snapshot(home: &std::path::Path, model_id: &str, require_weights: bool) -> bool {
+    cached_snapshot_at(&cache_path(home, model_id), require_weights)
+}
+
+fn cached_snapshot_at(repo: &std::path::Path, require_weights: bool) -> bool {
+    let snapshots = repo.join("snapshots");
+    let Ok(revisions) = std::fs::read_dir(snapshots) else {
+        return false;
+    };
+    revisions.filter_map(Result::ok).any(|revision| {
+        let snapshot = revision.path();
+        snapshot_has_config(&snapshot) && (!require_weights || snapshot_has_weights(&snapshot))
     })
+}
+
+fn pyannote_cache_path(home: &std::path::Path, model_id: &str) -> std::path::PathBuf {
+    let root = std::env::var_os("PYANNOTE_CACHE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache/torch/pyannote"));
+    root.join(format!("models--{}", model_id.replace('/', "--")))
+}
+
+fn diarize_cached_snapshot(home: &std::path::Path, model_id: &str, require_weights: bool) -> bool {
+    cached_snapshot(home, model_id, require_weights)
+        || cached_snapshot_at(&pyannote_cache_path(home, model_id), require_weights)
+}
+
+pub fn model_cached(home: &std::path::Path, model_id: &str) -> bool {
+    // Repository metadata can appear before a multi-gigabyte weight finishes.
+    // Core models and transitive diarization dependencies are ready only when
+    // both their config and at least one materialized weight are present.
+    cached_snapshot(home, model_id, true)
+}
+
+/// Diarization pipelines can be tiny YAML repositories that reference model
+/// weights stored in separate gated repositories. Do not report the pipeline
+/// ready until those transitive snapshots are materialized too.
+pub fn diarize_model_cached(home: &std::path::Path, model_id: &str) -> bool {
+    // The 3.1 pipeline repository itself is intentionally only a YAML graph;
+    // its referenced segmentation and embedding repositories own the weights.
+    if !diarize_cached_snapshot(home, model_id, false) {
+        return false;
+    }
+    match model_id {
+        "pyannote/speaker-diarization-3.1" => [
+            "pyannote/segmentation-3.0",
+            "pyannote/wespeaker-voxceleb-resnet34-LM",
+        ]
+        .into_iter()
+        .all(|dependency| diarize_cached_snapshot(home, dependency, true)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +275,37 @@ mod tests {
         std::fs::create_dir_all(repo.join("refs")).unwrap();
         std::fs::write(repo.join("refs/main"), "revision").unwrap();
         assert!(!model_cached(home.path(), "org/model"));
+    }
+
+    #[test]
+    fn legacy_diarization_requires_transitive_model_snapshots() {
+        let home = tempfile::tempdir().unwrap();
+        let pipeline =
+            cache_path(home.path(), "pyannote/speaker-diarization-3.1").join("snapshots/revision");
+        std::fs::create_dir_all(&pipeline).unwrap();
+        std::fs::write(pipeline.join("config.yaml"), "pipeline: ready").unwrap();
+        let segmentation =
+            cache_path(home.path(), "pyannote/segmentation-3.0").join("snapshots/revision");
+        std::fs::create_dir_all(&segmentation).unwrap();
+        std::fs::write(segmentation.join("config.yaml"), "model: ready").unwrap();
+        std::fs::write(segmentation.join("model.bin"), vec![0; 1_000_001]).unwrap();
+        assert!(!diarize_model_cached(
+            home.path(),
+            "pyannote/speaker-diarization-3.1"
+        ));
+        let weights = cache_path(home.path(), "pyannote/wespeaker-voxceleb-resnet34-LM")
+            .join("snapshots/revision");
+        std::fs::create_dir_all(&weights).unwrap();
+        std::fs::write(weights.join("config.yaml"), "model: ready").unwrap();
+        assert!(!diarize_model_cached(
+            home.path(),
+            "pyannote/speaker-diarization-3.1"
+        ));
+        std::fs::write(weights.join("model.bin"), vec![0; 1_000_001]).unwrap();
+        assert!(diarize_model_cached(
+            home.path(),
+            "pyannote/speaker-diarization-3.1"
+        ));
     }
 
     #[test]

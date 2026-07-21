@@ -22,6 +22,41 @@ export interface SpeakerInfo {
   paragraph_count: number;
 }
 
+export interface SpeakerTurn {
+  paragraphId: number;
+  speaker: string | null;
+  start: number;
+  end: number;
+  text: string;
+  cueIds: string[];
+}
+
+export interface SpeakerEvidence {
+  speakers: SpeakerInfo[];
+  turns: SpeakerTurn[];
+  identified: boolean;
+  unlabelled: number;
+}
+
+export interface SpeakerReidentifyProposal {
+  paragraphId: number;
+  current: string | null;
+  cluster: string;
+  proposed: string;
+  start: number;
+  end: number;
+  text: string;
+  coverage: number;
+  margin: number;
+}
+
+export interface SpeakerReidentifyPreview {
+  segments: number;
+  changed: number;
+  unassigned: number;
+  proposals: SpeakerReidentifyProposal[];
+}
+
 export interface RecordingStarted {
   pid: string;
   path: string;
@@ -171,6 +206,7 @@ export interface ModelConfig {
   asrModel: string;
   asrAligner: string;
   diarizeModel: string;
+  hfToken: string;
   llmEndpoint: string;
   llmApiKey: string;
   llmModel: string;
@@ -185,6 +221,13 @@ export interface AsrStatus {
   modelCached: boolean;
   alignerId: string;
   alignerCached: boolean;
+  diarizeModelId: string;
+  diarizeModelCached: boolean;
+  diarizePythonPath: string | null;
+  diarizeRuntimeReady: boolean;
+  diarizeRuntimeDetail: string;
+  huggingFaceTokenSet: boolean;
+  diarizeReady: boolean;
   ready: boolean;
 }
 
@@ -302,6 +345,7 @@ export interface Settings {
   asrModel: string;
   asrAligner: string;
   diarizeModel: string;
+  hfToken: string;
   llmEndpoint: string;
   llmApiKey: string;
   llmModel: string;

@@ -35,9 +35,21 @@ pub fn cancellation_requested() -> bool {
 /// annotates failures with `sidecar` and the stderr tail. Used by code paths
 /// that already live inside a tokio runtime.
 pub async fn run(bin: &str, args: &[&str]) -> AppResult<String> {
+    run_with_env(bin, args, &[]).await
+}
+
+/// Run a cancellable subprocess with a small, explicit environment overlay.
+/// This avoids process-global mutation when a local project stores credentials
+/// needed by one sidecar.
+pub async fn run_with_env(
+    bin: &str,
+    args: &[&str],
+    environment: &[(&str, &str)],
+) -> AppResult<String> {
     let mut command = TokioCommand::new(bin);
     command
         .args(args)
+        .envs(environment.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -167,6 +179,18 @@ mod tests {
             AppError::Sidecar { message, .. } => assert!(message.contains("exit")),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_with_env_passes_an_explicit_value() {
+        let out = run_with_env(
+            "/bin/sh",
+            &["-c", "printf '%s' \"$LUMEN_CUT_PROC_TEST\""],
+            &[("LUMEN_CUT_PROC_TEST", "scoped")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "scoped");
     }
 
     #[tokio::test]

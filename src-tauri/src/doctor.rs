@@ -94,7 +94,20 @@ pub fn checks() -> Vec<Check> {
             None => asr.runtime_detail,
         },
     });
-    let token = std::env::var_os("HF_TOKEN").or_else(|| std::env::var_os("HUGGING_FACE_HUB_TOKEN"));
+    output.push(Check {
+        name: "speaker runtime".into(),
+        ok: asr.diarize_runtime_ready,
+        detail: asr.diarize_runtime_detail,
+    });
+    let config = crate::data::modelconfig::load();
+    let token = (!config.hf_token.trim().is_empty())
+        .then_some(config.hf_token.as_str())
+        .or_else(|| {
+            std::env::var_os("HF_TOKEN")
+                .or_else(|| std::env::var_os("HUGGING_FACE_HUB_TOKEN"))
+                .as_ref()
+                .map(|_| "environment")
+        });
     output.push(Check {
         name: "HF_TOKEN".into(),
         ok: token.is_some(),
@@ -107,13 +120,16 @@ pub fn checks() -> Vec<Check> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let config = crate::data::modelconfig::load();
     for (name, model) in [
         ("Qwen3-ASR", config.asr_model.as_str()),
         ("ForcedAligner", config.asr_aligner.as_str()),
         ("pyannote", config.diarize_model.as_str()),
     ] {
-        let ok = crate::data::modelconfig::model_cached(&home, model);
+        let ok = if name == "pyannote" {
+            crate::data::modelconfig::diarize_model_cached(&home, model)
+        } else {
+            crate::data::modelconfig::model_cached(&home, model)
+        };
         output.push(Check {
             name: name.into(),
             ok,
@@ -143,7 +159,7 @@ mod tests {
     #[test]
     fn check_set_covers_tools_token_and_all_model_families() {
         let names: Vec<String> = checks().into_iter().map(|check| check.name).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         for expected in [
             "ffmpeg",
             "ffprobe",
@@ -152,6 +168,7 @@ mod tests {
             "hf",
             "HF_TOKEN",
             "ASR runtime",
+            "speaker runtime",
             "Qwen3-ASR",
             "ForcedAligner",
             "pyannote",

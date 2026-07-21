@@ -1304,17 +1304,24 @@ pub async fn wait_and_apply(
     task: PreparedTask,
     timeout: Duration,
 ) -> AppResult<usize> {
-    let zero_duration_words_before = (task.kind == "polish")
-        .then(|| {
-            Doc::load(&task.project_dir).map(|doc| {
-                doc.all_words()
-                    .into_iter()
-                    .filter(|word| word.end - word.start < crate::pipeline::timing::MIN_DUR)
-                    .count()
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
+    wait_and_apply_inner(allocator, task, timeout, None).await
+}
+
+pub async fn wait_and_apply_with_lock(
+    allocator: Arc<Allocator>,
+    task: PreparedTask,
+    timeout: Duration,
+    project_mutation: Arc<tokio::sync::Mutex<()>>,
+) -> AppResult<usize> {
+    wait_and_apply_inner(allocator, task, timeout, Some(project_mutation)).await
+}
+
+async fn wait_and_apply_inner(
+    allocator: Arc<Allocator>,
+    task: PreparedTask,
+    timeout: Duration,
+    project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+) -> AppResult<usize> {
     let started = Instant::now();
     loop {
         if task
@@ -1386,6 +1393,25 @@ pub async fn wait_and_apply(
         return Err(AppError::Schema(task_errors.join("; ")));
     }
 
+    // Model execution can take minutes. Lock only the final local mutation so
+    // the editor stays usable while work is in flight, but background results
+    // cannot write doc/cuts/artifacts concurrently with an editor command.
+    let _mutation = if let Some(mutation) = project_mutation {
+        Some(mutation.lock_owned().await)
+    } else {
+        None
+    };
+    let zero_duration_words_before = (task.kind == "polish")
+        .then(|| {
+            Doc::load(&task.project_dir).map(|doc| {
+                doc.all_words()
+                    .into_iter()
+                    .filter(|word| word.end - word.start < crate::pipeline::timing::MIN_DUR)
+                    .count()
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let mut applied = 0usize;
     let mut evidence = Vec::with_capacity(task.calls.len());
     for (prepared, submission) in task.calls.iter().zip(submissions) {

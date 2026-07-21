@@ -15,6 +15,19 @@ let brollOverview: {
   errors: string[];
 };
 let brollListError: Error | null;
+let speakerEvidenceState: {
+  speakers: Array<{ id: string; paragraph_count: number }>;
+  turns: Array<{
+    paragraphId: number;
+    speaker: string | null;
+    start: number;
+    end: number;
+    text: string;
+    cueIds: string[];
+  }>;
+  identified: boolean;
+  unlabelled: number;
+};
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `asset://${path}`,
@@ -27,6 +40,7 @@ beforeEach(() => {
   versionCommitError = null;
   brollOverview = { suggestions: [], accepted: [], errors: [] };
   brollListError = null;
+  speakerEvidenceState = { speakers: [], turns: [], identified: false, unlabelled: 0 };
   invoke.mockReset();
   projectDoc = structuredClone(serializedProject);
   invoke.mockImplementation(async (command) => {
@@ -77,6 +91,29 @@ beforeEach(() => {
       case "speakers_list":
       case "cut_list":
         return [];
+      case "speaker_evidence":
+        return speakerEvidenceState;
+      case "speaker_reidentify_preview":
+        return {
+          segments: 3,
+          changed: 1,
+          unassigned: 0,
+          proposals: [{
+            paragraphId: 1,
+            current: "Alice",
+            cluster: "SPEAKER_00",
+            proposed: "SPEAKER_00",
+            start: 0,
+            end: 1,
+            text: "Hello world",
+            coverage: 0.94,
+            margin: 0.88,
+          }],
+        };
+      case "speaker_reidentify_apply":
+        return 1;
+      case "speaker_assign":
+        return undefined;
       case "style_get":
         return {
           name: "Default",
@@ -129,6 +166,7 @@ beforeEach(() => {
           asrModel: "Qwen/Qwen3-ASR-0.6B",
           asrAligner: "Qwen/Qwen3-ForcedAligner-0.6B",
           diarizeModel: "pyannote/speaker-diarization-3.1",
+          hfToken: "hf_test",
           llmEndpoint: "",
           llmApiKey: "",
           llmModel: "gpt-4o-mini",
@@ -143,6 +181,13 @@ beforeEach(() => {
           modelCached: asrReady,
           alignerId: "Qwen/Qwen3-ForcedAligner-0.6B",
           alignerCached: asrReady,
+          diarizeModelId: "pyannote/speaker-diarization-3.1",
+          diarizeModelCached: asrReady,
+          diarizePythonPath: "/Users/example/.lumen-cut/runtime/bin/python3",
+          diarizeRuntimeReady: asrReady,
+          diarizeRuntimeDetail: "pyannote.audio 3.4.0",
+          huggingFaceTokenSet: asrReady,
+          diarizeReady: asrReady,
           ready: asrReady,
         };
       case "transcription_status":
@@ -214,6 +259,62 @@ test("a serialized transcript project can open every editor surface", async () =
   }
 });
 
+test("speaker re-identification is previewed before it can change labels", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Alice",
+      sentences: [{
+        id: "s1",
+        text: "Hello world",
+        words: [
+          { id: "w1", text: "Hello", start: 0, end: 0.5 },
+          { id: "w2", text: "world", start: 0.5, end: 1 },
+        ],
+      }],
+    }],
+  };
+  speakerEvidenceState = {
+    speakers: [{ id: "Alice", paragraph_count: 1 }],
+    turns: [{
+      paragraphId: 1,
+      speaker: "Alice",
+      start: 0,
+      end: 1,
+      text: "Hello world",
+      cueIds: ["s1"],
+    }],
+    identified: true,
+    unlabelled: 0,
+  };
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "属性" }));
+
+  expect(await screen.findByText("逐段证据")).toBeVisible();
+  expect(screen.getByText("Hello world")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "预览重新识别" }));
+
+  expect(await screen.findByText("1 个段落标签将改变")).toBeVisible();
+  expect(screen.getByText("Alice → SPEAKER_00")).toBeVisible();
+  expect(invoke).toHaveBeenCalledWith("speaker_reidentify_preview", {
+    pid: "project-1",
+    root: null,
+  });
+  expect(invoke).not.toHaveBeenCalledWith("speaker_reidentify_apply", expect.anything());
+  expect(screen.getByRole("button", { name: "请先勾选" })).toBeDisabled();
+
+  fireEvent.click(screen.getByRole("checkbox", { name: "选择段落 1" }));
+  fireEvent.click(screen.getByRole("button", { name: "应用 1 项" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("speaker_reidentify_apply", {
+    pid: "project-1",
+    proposals: [expect.objectContaining({ paragraphId: 1 })],
+    root: null,
+  }));
+});
+
 test("setup blocks transcription until the local runtime and models are ready", async () => {
   asrReady = false;
   render(<App />);
@@ -230,9 +331,10 @@ test("settings exposes the real local transcription status", async () => {
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
 
-  expect(await screen.findByRole("heading", { name: "本地转写" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "本地模型与运行环境" })).toBeVisible();
   expect(screen.getByText(/mlx-qwen3-asr 0.3.5/)).toBeVisible();
-  expect(screen.getAllByText("模型已下载")).toHaveLength(2);
+  expect(screen.getAllByText("模型已下载")).toHaveLength(3);
+  expect(screen.getByText(/pyannote\.audio 3\.4\.0/)).toBeVisible();
   expect(screen.queryByRole("button", { name: /start server/i })).not.toBeInTheDocument();
 });
 
