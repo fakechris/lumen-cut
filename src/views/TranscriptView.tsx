@@ -2,6 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import {
   audit,
   asrStatus,
+  brollAcceptSuggestion,
+  brollAdd,
+  brollList,
+  brollPreview,
+  brollRemove,
+  brollUpdate,
   branchCreate,
   branchSwitch,
   configShow,
@@ -13,6 +19,7 @@ import {
   exportVideo,
   finishCheck,
   mergeSubtitles,
+  pickBrollFile,
   projectUpdateMeta,
   projectShow,
   speakerMerge,
@@ -45,6 +52,9 @@ import type { Lang } from "../i18n";
 import type {
   Doc,
   AsrStatus,
+  BrollOverview,
+  BrollPlacementInput,
+  BrollSuggestion,
   FinishCheckItem,
   SubtitleRow,
   SubtitleStyle,
@@ -61,6 +71,7 @@ import { TimelineWorkspace } from "./editor/TimelineWorkspace";
 import { TranscriptEditor } from "./editor/TranscriptEditor";
 import { TranslationWorkspace } from "./editor/TranslationWorkspace";
 import { HistoryWorkspace } from "./editor/HistoryWorkspace";
+import { BrollWorkspace } from "./editor/BrollWorkspace";
 
 interface Props {
   lang: Lang;
@@ -77,6 +88,7 @@ type Tab =
   | "properties"
   | "history"
   | "timeline"
+  | "broll"
   | "review"
   | "export";
 type Feedback = { tone: "success" | "error" | "info"; text: string };
@@ -89,6 +101,7 @@ const COPY = {
     properties: "属性",
     history: "版本",
     timeline: "时间线",
+    broll: "补充画面",
     review: "审查与修复",
     export: "导出",
     imported: "媒体已导入",
@@ -138,6 +151,7 @@ const COPY = {
     properties: "Properties",
     history: "Versions",
     timeline: "Timeline",
+    broll: "B-roll",
     review: "Review & Fix",
     export: "Export",
     imported: "Media imported",
@@ -260,19 +274,34 @@ export function TranscriptView({
   const [agentConfigured, setAgentConfigured] = useState(false);
   const [asrReadiness, setAsrReadiness] = useState<AsrStatus | null>(null);
   const [versionHistory, setVersionHistory] = useState<VersionHistory | null>(null);
+  const [brollOverview, setBrollOverview] = useState<BrollOverview>({
+    suggestions: [],
+    accepted: [],
+    errors: [],
+  });
   const previousPending = useRef(0);
 
   const reload = async (projectId: string, resetTab = true) => {
-    const [nextDoc, nextRows, nextStyle, nextSpeakers] = await Promise.all([
+    const [nextDoc, nextRows, nextStyle, nextSpeakers, nextBroll] = await Promise.all([
       projectShow(projectId),
       subtitleList(projectId),
       styleGet(projectId),
       speakersList(projectId),
+      brollList(projectId).catch((error) => {
+        setFeedback({
+          tone: "error",
+          text: lang === "zh"
+            ? `B-roll 数据无法加载，转写稿仍可继续编辑：${friendlyError(error, lang)}`
+            : `B-roll data could not be loaded; transcript editing is still available: ${friendlyError(error, lang)}`,
+        });
+        return { suggestions: [], accepted: [], errors: [friendlyError(error, lang)] };
+      }),
     ]);
     setDoc(nextDoc);
     setSubtitleRows(nextRows);
     setSubtitleStyle(nextStyle);
     setSpeakers(nextSpeakers);
+    setBrollOverview(nextBroll);
     if (resetTab) {
       setActiveTab(nextDoc.paragraphs.length > 0 ? "transcript" : "setup");
     }
@@ -292,6 +321,7 @@ export function TranscriptView({
     setOperation(null);
     setTranscriptionJob(null);
     setVersionHistory(null);
+    setBrollOverview({ suggestions: [], accepted: [], errors: [] });
     if (!pid) return;
     void Promise.all([
       reload(pid),
@@ -440,11 +470,11 @@ export function TranscriptView({
     }
   };
 
-  const performRecoverable = async (name: string, action: () => Promise<void>) => {
+  const performRecoverable = async <T,>(name: string, action: () => Promise<T>): Promise<T> => {
     setOperation(name);
     setFeedback(null);
     try {
-      await action();
+      return await action();
     } catch (error) {
       setFeedback({ tone: "error", text: friendlyError(error, lang) });
       throw error;
@@ -689,6 +719,61 @@ export function TranscriptView({
     });
   };
 
+  const refreshBroll = async () => {
+    setBrollOverview(await brollList(pid));
+  };
+
+  const pickBrollAsset = () => performRecoverable("broll-pick", pickBrollFile);
+
+  const acceptBrollSuggestion = async (suggestion: BrollSuggestion) => {
+    const file = await pickBrollAsset();
+    if (!file) return false;
+    await performRecoverable("broll-add", async () => {
+      await brollAcceptSuggestion(pid, suggestion, file);
+      await refreshBroll();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "素材已按建议时段加入 B-roll 轨道。" : "Added the asset at the suggested B-roll range.",
+      });
+    });
+    return true;
+  };
+
+  const addBroll = async (input: BrollPlacementInput) => {
+    await performRecoverable("broll-add", async () => {
+      await brollAdd(pid, input);
+      await refreshBroll();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "素材已加入 B-roll 轨道。" : "Added the asset to the B-roll track.",
+      });
+    });
+  };
+
+  const updateBroll = async (id: string, input: BrollPlacementInput) => {
+    await performRecoverable("broll-update", async () => {
+      await brollUpdate(pid, id, input);
+      await refreshBroll();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "B-roll 调整已保存。" : "Saved the B-roll changes.",
+      });
+    });
+  };
+
+  const removeBroll = async (id: string) => {
+    await performRecoverable("broll-remove", async () => {
+      if (!await brollRemove(pid, id)) throw new Error(`B-roll ${id} was not found`);
+      await refreshBroll();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "已从成片中移除这段素材。" : "Removed the asset from the edit.",
+      });
+    });
+  };
+
+  const previewBroll = () => performRecoverable("broll-preview", () => brollPreview(pid));
+
   const renameSpeaker = async (from: string, to: string) => {
     setOperation(`speaker-rename-${from}`);
     setFeedback(null);
@@ -788,6 +873,7 @@ export function TranscriptView({
     { id: "properties", label: c.properties },
     { id: "history", label: c.history },
     { id: "timeline", label: c.timeline, disabled: !hasTranscript },
+    { id: "broll", label: c.broll, disabled: !hasTranscript },
     { id: "review", label: c.review, disabled: !hasTranscript },
     { id: "export", label: c.export, disabled: !hasTranscript },
   ];
@@ -1016,6 +1102,22 @@ export function TranscriptView({
 
       {activeTab === "timeline" && (
         <TimelineWorkspace cuts={cuts} doc={doc} lang={lang} />
+      )}
+
+      {activeTab === "broll" && (
+        <BrollWorkspace
+          busy={operation !== null}
+          doc={doc}
+          lang={lang}
+          overview={brollOverview}
+          onAcceptSuggestion={acceptBrollSuggestion}
+          onAdd={addBroll}
+          onPickFile={pickBrollAsset}
+          onPreview={previewBroll}
+          onRefresh={() => performRecoverable("broll-load", refreshBroll)}
+          onRemove={removeBroll}
+          onUpdate={updateBroll}
+        />
       )}
 
       {activeTab === "review" && (

@@ -254,6 +254,50 @@ export interface VersionHistory {
   versions: VersionNode[];
 }
 
+export type BrollMode = "fullscreen" | "pip";
+export type BrollFit = "cover" | "contain";
+export type BrollBackground = "black" | "blur";
+
+export interface BrollSuggestion {
+  start: string;
+  end: string;
+  mode: BrollMode;
+  query: string;
+  reason: string;
+}
+
+export interface BrollPlacement {
+  id: string;
+  file: string;
+  start: number;
+  end: number;
+  mode: BrollMode;
+  rect?: { x: number; y: number; width: number; height: number } | null;
+  fit: BrollFit;
+  background: BrollBackground;
+  sourceStart: number;
+  radius: number;
+  name?: string | null;
+}
+
+export interface BrollPlacementInput {
+  file: string;
+  start: number;
+  end: number;
+  mode: BrollMode;
+  fit: BrollFit;
+  background: BrollBackground;
+  sourceStart: number;
+  radius: number;
+  name: string | null;
+}
+
+export interface BrollOverview {
+  suggestions: BrollSuggestion[];
+  accepted: BrollPlacement[];
+  errors: string[];
+}
+
 export interface Settings {
   asrModel: string;
   asrAligner: string;

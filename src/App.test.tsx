@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
 import serializedProject from "./test/fixtures/project.json";
@@ -9,6 +9,12 @@ const { invoke } = vi.hoisted(() => ({
 let projectDoc: Record<string, unknown>;
 let asrReady: boolean;
 let versionCommitError: Error | null;
+let brollOverview: {
+  suggestions: Array<Record<string, unknown>>;
+  accepted: Array<Record<string, unknown>>;
+  errors: string[];
+};
+let brollListError: Error | null;
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `asset://${path}`,
@@ -19,6 +25,8 @@ beforeEach(() => {
   localStorage.clear();
   asrReady = true;
   versionCommitError = null;
+  brollOverview = { suggestions: [], accepted: [], errors: [] };
+  brollListError = null;
   invoke.mockReset();
   projectDoc = structuredClone(serializedProject);
   invoke.mockImplementation(async (command) => {
@@ -91,6 +99,28 @@ beforeEach(() => {
         return { pending: 0, done: 0, kinds: [], polishQuality: null };
       case "version_list":
         return { v: 1, head: null, activeBranch: null, branches: [], versions: [] };
+      case "broll_list":
+        if (brollListError) throw brollListError;
+        return brollOverview;
+      case "pick_broll_file":
+        return "/Users/example/product.png";
+      case "broll_accept_suggestion": {
+        const placement = {
+          id: "br-1",
+          file: "/Users/example/product.png",
+          start: 4,
+          end: 7,
+          mode: "pip",
+          rect: null,
+          fit: "cover",
+          background: "black",
+          sourceStart: 0,
+          radius: 0,
+          name: "product close-up",
+        };
+        brollOverview = { ...brollOverview, accepted: [placement] };
+        return placement;
+      }
       case "version_commit":
         if (versionCommitError) throw versionCommitError;
         return "v0";
@@ -145,6 +175,17 @@ test("a project rendering error shows recovery UI instead of a white window", as
   expect(screen.getByRole("button", { name: "重新载入" })).toBeVisible();
 });
 
+test("corrupt optional B-roll data does not block the transcript editor", async () => {
+  brollListError = new Error("invalid broll.json");
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+
+  expect(await screen.findByRole("heading", { name: "Interview" })).toBeVisible();
+  expect(screen.getByText(/B-roll 数据无法加载，转写稿仍可继续编辑/)).toBeVisible();
+  expect(screen.queryByText("界面出现问题")).not.toBeInTheDocument();
+});
+
 test("a serialized transcript project can open every editor surface", async () => {
   projectDoc = {
     ...projectDoc,
@@ -165,7 +206,7 @@ test("a serialized transcript project can open every editor surface", async () =
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
 
   const tabs = await screen.findByRole("navigation", { name: "编辑步骤" });
-  for (const label of ["转写稿", "翻译", "样式", "属性", "版本", "时间线", "审查与修复", "导出"]) {
+  for (const label of ["转写稿", "翻译", "样式", "属性", "版本", "时间线", "补充画面", "审查与修复", "导出"]) {
     const tab = within(tabs).getByRole("button", { name: label });
     fireEvent.click(tab);
     expect(tab).toHaveAttribute("aria-current", "page");
@@ -270,4 +311,56 @@ test("a failed version save preserves the draft for retry", async () => {
   expect(await screen.findByText("disk is temporarily unavailable")).toBeVisible();
   expect(name).toHaveValue("Retry me");
   expect(note).toHaveValue("Keep this note");
+});
+
+test("B-roll suggestions have a discoverable asset acceptance flow", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Alice",
+      sentences: [{
+        id: "s1",
+        text: "Show the product",
+        words: [
+          { id: "w1", text: "Show", start: 4, end: 5 },
+          { id: "w2", text: "product", start: 6, end: 7 },
+        ],
+      }],
+    }],
+  };
+  brollOverview = {
+    suggestions: [{
+      start: "w1",
+      end: "w2",
+      mode: "pip",
+      query: "product close-up",
+      reason: "Show the object being discussed",
+    }],
+    accepted: [],
+    errors: [],
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "补充画面" }));
+
+  expect(await screen.findByText("product close-up")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "选择素材并添加" }));
+
+  await waitFor(() => {
+    expect(invoke).toHaveBeenCalledWith("broll_accept_suggestion", {
+      pid: "project-1",
+      suggestion: {
+        start: "w1",
+        end: "w2",
+        mode: "pip",
+        query: "product close-up",
+        reason: "Show the object being discussed",
+      },
+      file: "/Users/example/product.png",
+      root: null,
+    });
+  });
+  expect(await screen.findByText("素材已按建议时段加入 B-roll 轨道。")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "已加入成片" }).closest("header")).toHaveTextContent("1");
 });

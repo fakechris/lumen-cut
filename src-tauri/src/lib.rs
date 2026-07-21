@@ -34,10 +34,12 @@ pub fn run() {
         .manage(commands::AgentServerState::default())
         .manage(commands::RecordingState::default())
         .manage(commands::MediaAssetState::default())
+        .manage(commands::BrollPreviewState::default())
         .manage(commands::TranscriptionState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::pick_media_file,
+            commands::pick_broll_file,
             commands::project_create,
             commands::project_show,
             commands::project_list,
@@ -71,6 +73,10 @@ pub fn run() {
             commands::speaker_rename,
             commands::speaker_merge,
             commands::broll_list,
+            commands::broll_add,
+            commands::broll_accept_suggestion,
+            commands::broll_update,
+            commands::broll_remove,
             commands::broll_preview,
             commands::diarize_pid,
             commands::timing_repair,

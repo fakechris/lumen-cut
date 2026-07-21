@@ -5,6 +5,10 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AsrStatus,
   AutoResult,
+  BrollOverview,
+  BrollPlacement,
+  BrollPlacementInput,
+  BrollSuggestion,
   Doc,
   DoctorCheck,
   FinishCheckItem,
@@ -38,6 +42,10 @@ export async function greet(): Promise<{ msg: string; version: string }> {
 
 export async function pickMediaFile(): Promise<string | null> {
   return invoke("pick_media_file");
+}
+
+export async function pickBrollFile(): Promise<string | null> {
+  return invoke("pick_broll_file");
 }
 
 export async function projectList(): Promise<ProjectSummary[]> {
@@ -265,6 +273,46 @@ export async function speakerMerge(
   into: string,
 ): Promise<number> {
   return invoke("speaker_merge", { pid, from, into, root: null });
+}
+
+export async function brollList(pid: string): Promise<BrollOverview> {
+  return invoke("broll_list", { pid, root: null });
+}
+
+export async function brollAdd(
+  pid: string,
+  input: BrollPlacementInput,
+): Promise<BrollPlacement> {
+  return invoke("broll_add", { pid, input, root: null });
+}
+
+export async function brollAcceptSuggestion(
+  pid: string,
+  suggestion: BrollSuggestion,
+  file: string,
+): Promise<BrollPlacement> {
+  return invoke("broll_accept_suggestion", {
+    pid,
+    suggestion,
+    file,
+    root: null,
+  });
+}
+
+export async function brollUpdate(
+  pid: string,
+  id: string,
+  input: BrollPlacementInput,
+): Promise<BrollPlacement> {
+  return invoke("broll_update", { pid, id, input, root: null });
+}
+
+export async function brollRemove(pid: string, id: string): Promise<boolean> {
+  return invoke("broll_remove", { pid, id, root: null });
+}
+
+export async function brollPreview(pid: string): Promise<string[]> {
+  return invoke("broll_preview", { pid, at: [], root: null });
 }
 
 export async function finishCheck(pid: string): Promise<FinishCheckItem[]> {

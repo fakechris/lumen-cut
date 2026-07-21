@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,31 @@ pub async fn pick_media_file(app: tauri::AppHandle) -> AppResult<Option<String>>
             "Audio and video",
             &[
                 "mp4", "mov", "m4v", "mkv", "webm", "mp3", "m4a", "wav", "aac", "flac", "aiff",
+            ],
+        )
+        .pick_file(move |selected| {
+            let _ = send.send(selected);
+        });
+    let selected = receive
+        .await
+        .map_err(|_| AppError::Schema("native file dialog closed unexpectedly".into()))?;
+    Ok(selected.and_then(|file| {
+        file.as_path()
+            .map(|path| path.to_string_lossy().into_owned())
+    }))
+}
+
+/// Pick a still image or video to place on the B-roll track. The callback API
+/// keeps the native dialog off AppKit's synchronous command path.
+#[tauri::command]
+pub async fn pick_broll_file(app: tauri::AppHandle) -> AppResult<Option<String>> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter(
+            "Images and video",
+            &[
+                "png", "jpg", "jpeg", "webp", "gif", "mp4", "mov", "m4v", "mkv", "webm",
             ],
         )
         .pick_file(move |selected| {
@@ -1512,15 +1537,330 @@ pub async fn speaker_merge(
 pub struct BrollOverview {
     pub suggestions: Vec<crate::pipeline::broll::BrollSuggestion>,
     pub accepted: Vec<crate::data::broll::BrollPlacement>,
+    pub errors: Vec<String>,
+}
+
+pub struct BrollPreviewState {
+    current: Mutex<Vec<PathBuf>>,
+}
+
+impl Default for BrollPreviewState {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrollPlacementInput {
+    pub file: PathBuf,
+    pub start: f64,
+    pub end: f64,
+    pub mode: Option<crate::data::broll::PlacementMode>,
+    pub fit: Option<crate::data::broll::FitMode>,
+    pub background: Option<crate::data::broll::BackgroundMode>,
+    pub source_start: Option<f64>,
+    pub radius: Option<u32>,
+    pub name: Option<String>,
+}
+
+static BROLL_MUTATIONS: OnceLock<
+    tokio::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
+
+async fn lock_broll_project(dir: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let registry = BROLL_MUTATIONS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let project_lock = {
+        let mut locks = registry.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(dir).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(dir.to_path_buf(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    project_lock.lock_owned().await
+}
+
+const fn default_pip_rect() -> crate::data::broll::Rect {
+    crate::data::broll::Rect {
+        x: 1229,
+        y: 65,
+        width: 614,
+        height: 346,
+    }
+}
+
+fn is_still_image(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif"
+            )
+        })
+}
+
+fn validate_broll_span(
+    doc: &Doc,
+    placements: &[crate::data::broll::BrollPlacement],
+    start: f64,
+    end: f64,
+    ignore_id: Option<&str>,
+) -> AppResult<()> {
+    if doc.media.duration_seconds > 0.0 && end > doc.media.duration_seconds {
+        return Err(AppError::Schema(format!(
+            "B-roll end {end:.2}s exceeds media duration {:.2}s",
+            doc.media.duration_seconds
+        )));
+    }
+    if placements.iter().any(|placement| {
+        ignore_id != Some(placement.id.as_str()) && start < placement.end && placement.start < end
+    }) {
+        return Err(AppError::Schema(
+            "B-roll placement overlaps an existing placement".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn broll_placement_from_input(
+    input: BrollPlacementInput,
+    id: String,
+) -> AppResult<crate::data::broll::BrollPlacement> {
+    let file = std::fs::canonicalize(input.file)?;
+    if !file.is_file() {
+        return Err(AppError::ProjectNotFound(file));
+    }
+    let image = is_still_image(&file);
+    let mode = input.mode.unwrap_or(if image {
+        crate::data::broll::PlacementMode::Pip
+    } else {
+        crate::data::broll::PlacementMode::Fullscreen
+    });
+    let placement = crate::data::broll::BrollPlacement {
+        id,
+        file,
+        start: input.start,
+        end: input.end,
+        mode,
+        rect: (mode == crate::data::broll::PlacementMode::Pip).then_some(default_pip_rect()),
+        fit: input.fit.unwrap_or_default(),
+        background: input.background.unwrap_or_default(),
+        source_start: input.source_start.unwrap_or_default(),
+        radius: input.radius.unwrap_or_default(),
+        name: input.name.and_then(|name| {
+            let name = name.trim().to_string();
+            (!name.is_empty()).then_some(name)
+        }),
+    };
+    placement.validate()?;
+    Ok(placement)
 }
 
 #[tauri::command]
 pub async fn broll_list(pid: String, root: Option<PathBuf>) -> AppResult<BrollOverview> {
-    let dir = resolve_project_root(root).join(&pid);
-    Ok(BrollOverview {
-        suggestions: crate::pipeline::broll::load_artifact(&dir)?,
-        accepted: crate::data::broll::load(&dir)?,
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("B-roll list", move || {
+        Doc::load(&dir)?;
+        let mut errors = Vec::new();
+        let suggestions = crate::pipeline::broll::load_artifact(&dir).unwrap_or_else(|error| {
+            errors.push(format!("suggestions: {error}"));
+            Vec::new()
+        });
+        let accepted = crate::data::broll::load(&dir).unwrap_or_else(|error| {
+            errors.push(format!("placements: {error}"));
+            Vec::new()
+        });
+        Ok(BrollOverview {
+            suggestions,
+            accepted,
+            errors,
+        })
     })
+    .await
+}
+
+#[tauri::command]
+pub async fn broll_add(
+    pid: String,
+    input: BrollPlacementInput,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::broll::BrollPlacement> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_broll_project(&dir).await;
+    run_blocking("B-roll add", move || {
+        let doc = Doc::load(&dir)?;
+        let mut placements = crate::data::broll::load(&dir)?;
+        let placement =
+            broll_placement_from_input(input, format!("br-{}", uuid::Uuid::new_v4().simple()))?;
+        validate_broll_span(&doc, &placements, placement.start, placement.end, None)?;
+        placements.push(placement.clone());
+        crate::data::broll::save(&dir, &placements)?;
+        Ok(placement)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn broll_accept_suggestion(
+    pid: String,
+    suggestion: crate::pipeline::broll::BrollSuggestion,
+    file: PathBuf,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::broll::BrollPlacement> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_broll_project(&dir).await;
+    run_blocking("B-roll suggestion accept", move || {
+        let doc = Doc::load(&dir)?;
+        let suggestions = crate::pipeline::broll::load_artifact(&dir)?;
+        let suggestion = suggestions
+            .iter()
+            .find(|candidate| **candidate == suggestion)
+            .ok_or_else(|| {
+                AppError::Schema(
+                    "B-roll suggestions changed while choosing an asset; refresh and try again"
+                        .into(),
+                )
+            })?;
+        let placements = crate::data::broll::load(&dir)?;
+        let existing = placements
+            .iter()
+            .map(|placement| (placement.start, placement.end))
+            .collect::<Vec<_>>();
+        let problems =
+            crate::pipeline::broll::lint(&doc, std::slice::from_ref(suggestion), &existing);
+        if !problems.is_empty() {
+            return Err(AppError::Schema(
+                problems
+                    .iter()
+                    .map(|problem| format!("{}: {}", problem.loc, problem.problem))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        let words = doc
+            .all_words()
+            .into_iter()
+            .map(|word| (word.id.as_str(), (word.start, word.end)))
+            .collect::<HashMap<_, _>>();
+        let start = words
+            .get(suggestion.start.as_str())
+            .map(|times| times.0)
+            .ok_or_else(|| AppError::Schema("B-roll suggestion start word is missing".into()))?;
+        let end = words
+            .get(suggestion.end.as_str())
+            .map(|times| times.1)
+            .ok_or_else(|| AppError::Schema("B-roll suggestion end word is missing".into()))?;
+        let mode = match suggestion.mode {
+            crate::pipeline::broll::BrollMode::Fullscreen => {
+                crate::data::broll::PlacementMode::Fullscreen
+            }
+            crate::pipeline::broll::BrollMode::Pip => crate::data::broll::PlacementMode::Pip,
+        };
+        let input = BrollPlacementInput {
+            file,
+            start,
+            end,
+            mode: Some(mode),
+            fit: None,
+            background: None,
+            source_start: None,
+            radius: None,
+            name: Some(suggestion.query.clone()),
+        };
+        let placement =
+            broll_placement_from_input(input, format!("br-{}", uuid::Uuid::new_v4().simple()))?;
+        let mut placements = placements;
+        placements.push(placement.clone());
+        crate::data::broll::save(&dir, &placements)?;
+        Ok(placement)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn broll_update(
+    pid: String,
+    id: String,
+    input: BrollPlacementInput,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::broll::BrollPlacement> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_broll_project(&dir).await;
+    run_blocking("B-roll update", move || {
+        let doc = Doc::load(&dir)?;
+        let mut placements = crate::data::broll::load(&dir)?;
+        if !placements.iter().any(|placement| placement.id == id) {
+            return Err(AppError::Schema(format!("B-roll id {id} not found")));
+        }
+        let mut replacement = broll_placement_from_input(input, id.clone())?;
+        validate_broll_span(
+            &doc,
+            &placements,
+            replacement.start,
+            replacement.end,
+            Some(&id),
+        )?;
+        let index = placements
+            .iter()
+            .position(|placement| placement.id == id)
+            .ok_or_else(|| AppError::Schema(format!("B-roll id {id} disappeared")))?;
+        replacement.rect = match replacement.mode {
+            crate::data::broll::PlacementMode::Fullscreen => None,
+            crate::data::broll::PlacementMode::Pip => {
+                placements[index].rect.or(Some(default_pip_rect()))
+            }
+        };
+        placements[index] = replacement.clone();
+        crate::data::broll::save(&dir, &placements)?;
+        Ok(replacement)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn broll_remove(pid: String, id: String, root: Option<PathBuf>) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_broll_project(&dir).await;
+    run_blocking("B-roll remove", move || {
+        let mut placements = crate::data::broll::load(&dir)?;
+        let before = placements.len();
+        placements.retain(|placement| placement.id != id);
+        if placements.len() == before {
+            return Ok(false);
+        }
+        crate::data::broll::save(&dir, &placements)?;
+        Ok(true)
+    })
+    .await
+}
+
+fn broll_preview_timestamps(
+    doc: &Doc,
+    cuts: &ClipCuts,
+    placements: &[crate::data::broll::BrollPlacement],
+) -> Vec<f64> {
+    let intervals = crate::export::cut_intervals(doc, &cuts.cuts);
+    placements
+        .iter()
+        .filter_map(|placement| {
+            if intervals
+                .iter()
+                .any(|(start, end)| *start <= placement.start && placement.end <= *end)
+            {
+                return None;
+            }
+            let start = crate::export::retime(placement.start, &intervals);
+            let end = crate::export::retime(placement.end, &intervals);
+            (end > start).then_some((start + end) / 2.0)
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -1528,8 +1868,10 @@ pub async fn broll_preview(
     pid: String,
     at: Vec<f64>,
     root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrollPreviewState>,
 ) -> AppResult<Vec<String>> {
-    let dir = resolve_project_root(root).join(&pid);
+    let dir = resolve_project_dir(&pid, root)?;
     let prepare_dir = dir.clone();
     let (doc, cuts, placements, ass) = run_blocking("B-roll preview preparation", move || {
         let doc = Doc::load(&prepare_dir)?;
@@ -1546,15 +1888,20 @@ pub async fn broll_preview(
     })
     .await?;
     if placements.is_empty() {
+        let scope = app.asset_protocol_scope();
+        let mut current = state.current.lock().expect("B-roll preview state poisoned");
+        for previous in current.iter() {
+            scope
+                .forbid_file(previous)
+                .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
+        }
+        current.clear();
         return Ok(Vec::new());
     }
     let video = dir.join("broll-preview.mp4");
     crate::export::render_video_with_broll(&doc, &cuts.cuts, &ass, &video, &placements).await?;
     let timestamps = if at.is_empty() {
-        placements
-            .iter()
-            .map(|placement| (placement.start + placement.end) / 2.0)
-            .collect()
+        broll_preview_timestamps(&doc, &cuts, &placements)
     } else {
         at
     };
@@ -1564,6 +1911,23 @@ pub async fn broll_preview(
         crate::media::extract_frame(&video, timestamp, &output).await?;
         outputs.push(output.to_string_lossy().into_owned());
     }
+    let scope = app.asset_protocol_scope();
+    let output_paths = outputs.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let mut current = state.current.lock().expect("B-roll preview state poisoned");
+    for previous in current
+        .iter()
+        .filter(|previous| !output_paths.contains(previous))
+    {
+        scope
+            .forbid_file(previous)
+            .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
+    }
+    for output in &output_paths {
+        scope
+            .allow_file(output)
+            .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
+    }
+    *current = output_paths;
     Ok(outputs)
 }
 
@@ -2239,6 +2603,16 @@ mod main_thread_safety_tests {
             "IPC work must use async timers instead of putting an executor thread to sleep"
         );
     }
+
+    #[test]
+    fn broll_preview_uses_the_validated_project_path() {
+        let source = include_str!("commands.rs");
+        let start = source.find("pub async fn broll_preview(").unwrap();
+        let rest = &source[start..];
+        let end = rest.find("pub struct DiarizeResult").unwrap();
+        assert!(rest[..end].contains("resolve_project_dir(&pid, root)?"));
+        assert!(!rest[..end].contains("resolve_project_root(root).join(&pid)"));
+    }
 }
 
 #[tauri::command]
@@ -2597,6 +2971,188 @@ mod tests {
             .unwrap();
         assert_eq!(history.versions.len(), 1);
         assert_eq!(history.versions[0].name, "before timing repair");
+    }
+
+    fn broll_input(file: &std::path::Path, start: f64, end: f64) -> BrollPlacementInput {
+        BrollPlacementInput {
+            file: file.to_path_buf(),
+            start,
+            end,
+            mode: Some(crate::data::broll::PlacementMode::Pip),
+            fit: None,
+            background: None,
+            source_start: None,
+            radius: Some(12),
+            name: Some("Product close-up".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn broll_commands_cover_suggestion_accept_update_and_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "show the product",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.media.duration_seconds = 30.0;
+        doc.paragraphs[0].sentences[0].words = vec![
+            crate::data::Word {
+                id: "wc".into(),
+                text: "cut".into(),
+                start: 1.0,
+                end: 3.0,
+            },
+            crate::data::Word {
+                id: "w0".into(),
+                text: "show".into(),
+                start: 5.0,
+                end: 5.8,
+            },
+            crate::data::Word {
+                id: "w1".into(),
+                text: "product".into(),
+                start: 6.0,
+                end: 7.0,
+            },
+        ];
+        doc.save(&project).unwrap();
+        std::fs::create_dir_all(project.join("ai")).unwrap();
+        std::fs::write(
+            project.join("ai/broll-suggestions.json"),
+            r#"{"suggestions":[{"start":"w0","end":"w1","mode":"pip","query":"product detail","reason":"show the object"}]}"#,
+        )
+        .unwrap();
+        let asset = tmp.path().join("asset.png");
+        std::fs::write(&asset, "fixture").unwrap();
+        let suggestion = crate::pipeline::broll::BrollSuggestion {
+            start: "w0".into(),
+            end: "w1".into(),
+            mode: crate::pipeline::broll::BrollMode::Pip,
+            query: "product detail".into(),
+            reason: "show the object".into(),
+        };
+
+        let accepted = broll_accept_suggestion(
+            "p1".into(),
+            suggestion.clone(),
+            asset.clone(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!((accepted.start, accepted.end), (5.0, 7.0));
+        assert_eq!(accepted.name.as_deref(), Some("product detail"));
+        assert_eq!(accepted.rect, Some(default_pip_rect()));
+
+        let mut stale = suggestion;
+        stale.query = "changed while picker was open".into();
+        assert!(broll_accept_suggestion(
+            "p1".into(),
+            stale,
+            asset.clone(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .is_err());
+
+        let overlap = broll_add(
+            "p1".into(),
+            broll_input(&asset, 6.5, 8.0),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await;
+        assert!(overlap.is_err());
+
+        let updated = broll_update(
+            "p1".into(),
+            accepted.id.clone(),
+            broll_input(&asset, 8.0, 12.0),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!((updated.start, updated.end), (8.0, 12.0));
+        let cuts = ClipCuts {
+            cuts: vec![crate::data::Cut {
+                id: "cut-before-broll".into(),
+                note: None,
+                a_word: "wc".into(),
+                b_word: "wc".into(),
+                kind: crate::data::CutKind::Manual,
+                duration: 2.0,
+            }],
+        };
+        assert_eq!(
+            broll_preview_timestamps(&doc, &cuts, std::slice::from_ref(&updated)),
+            vec![8.0]
+        );
+        std::fs::write(project.join("ai/broll-suggestions.json"), "not json").unwrap();
+        let partial = broll_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(partial.accepted.len(), 1);
+        assert!(partial.suggestions.is_empty());
+        assert_eq!(partial.errors.len(), 1);
+        assert!(
+            broll_remove("p1".into(), accepted.id, Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+        );
+        assert!(crate::data::broll::load(&project).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_broll_adds_do_not_lose_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "two placements",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.media.duration_seconds = 30.0;
+        doc.save(&project).unwrap();
+        let first_asset = tmp.path().join("first.png");
+        let second_asset = tmp.path().join("second.png");
+        std::fs::write(&first_asset, "first").unwrap();
+        std::fs::write(&second_asset, "second").unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let (first, second) = tokio::join!(
+            broll_add(
+                "p1".into(),
+                broll_input(&first_asset, 4.0, 7.0),
+                Some(root.clone()),
+            ),
+            broll_add(
+                "p1".into(),
+                broll_input(&second_asset, 9.0, 12.0),
+                Some(root),
+            )
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(crate::data::broll::load(&project).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn broll_list_rejects_project_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            broll_list("../outside".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .is_err()
+        );
     }
 
     fn settings() -> SettingsPayload {
