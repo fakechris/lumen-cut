@@ -105,18 +105,20 @@ async fn terminate_process_tree(
     {
         if let Some(pid) = child.id() {
             let group = format!("-{pid}");
-            let _ = std::process::Command::new("/bin/kill")
+            let _ = TokioCommand::new("/bin/kill")
                 .args(["-TERM", &group])
-                .status();
+                .status()
+                .await;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
             loop {
                 if let Some(status) = child.try_wait()? {
                     return Ok(status);
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    let _ = std::process::Command::new("/bin/kill")
+                    let _ = TokioCommand::new("/bin/kill")
                         .args(["-KILL", &group])
-                        .status();
+                        .status()
+                        .await;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -141,6 +143,16 @@ fn label(bin: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_termination_does_not_spawn_synchronous_commands() {
+        let source = include_str!("proc.rs");
+        let forbidden = ["std::process::", "Command"].concat();
+        assert!(
+            !source.contains(&forbidden),
+            "cancellation must not block the async subprocess runner"
+        );
+    }
 
     #[tokio::test]
     async fn run_captures_stdout() {

@@ -29,8 +29,8 @@ pub struct MediaInfo {
 /// Extract one frame at the given timestamp; useful for B-roll thumbnail prep
 /// downstream (Stage 4). Returns the path of the written PNG.
 pub async fn extract_frame(video: &Path, at_seconds: f64, out: &Path) -> AppResult<PathBuf> {
-    if !out.exists() {
-        let _ = std::fs::create_dir_all(out.parent().unwrap_or(Path::new(".")));
+    if !tokio::fs::try_exists(out).await.unwrap_or(false) {
+        let _ = tokio::fs::create_dir_all(out.parent().unwrap_or(Path::new("."))).await;
     }
     let at = format!("{:.3}", at_seconds);
     proc::run(
@@ -54,7 +54,7 @@ pub async fn extract_frame(video: &Path, at_seconds: f64, out: &Path) -> AppResu
 /// Convert any audio/video file to a 16 kHz mono WAV for ASR.
 pub async fn extract_audio_wav(input: &Path, output: &Path) -> AppResult<PathBuf> {
     if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
     info!(input = %input.display(), output = %output.display(), "extracting audio");
     proc::run(

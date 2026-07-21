@@ -18,7 +18,7 @@ const FORMAT: &str =
 /// Download a URL to the given output template (`%(ext)s` recommended).
 pub async fn download(url: &str, output_template: &Path) -> AppResult<PathBuf> {
     if let Some(parent) = output_template.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
     let tpl = output_template.display().to_string();
     let out = proc::run(

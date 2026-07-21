@@ -4,16 +4,16 @@
 //! so the React frontend can drive the editor in-process.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use tokio::io::AsyncWriteExt;
 
 use crate::VERSION;
 
@@ -24,6 +24,16 @@ use crate::data::{ClipCuts, Doc, MediaRef, Meta};
 use crate::error::{AppError, AppResult};
 use crate::export::{write_ass, write_md, write_srt, write_vtt};
 use crate::media::{extract_audio_wav, probe};
+
+async fn run_blocking<T, F>(label: &'static str, work: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| AppError::Schema(format!("{label} task failed: {error}")))?
+}
 
 /// Tauri apps do not have a reliable working directory. Keep GUI projects in
 /// a user-owned, stable location unless the caller explicitly supplies one.
@@ -72,7 +82,7 @@ pub struct Greet {
 }
 
 #[tauri::command]
-pub fn greet() -> Greet {
+pub async fn greet() -> Greet {
     Greet {
         msg: "lumen-cut ready".to_string(),
         version: VERSION,
@@ -86,9 +96,9 @@ pub fn greet() -> Greet {
 /// Open the native macOS file chooser. Returning `None` is a normal user
 /// cancellation, not an error.
 #[tauri::command]
-pub fn pick_media_file(app: tauri::AppHandle) -> AppResult<Option<String>> {
-    let selected = app
-        .dialog()
+pub async fn pick_media_file(app: tauri::AppHandle) -> AppResult<Option<String>> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .add_filter(
             "Audio and video",
@@ -96,7 +106,12 @@ pub fn pick_media_file(app: tauri::AppHandle) -> AppResult<Option<String>> {
                 "mp4", "mov", "m4v", "mkv", "webm", "mp3", "m4a", "wav", "aac", "flac", "aiff",
             ],
         )
-        .blocking_pick_file();
+        .pick_file(move |selected| {
+            let _ = send.send(selected);
+        });
+    let selected = receive
+        .await
+        .map_err(|_| AppError::Schema("native file dialog closed unexpectedly".into()))?;
     Ok(selected.and_then(|file| {
         file.as_path()
             .map(|path| path.to_string_lossy().into_owned())
@@ -125,10 +140,10 @@ pub struct ProjectSummary {
 #[tauri::command]
 pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary> {
     use chrono::Utc;
-    let media_path = std::fs::canonicalize(&args.from)?;
+    let media_path = tokio::fs::canonicalize(&args.from).await?;
     let info = probe(&media_path).await?;
     let root = resolve_project_root(args.root.clone());
-    std::fs::create_dir_all(&root)?;
+    tokio::fs::create_dir_all(&root).await?;
     let dir = resolve_project_dir(&args.pid, args.root)?;
     let doc = Doc {
         id: args.pid.clone(),
@@ -149,7 +164,9 @@ pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary
         paragraphs: vec![],
         translations: Default::default(),
     };
-    doc.save(&dir)?;
+    let save_doc = doc.clone();
+    let save_dir = dir.clone();
+    run_blocking("project save", move || save_doc.save(&save_dir)).await?;
     Ok(ProjectSummary {
         pid: args.pid,
         title: doc.meta.title,
@@ -161,12 +178,12 @@ pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary
 }
 
 #[tauri::command]
-pub fn project_show(pid: String, root: Option<PathBuf>) -> AppResult<Doc> {
+pub async fn project_show(pid: String, root: Option<PathBuf>) -> AppResult<Doc> {
     Doc::load(&resolve_project_dir(&pid, root)?)
 }
 
 #[tauri::command]
-pub fn project_list(root: Option<PathBuf>) -> AppResult<Vec<ProjectSummary>> {
+pub async fn project_list(root: Option<PathBuf>) -> AppResult<Vec<ProjectSummary>> {
     let root = resolve_project_root(root);
     let mut out = Vec::new();
     if !root.exists() {
@@ -199,7 +216,7 @@ pub fn project_list(root: Option<PathBuf>) -> AppResult<Vec<ProjectSummary>> {
 }
 
 #[tauri::command]
-pub fn project_update_meta(
+pub async fn project_update_meta(
     pid: String,
     title: String,
     description: String,
@@ -223,7 +240,7 @@ pub fn project_update_meta(
 }
 
 #[tauri::command]
-pub fn project_reveal(pid: String, root: Option<PathBuf>) -> AppResult<String> {
+pub async fn project_reveal(pid: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_dir(&pid, root)?;
     if !dir.is_dir() {
         return Err(AppError::ProjectNotFound(dir));
@@ -239,7 +256,7 @@ pub fn project_reveal(pid: String, root: Option<PathBuf>) -> AppResult<String> {
 }
 
 #[tauri::command]
-pub fn project_delete(
+pub async fn project_delete(
     pid: String,
     root: Option<PathBuf>,
     transcription: tauri::State<'_, TranscriptionState>,
@@ -291,7 +308,7 @@ impl Default for MediaAssetState {
 }
 
 #[tauri::command]
-pub fn media_asset_allow(
+pub async fn media_asset_allow(
     pid: String,
     root: Option<PathBuf>,
     app: tauri::AppHandle,
@@ -357,14 +374,14 @@ where
     report("preparing", 5);
     ensure_not_cancelled()?;
     let out_dir = resolve_project_root(args.out);
-    std::fs::create_dir_all(&out_dir)?;
+    tokio::fs::create_dir_all(&out_dir).await?;
 
     let requested_pid = args.pid.filter(|pid| !pid.trim().is_empty());
     let download_dir = requested_pid
         .as_ref()
         .map(|pid| out_dir.join(pid))
         .unwrap_or_else(|| out_dir.clone());
-    std::fs::create_dir_all(&download_dir)?;
+    tokio::fs::create_dir_all(&download_dir).await?;
     let media_path = if args.media.starts_with("http://") || args.media.starts_with("https://") {
         report("downloading", 12);
         crate::media_url::download(&args.media, &download_dir.join("source.%(ext)s")).await?
@@ -372,10 +389,10 @@ where
         PathBuf::from(&args.media)
     };
     ensure_not_cancelled()?;
-    if !media_path.exists() {
+    if !tokio::fs::try_exists(&media_path).await? {
         return Err(AppError::ProjectNotFound(media_path));
     }
-    let media_path = std::fs::canonicalize(media_path)?;
+    let media_path = tokio::fs::canonicalize(media_path).await?;
 
     let pid_stem = requested_pid.unwrap_or_else(|| {
         media_path
@@ -384,7 +401,7 @@ where
             .unwrap_or_else(|| "project".to_string())
     });
     let pid_dir = out_dir.join(&pid_stem);
-    std::fs::create_dir_all(&pid_dir)?;
+    tokio::fs::create_dir_all(&pid_dir).await?;
     let wav = pid_dir.join("audio.wav");
     // A recording project already uses `<pid>/audio.wav` as its media source.
     // Avoid asking ffmpeg to overwrite its own input.
@@ -397,7 +414,8 @@ where
     let info = probe(&media_path).await?;
     ensure_not_cancelled()?;
 
-    let model_config = crate::data::modelconfig::load();
+    let model_config =
+        run_blocking("model config load", || Ok(crate::data::modelconfig::load())).await?;
     let model = args.model.as_deref().unwrap_or(&model_config.asr_model);
     report("transcribing", 45);
     let asr_out = crate::asr::transcribe_file_with_aligner(
@@ -421,30 +439,30 @@ where
     doc.meta.title = args.title.clone().unwrap_or_else(|| pid_stem.clone());
     doc.meta.language = args.lang.clone();
     doc.meta.updated_at = chrono::Utc::now();
-    doc.save(&pid_dir)?;
-
     report("exporting", 94);
-    let srt = pid_dir.join("out.srt");
-    let vtt = pid_dir.join("out.vtt");
-    let ass = pid_dir.join("out.ass");
-    let md = pid_dir.join("out.md");
-    write_srt(&doc, &srt)?;
-    write_vtt(&doc, &vtt)?;
-    write_ass(&doc, &ass, 1920, 1080)?;
-    write_md(&doc, &md)?;
-
-    let word_count = doc.all_words().len();
-    let paragraph_count = doc.paragraphs.len();
-    report("completed", 100);
-    Ok(AutoResult {
-        pid_dir,
-        srt,
-        vtt,
-        ass,
-        md,
-        word_count,
-        paragraph_count,
+    let result = run_blocking("project save and subtitle export", move || {
+        doc.save(&pid_dir)?;
+        let srt = pid_dir.join("out.srt");
+        let vtt = pid_dir.join("out.vtt");
+        let ass = pid_dir.join("out.ass");
+        let md = pid_dir.join("out.md");
+        write_srt(&doc, &srt)?;
+        write_vtt(&doc, &vtt)?;
+        write_ass(&doc, &ass, 1920, 1080)?;
+        write_md(&doc, &md)?;
+        Ok(AutoResult {
+            pid_dir,
+            srt,
+            vtt,
+            ass,
+            md,
+            word_count: doc.all_words().len(),
+            paragraph_count: doc.paragraphs.len(),
+        })
     })
+    .await?;
+    report("completed", 100);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -489,7 +507,7 @@ fn update_transcription_job(
 }
 
 #[tauri::command]
-pub fn transcription_start(
+pub async fn transcription_start(
     args: AutoArgs,
     state: tauri::State<'_, TranscriptionState>,
 ) -> AppResult<TranscriptionJobStatus> {
@@ -570,7 +588,7 @@ pub fn transcription_start(
 }
 
 #[tauri::command]
-pub fn transcription_status(
+pub async fn transcription_status(
     pid: String,
     state: tauri::State<'_, TranscriptionState>,
 ) -> AppResult<TranscriptionJobStatus> {
@@ -584,7 +602,7 @@ pub fn transcription_status(
 }
 
 #[tauri::command]
-pub fn transcription_cancel(
+pub async fn transcription_cancel(
     pid: String,
     state: tauri::State<'_, TranscriptionState>,
 ) -> AppResult<TranscriptionJobStatus> {
@@ -631,16 +649,21 @@ pub async fn task_start(
 ) -> AppResult<TaskStartResult> {
     let root = resolve_project_root(args.root);
     let dir = root.join(&args.pid);
-    let task = crate::agent::task::prepare_task_with_task_options(
-        &dir,
-        &args.kind,
-        args.lang.as_deref(),
-        crate::agent::task::TaskOptions {
-            stale_only: args.stale_only,
-            groups: args.groups,
-            align_fit: args.align_fit,
-        },
-    )?;
+    let kind = args.kind;
+    let lang = args.lang;
+    let task = run_blocking("task preparation", move || {
+        crate::agent::task::prepare_task_with_task_options(
+            &dir,
+            &kind,
+            lang.as_deref(),
+            crate::agent::task::TaskOptions {
+                stale_only: args.stale_only,
+                groups: args.groups,
+                align_fit: args.align_fit,
+            },
+        )
+    })
+    .await?;
     let pending = task.calls.len();
     let ai_dir = task.ai_dir.clone();
     let (agent_port, allocator) = ensure_agent_server(&state, None).await?;
@@ -770,7 +793,7 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
 }
 
 #[tauri::command]
-pub fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> {
+pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> {
     let root = resolve_project_root(root);
     let project_dir = root.join(&pid);
     let (pending, done) = crate::agent::task::task_counts(&project_dir);
@@ -792,7 +815,10 @@ pub fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> 
 // ============================================================================
 
 #[tauri::command]
-pub fn finish_check_pid(pid: String, root: Option<PathBuf>) -> AppResult<Vec<FinishCheckItem>> {
+pub async fn finish_check_pid(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<FinishCheckItem>> {
     let root = resolve_project_root(root);
     let dir = root.join(&pid);
     let doc = Doc::load(&dir)?;
@@ -830,7 +856,7 @@ pub struct FinishCheckItem {
 }
 
 #[tauri::command]
-pub fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
+pub async fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
     let root = resolve_project_root(root);
     let dir = root.join(&pid);
     let doc = Doc::load(&dir)?;
@@ -846,7 +872,7 @@ pub fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
 }
 
 #[tauri::command]
-pub fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> AppResult<bool> {
+pub async fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> AppResult<bool> {
     let root = resolve_project_root(root);
     let dir = root.join(&pid);
     let cuts_path = dir.join("cuts.json");
@@ -873,7 +899,7 @@ pub struct CutSummary {
 }
 
 #[tauri::command]
-pub fn cut_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<CutSummary>> {
+pub async fn cut_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<CutSummary>> {
     let root = resolve_project_root(root);
     let dir = root.join(&pid);
     let cuts_path = dir.join("cuts.json");
@@ -909,7 +935,7 @@ pub struct SettingsPayload {
 }
 
 #[tauri::command]
-pub fn settings_export(
+pub async fn settings_export(
     state: tauri::State<'_, AgentServerState>,
     settings: SettingsPayload,
 ) -> AppResult<String> {
@@ -941,7 +967,7 @@ fn apply_worker_count(state: &AgentServerState, settings: &SettingsPayload) {
 }
 
 #[tauri::command]
-pub fn audit_pid(pid: String, root: Option<PathBuf>) -> AppResult<ReportSummary> {
+pub async fn audit_pid(pid: String, root: Option<PathBuf>) -> AppResult<ReportSummary> {
     let root = resolve_project_root(root);
     let dir = root.join(&pid);
     let doc = Doc::load(&dir)?;
@@ -991,7 +1017,7 @@ impl From<&Report> for ReportSummary {
 }
 
 #[tauri::command]
-pub fn version_merge(
+pub async fn version_merge(
     base: BTreeMap<String, String>,
     ours: BTreeMap<String, String>,
     theirs: BTreeMap<String, String>,
@@ -1043,18 +1069,20 @@ pub struct AgentServerState {
 /// when to stop, then creates the project from the finalized WAV.
 pub struct RecordingState {
     session: Mutex<Option<RecordingSession>>,
+    starting: AtomicBool,
 }
 
 struct RecordingSession {
     pid: String,
     wav: PathBuf,
-    child: Child,
+    child: tokio::process::Child,
 }
 
 impl Default for RecordingState {
     fn default() -> Self {
         Self {
             session: Mutex::new(None),
+            starting: AtomicBool::new(false),
         }
     }
 }
@@ -1063,8 +1091,7 @@ impl Drop for RecordingState {
     fn drop(&mut self) {
         if let Ok(slot) = self.session.get_mut() {
             if let Some(session) = slot.as_mut() {
-                let _ = session.child.kill();
-                let _ = session.child.wait();
+                let _ = session.child.start_kill();
             }
         }
     }
@@ -1164,7 +1191,7 @@ pub async fn agent_serve(
 }
 
 #[tauri::command]
-pub fn agent_enqueue(
+pub async fn agent_enqueue(
     state: tauri::State<'_, AgentServerState>,
     call_id: String,
     kind: String,
@@ -1200,7 +1227,7 @@ fn enqueue_call(state: &AgentServerState, call: crate::agent::PendingCall) -> Ap
 /// Routes to the same `WorkerPool` the HTTP `/agent/workers` endpoint reads
 /// so the GUI and external workers agree on state.
 #[tauri::command]
-pub fn agent_workers(
+pub async fn agent_workers(
     state: tauri::State<'_, AgentServerState>,
 ) -> AppResult<Vec<crate::agent::pool::WorkerStatus>> {
     let g = state.allocator.lock().expect("state poisoned");
@@ -1230,7 +1257,7 @@ fn payload_char_count(payload_ref: &str) -> usize {
 // ============================================================================
 
 #[tauri::command]
-pub fn audit_codes() -> Vec<&'static str> {
+pub async fn audit_codes() -> Vec<&'static str> {
     // Stable public audit-code labels in display order.
     Code::all().iter().map(|c| c.label()).collect()
 }
@@ -1240,7 +1267,7 @@ pub fn audit_codes() -> Vec<&'static str> {
 // ============================================================================
 
 #[tauri::command]
-pub fn subtitle_list(
+pub async fn subtitle_list(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<Vec<crate::data::subtitle::SubtitleRow>> {
@@ -1251,7 +1278,7 @@ pub fn subtitle_list(
 }
 
 #[tauri::command]
-pub fn subtitle_set(
+pub async fn subtitle_set(
     pid: String,
     id: String,
     text: String,
@@ -1267,7 +1294,7 @@ pub fn subtitle_set(
 }
 
 #[tauri::command]
-pub fn subtitle_visibility(
+pub async fn subtitle_visibility(
     pid: String,
     id: String,
     hidden: bool,
@@ -1282,7 +1309,7 @@ pub fn subtitle_visibility(
 }
 
 #[tauri::command]
-pub fn subtitle_replace(
+pub async fn subtitle_replace(
     pid: String,
     query: String,
     replacement: String,
@@ -1299,7 +1326,7 @@ pub fn subtitle_replace(
 }
 
 #[tauri::command]
-pub fn speakers_list(
+pub async fn speakers_list(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<Vec<crate::data::speakers::SpeakerInfo>> {
@@ -1309,7 +1336,7 @@ pub fn speakers_list(
 }
 
 #[tauri::command]
-pub fn speaker_rename(
+pub async fn speaker_rename(
     pid: String,
     from: String,
     to: String,
@@ -1330,7 +1357,7 @@ pub fn speaker_rename(
 }
 
 #[tauri::command]
-pub fn speaker_merge(
+pub async fn speaker_merge(
     pid: String,
     from: String,
     into: String,
@@ -1359,7 +1386,7 @@ pub struct BrollOverview {
 }
 
 #[tauri::command]
-pub fn broll_list(pid: String, root: Option<PathBuf>) -> AppResult<BrollOverview> {
+pub async fn broll_list(pid: String, root: Option<PathBuf>) -> AppResult<BrollOverview> {
     let dir = resolve_project_root(root).join(&pid);
     Ok(BrollOverview {
         suggestions: crate::pipeline::broll::load_artifact(&dir)?,
@@ -1374,17 +1401,24 @@ pub async fn broll_preview(
     root: Option<PathBuf>,
 ) -> AppResult<Vec<String>> {
     let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
-    let placements = crate::data::broll::load(&dir)?;
+    let prepare_dir = dir.clone();
+    let (doc, cuts, placements, ass) = run_blocking("B-roll preview preparation", move || {
+        let doc = Doc::load(&prepare_dir)?;
+        let cuts: ClipCuts = std::fs::read_to_string(prepare_dir.join("cuts.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let placements = crate::data::broll::load(&prepare_dir)?;
+        let ass = prepare_dir.join("broll-preview.ass");
+        if !placements.is_empty() {
+            crate::export::write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
+        }
+        Ok((doc, cuts, placements, ass))
+    })
+    .await?;
     if placements.is_empty() {
         return Ok(Vec::new());
     }
-    let ass = dir.join("broll-preview.ass");
-    crate::export::write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
     let video = dir.join("broll-preview.mp4");
     crate::export::render_video_with_broll(&doc, &cuts.cuts, &ass, &video, &placements).await?;
     let timestamps = if at.is_empty() {
@@ -1413,23 +1447,35 @@ pub struct DiarizeResult {
 #[tauri::command]
 pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<DiarizeResult> {
     let dir = resolve_project_root(root).join(&pid);
-    let mut doc = Doc::load(&dir)?;
+    let load_dir = dir.clone();
+    let (mut doc, model) = run_blocking("diarization preparation", move || {
+        Ok((
+            Doc::load(&load_dir)?,
+            crate::data::modelconfig::load().diarize_model,
+        ))
+    })
+    .await?;
     let wav = dir.join("audio.wav");
-    if !wav.exists() {
+    if !tokio::fs::try_exists(&wav).await? {
         extract_audio_wav(&doc.media.path, &wav).await?;
     }
-    let model = crate::data::modelconfig::load().diarize_model;
     let out = crate::diarize::diarize_file_with_model(&wav, &model).await?;
-    let paragraphs_assigned = crate::diarize::assign_speakers(&mut doc, &out.segments);
-    doc.save(&dir)?;
+    let segments = out.segments;
+    let segment_count = segments.len();
+    let paragraphs_assigned = run_blocking("diarization save", move || {
+        let paragraphs_assigned = crate::diarize::assign_speakers(&mut doc, &segments);
+        doc.save(&dir)?;
+        Ok(paragraphs_assigned)
+    })
+    .await?;
     Ok(DiarizeResult {
-        segments: out.segments.len(),
+        segments: segment_count,
         paragraphs_assigned,
     })
 }
 
 #[tauri::command]
-pub fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<String> {
+pub async fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
     let mut doc = Doc::load(&dir)?;
     let rep = crate::pipeline::timing::repair(&mut doc);
@@ -1438,7 +1484,7 @@ pub fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<String> {
 }
 
 #[tauri::command]
-pub fn model_list() -> Vec<String> {
+pub async fn model_list() -> Vec<String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -1453,7 +1499,7 @@ pub fn model_list() -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(String, usize)>> {
+pub async fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(String, usize)>> {
     let dir = resolve_project_root(root).join(&pid).join("ai");
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1473,7 +1519,7 @@ pub fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(String, u
 #[tauri::command]
 pub async fn record_audio(pid: String, seconds: u32, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
-    std::fs::create_dir_all(&dir)?;
+    tokio::fs::create_dir_all(&dir).await?;
     let wav = dir.join("audio.wav");
     let st = tokio::process::Command::new("ffmpeg")
         .args([
@@ -1532,70 +1578,96 @@ fn recording_output(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
 }
 
 #[tauri::command]
-pub fn recording_start(
+pub async fn recording_start(
     pid: String,
     root: Option<PathBuf>,
     state: tauri::State<'_, RecordingState>,
 ) -> AppResult<RecordingStarted> {
     let wav = recording_output(&pid, root)?;
+    if state
+        .starting
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(AppError::Schema(
+            "another microphone recording is already in progress".into(),
+        ));
+    }
+    if state
+        .session
+        .lock()
+        .expect("recording state poisoned")
+        .is_some()
+    {
+        state.starting.store(false, Ordering::Release);
+        return Err(AppError::Schema(
+            "another microphone recording is already in progress".into(),
+        ));
+    }
+
+    let started = async {
+        if let Some(dir) = wav.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        if tokio::fs::try_exists(&wav).await? {
+            tokio::fs::remove_file(&wav).await?;
+        }
+
+        let mut command = tokio::process::Command::new("ffmpeg");
+        command
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "avfoundation",
+                "-i",
+                ":0",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&wav)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            AppError::Io(std::io::Error::other(format!(
+                "ffmpeg microphone recording: {error}"
+            )))
+        })?;
+
+        // Missing devices and denied microphone access normally make ffmpeg
+        // exit immediately. Yield to the runtime while checking startup so
+        // neither AppKit nor a Tokio worker thread is put to sleep.
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        if let Some(status) = child.try_wait()? {
+            let _ = tokio::fs::remove_file(&wav).await;
+            return Err(AppError::Schema(format!(
+                "ffmpeg microphone recording stopped before it started ({status})"
+            )));
+        }
+        Ok(RecordingSession {
+            pid: pid.clone(),
+            wav: wav.clone(),
+            child,
+        })
+    }
+    .await;
+    state.starting.store(false, Ordering::Release);
+    let session = started?;
     let mut slot = state.session.lock().expect("recording state poisoned");
     if slot.is_some() {
         return Err(AppError::Schema(
             "another microphone recording is already in progress".into(),
         ));
     }
-
-    if let Some(dir) = wav.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    if wav.exists() {
-        std::fs::remove_file(&wav)?;
-    }
-
-    let mut child = std::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "avfoundation",
-            "-i",
-            ":0",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-        ])
-        .arg(&wav)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            AppError::Io(std::io::Error::other(format!(
-                "ffmpeg microphone recording: {error}"
-            )))
-        })?;
-
-    // Missing devices and denied microphone access normally make ffmpeg exit
-    // immediately. Catch that here so the UI never displays a false recording
-    // state.
-    std::thread::sleep(Duration::from_millis(140));
-    if let Some(status) = child.try_wait()? {
-        let _ = std::fs::remove_file(&wav);
-        return Err(AppError::Schema(format!(
-            "ffmpeg microphone recording stopped before it started ({status})"
-        )));
-    }
-
-    *slot = Some(RecordingSession {
-        pid: pid.clone(),
-        wav: wav.clone(),
-        child,
-    });
+    *slot = Some(session);
     Ok(RecordingStarted {
         pid,
         path: wav.to_string_lossy().into_owned(),
@@ -1616,32 +1688,33 @@ fn take_recording(pid: &str, state: &RecordingState) -> AppResult<RecordingSessi
     Ok(slot.take().expect("recording session disappeared"))
 }
 
-fn stop_recording_session(
+async fn stop_recording_session(
     mut session: RecordingSession,
 ) -> AppResult<(PathBuf, std::process::ExitStatus)> {
     if let Some(mut stdin) = session.child.stdin.take() {
-        let _ = stdin.write_all(b"q\n");
-        let _ = stdin.flush();
+        let _ = stdin.write_all(b"q\n").await;
+        let _ = stdin.flush().await;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = session.child.try_wait()? {
-            break status;
+    let status = match tokio::time::timeout(Duration::from_secs(5), session.child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            session.child.kill().await?;
+            session.child.wait().await?
         }
-        if Instant::now() >= deadline {
-            session.child.kill()?;
-            break session.child.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(40));
     };
     Ok((session.wav, status))
 }
 
-fn finalize_recording(session: RecordingSession) -> AppResult<PathBuf> {
-    let (wav, status) = stop_recording_session(session)?;
-    if !status.success() || !wav.exists() || std::fs::metadata(&wav)?.len() <= 44 {
-        let _ = std::fs::remove_file(&wav);
+async fn finalize_recording(session: RecordingSession) -> AppResult<PathBuf> {
+    let (wav, status) = stop_recording_session(session).await?;
+    let usable = status.success()
+        && tokio::fs::metadata(&wav)
+            .await
+            .map(|metadata| metadata.len() > 44)
+            .unwrap_or(false);
+    if !usable {
+        let _ = tokio::fs::remove_file(&wav).await;
         return Err(AppError::Schema(
             "ffmpeg did not produce a usable microphone recording".into(),
         ));
@@ -1655,9 +1728,7 @@ pub async fn recording_stop(
     state: tauri::State<'_, RecordingState>,
 ) -> AppResult<RecordingStopped> {
     let session = take_recording(&pid, &state)?;
-    let wav = tokio::task::spawn_blocking(move || finalize_recording(session))
-        .await
-        .map_err(|error| AppError::Schema(format!("recording stop task failed: {error}")))??;
+    let wav = finalize_recording(session).await?;
     let info = probe(&wav).await?;
     Ok(RecordingStopped {
         pid,
@@ -1674,22 +1745,17 @@ pub async fn recording_cancel(
     let session = take_recording(&pid, &state)?;
     let dir = session.wav.parent().map(PathBuf::from);
     let wav = session.wav.clone();
-    tokio::task::spawn_blocking(move || {
-        let stopped = stop_recording_session(session);
-        let _ = std::fs::remove_file(&wav);
-        if let Some(dir) = dir {
-            let _ = std::fs::remove_dir(dir);
-        }
-        stopped.map(|_| ())
-    })
-    .await
-    .map_err(|error| AppError::Schema(format!("recording cancel task failed: {error}")))??;
+    stop_recording_session(session).await?;
+    let _ = tokio::fs::remove_file(&wav).await;
+    if let Some(dir) = dir {
+        let _ = tokio::fs::remove_dir(dir).await;
+    }
     Ok(true)
 }
 
 /// Run the environment health checks used by the CLI and diagnostics UI.
 #[tauri::command]
-pub fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
+pub async fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
     Ok(crate::doctor::checks())
 }
 
@@ -1697,23 +1763,28 @@ pub fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
 #[tauri::command]
 pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
-    let doc = Doc::load(&dir)?;
-    let cuts_path = dir.join("cuts.json");
-    let cuts: ClipCuts = if cuts_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
-    } else {
-        ClipCuts::new()
-    };
-    let ass = dir.join("export.ass");
-    crate::export::write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
+    let prepare_dir = dir.clone();
+    let (doc, cuts, ass, broll) = run_blocking("video export preparation", move || {
+        let doc = Doc::load(&prepare_dir)?;
+        let cuts_path = prepare_dir.join("cuts.json");
+        let cuts: ClipCuts = if cuts_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
+        } else {
+            ClipCuts::new()
+        };
+        let ass = prepare_dir.join("export.ass");
+        crate::export::write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
+        let broll = crate::data::broll::load(&prepare_dir)?;
+        Ok((doc, cuts, ass, broll))
+    })
+    .await?;
     let mp4 = dir.join("export.mp4");
-    let broll = crate::data::broll::load(&dir)?;
     crate::export::render_video_with_broll(&doc, &cuts.cuts, &ass, &mp4, &broll).await?;
     Ok(mp4.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
-pub fn export_fcp(pid: String, root: Option<PathBuf>) -> AppResult<String> {
+pub async fn export_fcp(pid: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
     let doc = Doc::load(&dir)?;
     let cuts_path = dir.join("cuts.json");
@@ -1729,7 +1800,7 @@ pub fn export_fcp(pid: String, root: Option<PathBuf>) -> AppResult<String> {
 }
 
 #[tauri::command]
-pub fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<Vec<String>> {
+pub async fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<Vec<String>> {
     let dir = resolve_project_root(root).join(&pid);
     let doc = Doc::load(&dir)?;
     let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
@@ -1753,7 +1824,7 @@ pub fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<Vec<Str
 }
 
 #[tauri::command]
-pub fn version_list(
+pub async fn version_list(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<crate::data::version::Lineage> {
@@ -1762,7 +1833,7 @@ pub fn version_list(
 }
 
 #[tauri::command]
-pub fn version_commit(
+pub async fn version_commit(
     pid: String,
     name: String,
     note: String,
@@ -1787,21 +1858,21 @@ pub fn version_commit(
 }
 
 #[tauri::command]
-pub fn version_restore(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
+pub async fn version_restore(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
     let dir = resolve_project_root(root).join(&pid);
     let mut lineage = crate::data::version::Lineage::load(&dir)?;
     crate::data::version::restore_snapshot(&dir, &mut lineage, &id)
 }
 
 #[tauri::command]
-pub fn branch_create(pid: String, name: String, root: Option<PathBuf>) -> AppResult<String> {
+pub async fn branch_create(pid: String, name: String, root: Option<PathBuf>) -> AppResult<String> {
     let dir = resolve_project_root(root).join(&pid);
     let mut lineage = crate::data::version::Lineage::load(&dir)?;
     crate::data::version::create_branch(&dir, &mut lineage, &name, "")
 }
 
 #[tauri::command]
-pub fn branch_switch(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
+pub async fn branch_switch(pid: String, id: String, root: Option<PathBuf>) -> AppResult<()> {
     let dir = resolve_project_root(root).join(&pid);
     let mut lineage = crate::data::version::Lineage::load(&dir)?;
     crate::data::version::switch_branch(&dir, &mut lineage, &id)
@@ -1810,7 +1881,12 @@ pub fn branch_switch(pid: String, id: String, root: Option<PathBuf>) -> AppResul
 // ---- line editing, style, and cloud configuration ----
 
 #[tauri::command]
-pub fn split_line(pid: String, id: String, at: usize, root: Option<PathBuf>) -> AppResult<bool> {
+pub async fn split_line(
+    pid: String,
+    id: String,
+    at: usize,
+    root: Option<PathBuf>,
+) -> AppResult<bool> {
     let dir = resolve_project_root(root).join(&pid);
     let mut doc = Doc::load(&dir)?;
     let ok = crate::data::edit::split_sentence(&mut doc, &id, at);
@@ -1821,7 +1897,7 @@ pub fn split_line(pid: String, id: String, at: usize, root: Option<PathBuf>) -> 
 }
 
 #[tauri::command]
-pub fn merge_lines(
+pub async fn merge_lines(
     pid: String,
     id1: String,
     id2: String,
@@ -1853,14 +1929,75 @@ mod recording_tests {
     }
 }
 
+#[cfg(test)]
+mod main_thread_safety_tests {
+    #[test]
+    fn tauri_commands_are_async_to_keep_the_appkit_thread_responsive() {
+        let source = include_str!("commands.rs");
+        let mut command_attribute_seen = false;
+        let mut synchronous_commands = Vec::new();
+
+        for line in source.lines().map(str::trim) {
+            if line == "#[tauri::command]" {
+                command_attribute_seen = true;
+                continue;
+            }
+            if !command_attribute_seen || line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if let Some(signature) = line.strip_prefix("pub fn ") {
+                synchronous_commands.push(
+                    signature
+                        .split(['(', '<'])
+                        .next()
+                        .unwrap_or(signature)
+                        .to_string(),
+                );
+            }
+            if line.starts_with("pub ") {
+                command_attribute_seen = false;
+            }
+        }
+
+        assert!(
+            synchronous_commands.is_empty(),
+            "Tauri commands run on the AppKit thread unless declared async; synchronous commands: {}",
+            synchronous_commands.join(", ")
+        );
+    }
+
+    #[test]
+    fn native_file_dialog_never_uses_a_blocking_api() {
+        let source = include_str!("commands.rs");
+        let forbidden_call = [".blocking_", "pick_file()"].concat();
+        assert!(
+            !source.contains(&forbidden_call),
+            "the native file dialog must use its callback API so AppKit can keep pumping events"
+        );
+    }
+
+    #[test]
+    fn ipc_commands_never_sleep_a_worker_thread() {
+        let source = include_str!("commands.rs");
+        let forbidden_call = ["std::thread::", "sleep"].concat();
+        assert!(
+            !source.contains(&forbidden_call),
+            "IPC work must use async timers instead of putting an executor thread to sleep"
+        );
+    }
+}
+
 #[tauri::command]
-pub fn style_get(pid: String, root: Option<PathBuf>) -> AppResult<crate::data::substyle::SubStyle> {
+pub async fn style_get(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::substyle::SubStyle> {
     let dir = resolve_project_root(root).join(&pid);
     Ok(crate::data::substyle::SubStyle::load_or_default(&dir))
 }
 
 #[tauri::command]
-pub fn style_set(
+pub async fn style_set(
     pid: String,
     style: crate::data::substyle::SubStyle,
     root: Option<PathBuf>,
@@ -1875,7 +2012,7 @@ pub fn style_set(
 }
 
 #[tauri::command]
-pub fn config_show() -> crate::data::modelconfig::ModelConfig {
+pub async fn config_show() -> crate::data::modelconfig::ModelConfig {
     crate::data::modelconfig::load()
 }
 
@@ -1888,9 +2025,9 @@ mod tests {
         assert!(!VERSION.is_empty());
     }
 
-    #[test]
-    fn greet_returns_ready() {
-        let g = greet();
+    #[tokio::test]
+    async fn greet_returns_ready() {
+        let g = greet().await;
         assert_eq!(g.msg, "lumen-cut ready");
         assert_eq!(g.version, VERSION);
     }
@@ -1925,8 +2062,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn project_metadata_update_is_trimmed_and_persisted() {
+    #[tokio::test]
+    async fn project_metadata_update_is_trimmed_and_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("p1");
         let created_at = chrono::Utc::now();
@@ -1959,6 +2096,7 @@ mod tests {
             Some(" en ".into()),
             Some(tmp.path().to_path_buf()),
         )
+        .await
         .unwrap();
         assert_eq!(updated.meta.title, "Interview final");
         assert_eq!(updated.meta.description, "Delivery notes");
@@ -1973,6 +2111,7 @@ mod tests {
             None,
             Some(tmp.path().to_path_buf()),
         )
+        .await
         .is_err());
     }
 
@@ -2096,8 +2235,8 @@ mod tests {
         assert_eq!(payload_char_count("/nonexistent/prompt.json"), 0);
     }
 
-    #[test]
-    fn task_status_exposes_polish_quality_artifact() {
+    #[tokio::test]
+    async fn task_status_exposes_polish_quality_artifact() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("p1");
         let artifact = crate::pipeline::polish::PolishQualityArtifact {
@@ -2119,7 +2258,9 @@ mod tests {
             .save(&project.join("ai/polish-quality.json"))
             .unwrap();
 
-        let status = task_status("p1".into(), Some(tmp.path().to_path_buf())).unwrap();
+        let status = task_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
         assert_eq!(
             status.polish_quality.as_ref().unwrap().status,
             crate::pipeline::polish::PolishQualityStatus::Warn
@@ -2128,8 +2269,8 @@ mod tests {
         assert!(json.get("polishQuality").is_some());
     }
 
-    #[test]
-    fn task_status_reports_each_kind_and_failure_count() {
+    #[tokio::test]
+    async fn task_status_reports_each_kind_and_failure_count() {
         let tmp = tempfile::tempdir().unwrap();
         let translate = tmp.path().join("p1/ai/translate");
         std::fs::create_dir_all(translate.join("pending")).unwrap();
@@ -2148,7 +2289,9 @@ mod tests {
         )
         .unwrap();
 
-        let status = task_status("p1".into(), Some(tmp.path().to_path_buf())).unwrap();
+        let status = task_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
         assert_eq!(status.kinds.len(), 1);
         assert_eq!(status.kinds[0].kind, "translate");
         assert_eq!(status.kinds[0].lang.as_deref(), Some("ja"));
