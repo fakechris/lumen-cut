@@ -51,6 +51,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      - name: Install native test dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
