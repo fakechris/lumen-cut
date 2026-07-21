@@ -300,8 +300,8 @@ export function PropertiesWorkspace({
 
         <p className="speaker-safety-note">
           {lang === "zh"
-            ? "分析只生成提案，不会改动项目。检查逐段证据后，再决定是否应用。"
-            : "Analysis creates a proposal without changing the project. Review turn evidence before applying it."}
+            ? "分析只生成提案，不会改动项目。长视频可能需要数分钟，任务在后台运行，期间仍可切换页面；检查逐段证据后再决定是否应用。"
+            : "Analysis creates a proposal without changing the project. Long media can take several minutes in the background; you can keep navigating, then review turn evidence before applying."}
         </p>
 
         {!diarizeReady && (

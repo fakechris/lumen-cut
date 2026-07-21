@@ -95,7 +95,7 @@ beforeEach(() => {
   invoke.mockImplementation(async (command) => {
     switch (command) {
       case "greet":
-        return { msg: "ready", version: "0.1.0" };
+        return { msg: "ready", version: "0.2.0" };
       case "project_list":
         return [{
           pid: "project-1",

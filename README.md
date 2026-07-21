@@ -6,26 +6,31 @@ It is built with Rust, Tauri 2, React, and TypeScript.
 
 ## Features
 
-- Import local audio/video or record a microphone in the desktop app.
+- Import local audio/video by picker or drag-and-drop, download a media URL,
+  or record a microphone in the desktop app.
 - Prepare, select, and verify local Qwen3-ASR and word-alignment models from Settings.
+- Track long transcription progress, cancel safely, and retry interrupted work.
 - Edit, split, merge, hide, search, and replace subtitle cues.
-- Identify, rename, and merge speakers in transcript properties.
+- Identify, preview, assign, rename, reidentify, and merge speakers with timed media evidence.
 - Translate, polish, repair punctuation, generate chapters, and suggest B-roll
   through an OpenAI-compatible or Anthropic API.
-- Review reversible speech-cleanup cuts on a media timeline.
-- Export SRT, VTT, ASS, Markdown, and rendered video from the desktop app.
+- Manage B-roll suggestions and local assets, then preview them against the edit.
+- Review and restore reversible speech-cleanup cuts on a seekable media timeline.
+- Save project versions and branches with recovery snapshots.
+- Run delivery checks and export SRT, VTT, ASS, Markdown, rendered video, or
+  an editable Final Cut Pro timeline from the desktop app.
 - Use the desktop app, `lumen-cut-cli`, or the local MCP/HTTP task interfaces.
 
-The CLI additionally exposes URL import, FCPXML, B-roll metadata, branches,
-versions, and automation interfaces. Those commands are not presented as
-desktop features until they have a discoverable, tested GUI workflow.
+The CLI additionally exposes automation-oriented audit, task, MCP, and HTTP
+interfaces. Desktop features have discoverable UI paths with progress and
+recovery states; lower-level automation remains available to advanced users.
 
 ## Requirements
 
 - macOS 14 or newer on Apple silicon
 - `ffmpeg` and `ffprobe` on `PATH`
 - [`uv`](https://docs.astral.sh/uv/) for the one-click local transcription setup
-- `yt-dlp` only when using URL imports from the CLI
+- `yt-dlp` when importing media URLs
 
 The app creates an isolated Python 3.12 runtime under `~/.lumen-cut/runtime`
 and downloads selected model files into the Hugging Face cache. Neither is
@@ -59,7 +64,7 @@ collects the distributable DMG, zipped app, CLI archive, and SHA-256 checksums
 in the top-level `build/` directory.
 
 GitHub Actions runs the same checks and packaging process for pushes and pull
-requests. Pushing a version tag such as `v0.1.0` creates a GitHub Release and
+requests. Pushing a version tag such as `v0.2.0` creates a GitHub Release and
 attaches every file from `build/`.
 
 ## Project layout
