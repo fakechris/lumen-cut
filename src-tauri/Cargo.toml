@@ -1,0 +1,49 @@
+[package]
+name = "lumen-cut"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Transcript-first desktop editor for spoken audio and video"
+repository = "https://github.com/fakechris/lumen-cut"
+
+[[bin]]
+name = "lumen-cut"
+path = "src/main.rs"
+
+[[bin]]
+name = "lumen-cut-cli"
+path = "src/bin/lumen-cut.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full", "process", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+axum = "0.7"
+tokio-stream = "0.1"
+eventsource-stream = "0.2"
+futures = "0.3"
+dashmap = "6"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,22 @@
+# Build artifacts
+node_modules/
+target/
+dist/
+__pycache__/
+*.py[cod]
+
+# Lockfiles (committed selectively; remove these if you want to track them)
+# Cargo.lock
+
+# Logs / OS
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Local environment
+.env
+.env.local
+
+# Tauri generated
+src-tauri/gen/

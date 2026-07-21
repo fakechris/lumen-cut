@@ -1,0 +1,120 @@
+//! yt-dlp wrapper for URL ingestion (YouTube, Vimeo, Loom, …).
+//!
+//! Prefer mp4/avc1 video with m4a audio and let ffmpeg mux them. The final
+//! artefact path is taken from
+//! `--print after_move:filepath` so merged outputs resolve correctly;
+//! the sidecar's exit code surfaces cleanly through `crate::proc::run`.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::{AppError, AppResult};
+use crate::proc;
+
+/// Format selector: mp4/avc1 video first, m4a audio,
+/// progressive mp4 next, then any mergeable pair.
+const FORMAT: &str =
+    "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
+
+/// Download a URL to the given output template (`%(ext)s` recommended).
+pub async fn download(url: &str, output_template: &Path) -> AppResult<PathBuf> {
+    if let Some(parent) = output_template.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tpl = output_template.display().to_string();
+    let out = proc::run(
+        "yt-dlp",
+        &[
+            "--no-playlist",
+            "--no-progress",
+            "--no-mtime",
+            "--no-part",
+            "--print",
+            "after_move:filepath",
+            "-f",
+            FORMAT,
+            "-o",
+            &tpl,
+            url,
+        ],
+    )
+    .await?;
+
+    parse_output_path(&out).ok_or_else(|| AppError::YtDlp("no output line".to_string()))
+}
+
+/// Resolve the downloaded file path from yt-dlp stdout.
+///
+/// Priority: the bare path printed by `--print after_move:filepath`
+/// (emitted after any merge/move, so it names the final artefact); then a
+/// `[Merger] Merging formats into "X"` line; then a `[download]
+/// Destination: X` line. Post-merge chatter such as `[download] Deleting
+/// original file …` is ignored.
+fn parse_output_path(stdout: &str) -> Option<PathBuf> {
+    let mut printed = None;
+    let mut merged = None;
+    let mut dest = None;
+    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(p) = line
+            .strip_prefix("[Merger] Merging formats into \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            merged = Some(PathBuf::from(p));
+        } else if let Some(p) = line.strip_prefix("[download] Destination: ") {
+            dest = Some(PathBuf::from(p));
+        } else if !line.starts_with('[') {
+            // Bare path line — output of `--print after_move:filepath`.
+            printed = Some(PathBuf::from(line));
+        }
+    }
+    printed.or(merged).or(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_print_after_move_over_merger_chatter() {
+        // Real yt-dlp output shape for a merged (bestvideo+bestaudio) run.
+        let out = "[download] Destination: /dl/source.f137.mp4\n\
+                   [download] 100% of   12.34MiB in 00:00:02\n\
+                   [download] Destination: /dl/source.f140.m4a\n\
+                   [download] 100% of    1.23MiB in 00:00:01\n\
+                   [Merger] Merging formats into \"/dl/source.mp4\"\n\
+                   [download] Deleting original file /dl/source.f137.mp4 (pass -k to keep)\n\
+                   [download] Deleting original file /dl/source.f140.m4a (pass -k to keep)\n\
+                   /dl/source.mp4\n";
+        assert_eq!(
+            parse_output_path(out),
+            Some(PathBuf::from("/dl/source.mp4"))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_merger_line_without_print() {
+        let out = "[download] Destination: /dl/source.f137.mp4\n\
+                   [download] Destination: /dl/source.f140.m4a\n\
+                   [Merger] Merging formats into \"/dl/source.mp4\"\n\
+                   [download] Deleting original file /dl/source.f137.mp4 (pass -k to keep)\n\
+                   [download] Deleting original file /dl/source.f140.m4a (pass -k to keep)\n";
+        assert_eq!(
+            parse_output_path(out),
+            Some(PathBuf::from("/dl/source.mp4"))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_destination_for_single_file() {
+        let out = "[download] Destination: /dl/source.mp4\n\
+                   [download] 100% of   13.57MiB in 00:00:03\n";
+        assert_eq!(
+            parse_output_path(out),
+            Some(PathBuf::from("/dl/source.mp4"))
+        );
+    }
+
+    #[test]
+    fn empty_output_yields_none() {
+        assert_eq!(parse_output_path("\n  \n"), None);
+    }
+}
