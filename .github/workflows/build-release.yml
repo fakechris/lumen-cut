@@ -63,7 +63,7 @@ jobs:
         run: pnpm release:local
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lumen-cut-macos-arm64-${{ github.sha }}
           path: build/*
@@ -79,7 +79,7 @@ jobs:
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lumen-cut-macos-arm64-${{ github.sha }}
           path: release-assets
