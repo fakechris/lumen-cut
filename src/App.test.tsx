@@ -9,6 +9,12 @@ const { invoke } = vi.hoisted(() => ({
 let projectDoc: Record<string, unknown>;
 let asrReady: boolean;
 let versionCommitError: Error | null;
+let finishCheckItems: Array<{
+  code: string;
+  ordinal: number;
+  pass: boolean;
+  blockers: string[];
+}>;
 let brollOverview: {
   suggestions: Array<Record<string, unknown>>;
   accepted: Array<Record<string, unknown>>;
@@ -38,6 +44,7 @@ beforeEach(() => {
   localStorage.clear();
   asrReady = true;
   versionCommitError = null;
+  finishCheckItems = [{ code: "delivery-ready", ordinal: 1, pass: true, blockers: [] }];
   brollOverview = { suggestions: [], accepted: [], errors: [] };
   brollListError = null;
   speakerEvidenceState = { speakers: [], turns: [], identified: false, unlabelled: 0 };
@@ -114,6 +121,16 @@ beforeEach(() => {
         return 1;
       case "speaker_assign":
         return undefined;
+      case "finish_check_pid":
+        return finishCheckItems;
+      case "export_subtitles":
+        return ["/projects/project-1/export.srt"];
+      case "export_video":
+        return "/projects/project-1/export.mp4";
+      case "export_fcp":
+        return "/projects/project-1/export.fcpxml";
+      case "project_reveal":
+        return "/projects/project-1";
       case "style_get":
         return {
           name: "Default",
@@ -336,6 +353,66 @@ test("settings exposes the real local transcription status", async () => {
   expect(screen.getAllByText("模型已下载")).toHaveLength(3);
   expect(screen.getByText(/pyannote\.audio 3\.4\.0/)).toBeVisible();
   expect(screen.queryByRole("button", { name: /start server/i })).not.toBeInTheDocument();
+});
+
+test("export requires a delivery check and exposes Final Cut output", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Ready to export",
+        words: [{ id: "w1", text: "Ready", start: 0, end: 1 }],
+      }],
+    }],
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "导出" }));
+
+  expect(screen.getByRole("button", { name: /导出 Final Cut 工程/ })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "开始检查" }));
+  await waitFor(() => expect(screen.getByText("当前版本可以交付")).toBeVisible());
+
+  fireEvent.click(screen.getByRole("button", { name: /导出 Final Cut 工程/ }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("export_fcp", {
+    pid: "project-1",
+    root: null,
+  }));
+});
+
+test("a failed delivery check needs an explicit draft override", async () => {
+  finishCheckItems = [{
+    code: "timing",
+    ordinal: 1,
+    pass: false,
+    blockers: ["1 subtitle overlaps the next subtitle"],
+  }];
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Needs review",
+        words: [{ id: "w1", text: "Needs", start: 0, end: 1 }],
+      }],
+    }],
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "导出" }));
+  fireEvent.click(screen.getByRole("button", { name: "开始检查" }));
+
+  expect(await screen.findByText("存在阻止正式交付的问题")).toBeVisible();
+  expect(screen.getByText("1 subtitle overlaps the next subtitle")).toBeVisible();
+  expect(screen.getByRole("button", { name: /导出带字幕视频/ })).toBeDisabled();
+
+  fireEvent.click(screen.getByRole("checkbox", { name: /仍要导出草稿/ }));
+  expect(screen.getByRole("button", { name: /导出带字幕视频/ })).toBeEnabled();
 });
 
 test("project library can search transcript content, star, and repair a project", async () => {

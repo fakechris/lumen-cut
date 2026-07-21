@@ -399,6 +399,10 @@ export async function exportVideo(pid: string): Promise<string> {
   return invoke("export_video", { pid, root: null });
 }
 
+export async function exportFinalCut(pid: string): Promise<string> {
+  return invoke("export_fcp", { pid, root: null });
+}
+
 export async function versionMerge(
   base: Record<string, string>,
   ours: Record<string, string>,

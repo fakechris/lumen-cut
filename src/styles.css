@@ -2704,19 +2704,95 @@ input::placeholder {
 .export-layout {
   align-items: start;
   display: grid;
-  gap: 48px;
+  gap: 22px 48px;
   grid-template-columns: minmax(220px, 0.7fr) minmax(360px, 1.3fr);
   margin-top: 42px;
 }
 
-.export-layout > div:first-child > p:not(.eyebrow) {
+.export-intro > p:not(.eyebrow) {
   color: var(--text-secondary);
   line-height: 1.6;
+}
+
+.export-preflight {
+  border: 1px solid var(--border);
+  padding: 18px;
+}
+
+.export-preflight.ready {
+  border-color: color-mix(in srgb, var(--success) 46%, var(--border));
+}
+
+.export-preflight.blocked {
+  border-color: color-mix(in srgb, var(--danger) 46%, var(--border));
+}
+
+.export-preflight > header {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.export-preflight h3 {
+  font-size: 15px;
+  margin: 4px 0 0;
+}
+
+.export-preflight ul {
+  border-top: 1px solid var(--border);
+  list-style: none;
+  margin: 16px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 0 0;
+}
+
+.export-preflight li {
+  align-items: start;
+  display: flex;
+  gap: 9px;
+  padding: 8px 0;
+}
+
+.export-preflight li > svg {
+  color: var(--danger);
+  flex: 0 0 auto;
+  height: 15px;
+  margin-top: 1px;
+  width: 15px;
+}
+
+.export-preflight li strong,
+.export-preflight li small {
+  display: block;
+}
+
+.export-preflight li small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  margin-top: 3px;
+}
+
+.draft-export-override {
+  align-items: start;
+  border-top: 1px solid var(--border);
+  display: flex;
+  font-size: 10px;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.draft-export-override input {
+  margin-top: 1px;
 }
 
 .export-actions {
   border-bottom: 1px solid var(--border);
   border-top: 1px solid var(--border);
+  grid-column: 2;
+  grid-row: 1 / span 2;
 }
 
 .export-action {
@@ -2741,6 +2817,12 @@ input::placeholder {
   background: var(--surface-hover);
 }
 
+.export-action:disabled {
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: not-allowed;
+}
+
 .export-action > svg {
   color: var(--accent);
 }
@@ -2748,6 +2830,20 @@ input::placeholder {
 .export-action strong,
 .export-action small {
   display: block;
+}
+
+.export-footer {
+  align-items: center;
+  display: flex;
+  gap: 18px;
+  grid-column: 2;
+  justify-content: space-between;
+}
+
+.export-footer > small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  line-height: 1.5;
 }
 
 .export-action small {
@@ -3610,6 +3706,12 @@ pre.out {
   .settings-section,
   .export-layout {
     grid-template-columns: 1fr;
+  }
+
+  .export-actions,
+  .export-footer {
+    grid-column: 1;
+    grid-row: auto;
   }
 
   .transcript-layout {

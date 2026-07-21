@@ -15,11 +15,13 @@ import {
   cutList,
   cutRestore,
   exportSubtitles,
+  exportFinalCut,
   exportVideo,
   finishCheck,
   mergeSubtitles,
   pickBrollFile,
   projectUpdateMeta,
+  projectReveal,
   projectShow,
   speakerAssign,
   speakerEvidence,
@@ -138,7 +140,15 @@ const COPY = {
     restore: "恢复",
     exportSubtitles: "导出字幕",
     exportVideo: "导出带字幕视频",
-    exportHint: "文件会写入当前项目目录。",
+    exportFcp: "导出 Final Cut 工程",
+    exportHint: "先完成交付检查，再选择输出格式。文件会写入当前项目目录。",
+    exportCheckTitle: "交付检查",
+    exportUnchecked: "尚未检查当前版本",
+    exportReady: "当前版本可以交付",
+    exportBlocked: "存在阻止正式交付的问题",
+    draftOverride: "仍要导出草稿（我了解检查项不会自动修复）",
+    revealExports: "在 Finder 中打开项目目录",
+    videoExportHint: "视频渲染可能需要数分钟，会在后台运行，编辑窗口不会失去响应。",
     loading: "正在打开项目…",
     noProject: "先从“项目”选择一个媒体文件。",
     emptyTranscript: "还没有转写内容。",
@@ -188,7 +198,15 @@ const COPY = {
     restore: "Restore",
     exportSubtitles: "Export subtitles",
     exportVideo: "Export subtitled video",
-    exportHint: "Files are written to the current project folder.",
+    exportFcp: "Export Final Cut project",
+    exportHint: "Run the delivery check, then choose an output. Files are written to the current project folder.",
+    exportCheckTitle: "Delivery check",
+    exportUnchecked: "The current version has not been checked",
+    exportReady: "The current version is ready to deliver",
+    exportBlocked: "Issues are blocking a production delivery",
+    draftOverride: "Export a draft anyway (I understand checks are not fixed automatically)",
+    revealExports: "Open project folder in Finder",
+    videoExportHint: "Video rendering can take several minutes. It runs in the background and the editor remains responsive.",
     loading: "Opening project…",
     noProject: "Choose a media file from Projects first.",
     emptyTranscript: "There is no transcript yet.",
@@ -269,6 +287,7 @@ export function TranscriptView({
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [auditReport, setAuditReport] = useState<ReportSummary | null>(null);
   const [finishItems, setFinishItems] = useState<FinishCheckItem[] | null>(null);
+  const [allowDraftExport, setAllowDraftExport] = useState(false);
   const [taskState, setTaskState] = useState<TaskStatus | null>(null);
   const [cuts, setCuts] = useState<CutSummary[]>([]);
   const [subtitleRows, setSubtitleRows] = useState<SubtitleRow[]>([]);
@@ -294,6 +313,8 @@ export function TranscriptView({
   const previousPending = useRef(0);
 
   const reload = async (projectId: string, resetTab = true) => {
+    setFinishItems(null);
+    setAllowDraftExport(false);
     const [nextDoc, nextRows, nextStyle, nextEvidence, nextBroll] = await Promise.all([
       projectShow(projectId),
       subtitleList(projectId),
@@ -330,6 +351,7 @@ export function TranscriptView({
     setFeedback(null);
     setAuditReport(null);
     setFinishItems(null);
+    setAllowDraftExport(false);
     setTaskState(null);
     setOperation(null);
     setTranscriptionJob(null);
@@ -462,6 +484,9 @@ export function TranscriptView({
   }
 
   const hasTranscript = doc.paragraphs.length > 0;
+  const failedFinishItems = finishItems?.filter((item) => !item.pass) ?? [];
+  const exportReady = finishItems !== null && failedFinishItems.length === 0;
+  const exportAllowed = exportReady || allowDraftExport;
   const failedTasks = taskState?.kinds.reduce((sum, task) => sum + task.failed, 0) ?? 0;
   const wordsByCue: Record<string, string[]> = {};
   const nextCueById: Record<string, string> = {};
@@ -880,7 +905,9 @@ export function TranscriptView({
 
   const runFinishCheck = () =>
     perform("finish", async () => {
-      setFinishItems(await finishCheck(pid));
+      const items = await finishCheck(pid);
+      setFinishItems(items);
+      setAllowDraftExport(false);
     });
 
   const restoreCut = (cutId: string) =>
@@ -908,6 +935,20 @@ export function TranscriptView({
         tone: "success",
         text: lang === "zh" ? `视频已导出：${path}` : `Video exported: ${path}`,
       });
+    });
+
+  const runFinalCutExport = () =>
+    perform("export-fcp", async () => {
+      const path = await exportFinalCut(pid);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? `Final Cut 工程已导出：${path}` : `Final Cut project exported: ${path}`,
+      });
+    });
+
+  const revealExportFolder = () =>
+    perform("reveal-export", async () => {
+      await projectReveal(pid);
     });
 
   const tabs: Array<{ id: Tab; label: string; disabled?: boolean }> = [
@@ -1263,18 +1304,67 @@ export function TranscriptView({
 
       {activeTab === "export" && (
         <div className="export-layout">
-          <div>
+          <div className="export-intro">
             <p className="eyebrow">{c.export}</p>
             <h2>{lang === "zh" ? "交付你的作品" : "Deliver your work"}</h2>
             <p>{c.exportHint}</p>
           </div>
+          <section className={`export-preflight ${exportReady ? "ready" : failedFinishItems.length > 0 ? "blocked" : "unchecked"}`}>
+            <header>
+              <div>
+                <p className="eyebrow">{c.exportCheckTitle}</p>
+                <h3>
+                  {finishItems === null
+                    ? c.exportUnchecked
+                    : exportReady
+                      ? c.exportReady
+                      : c.exportBlocked}
+                </h3>
+              </div>
+              <button
+                className={finishItems === null ? "button-primary" : "button-quiet"}
+                disabled={operation !== null}
+                onClick={runFinishCheck}
+              >
+                {operation === "finish" ? <span className="spinner" /> : null}
+                {finishItems === null
+                  ? lang === "zh" ? "开始检查" : "Run check"
+                  : lang === "zh" ? "重新检查" : "Check again"}
+              </button>
+            </header>
+            {failedFinishItems.length > 0 && (
+              <ul>
+                {failedFinishItems.map((item) => (
+                  <li key={item.ordinal}>
+                    <AlertIcon />
+                    <span>
+                      <strong>{item.code}</strong>
+                      {item.blockers.map((blocker, index) => (
+                        <small key={`${item.ordinal}-${index}`}>{blocker}</small>
+                      ))}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {!exportReady && finishItems !== null && (
+              <label className="draft-export-override">
+                <input
+                  type="checkbox"
+                  checked={allowDraftExport}
+                  onChange={(event) => setAllowDraftExport(event.target.checked)}
+                />
+                <span>{c.draftOverride}</span>
+              </label>
+            )}
+          </section>
           <div className="export-actions">
             <button
               className="export-action"
-              disabled={operation !== null}
+              disabled={operation !== null || !exportAllowed}
               onClick={runSubtitleExport}
             >
-              <TranscriptIcon />
+              {operation === "export-subtitles" ? <span className="spinner" /> : <TranscriptIcon />}
               <span>
                 <strong>{c.exportSubtitles}</strong>
                 <small>SRT · VTT · ASS · Markdown</small>
@@ -1282,14 +1372,35 @@ export function TranscriptView({
             </button>
             <button
               className="export-action"
-              disabled={operation !== null}
+              disabled={operation !== null || !exportAllowed}
               onClick={runVideoExport}
             >
-              <PlayIcon />
+              {operation === "export-video" ? <span className="spinner" /> : <PlayIcon />}
               <span>
                 <strong>{c.exportVideo}</strong>
-                <small>MP4 · burn-in subtitles</small>
+                <small>MP4 · burn-in subtitles · B-roll</small>
               </span>
+            </button>
+            <button
+              className="export-action"
+              disabled={operation !== null || !exportAllowed}
+              onClick={runFinalCutExport}
+            >
+              {operation === "export-fcp" ? <span className="spinner" /> : <PlayIcon />}
+              <span>
+                <strong>{c.exportFcp}</strong>
+                <small>FCPXML · editable timeline · B-roll</small>
+              </span>
+            </button>
+          </div>
+          <div className="export-footer">
+            <small>{c.videoExportHint}</small>
+            <button
+              className="button-quiet"
+              disabled={operation !== null}
+              onClick={revealExportFolder}
+            >
+              {c.revealExports}
             </button>
           </div>
         </div>
