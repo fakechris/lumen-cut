@@ -1055,6 +1055,15 @@ input::placeholder {
   margin-top: 10px;
 }
 
+.setup-readiness {
+  align-items: center;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  margin: 18px 0 0;
+  max-width: 620px;
+  text-align: left;
+}
+
 .transcription-progress,
 .ingest-progress {
   border-top: 1px solid var(--border);
@@ -2536,6 +2545,59 @@ input::placeholder {
   width: 100%;
 }
 
+.settings-form select {
+  width: 100%;
+}
+
+.asr-health {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.asr-health > div {
+  align-items: center;
+  display: grid;
+  gap: 3px 9px;
+  grid-template-columns: 9px minmax(0, 1fr);
+  padding: 11px 12px;
+}
+
+.asr-health > div + div {
+  border-top: 1px solid var(--border);
+}
+
+.asr-health strong,
+.asr-health small {
+  grid-column: 2;
+  overflow-wrap: anywhere;
+}
+
+.asr-health strong {
+  font-size: 11px;
+}
+
+.asr-health small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.status-dot {
+  background: var(--danger);
+  border-radius: 50%;
+  grid-row: 1 / span 2;
+  height: 8px;
+  width: 8px;
+}
+
+.status-dot.ready {
+  background: var(--success);
+}
+
+.asr-actions {
+  flex-wrap: wrap;
+}
+
 .settings-split {
   display: grid;
   gap: 12px;
@@ -2592,6 +2654,45 @@ input::placeholder {
   border-top: 1px solid var(--border);
   margin-top: 16px;
   padding-top: 12px;
+}
+
+.diagnostic-list {
+  border: 1px solid var(--border);
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.diagnostic-list li {
+  align-items: baseline;
+  display: grid;
+  gap: 4px 8px;
+  grid-template-columns: 12px 110px minmax(0, 1fr);
+  padding: 8px 10px;
+}
+
+.diagnostic-list li + li {
+  border-top: 1px solid var(--border);
+}
+
+.diagnostic-list li > span,
+.diagnostic-list li.passed > strong {
+  color: var(--success);
+}
+
+.diagnostic-list li.failed > span,
+.diagnostic-list li.failed > strong {
+  color: var(--danger);
+}
+
+.diagnostic-list strong {
+  font-size: 10px;
+}
+
+.diagnostic-list small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  overflow-wrap: anywhere;
 }
 
 .card,

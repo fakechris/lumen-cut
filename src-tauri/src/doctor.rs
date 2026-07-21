@@ -4,6 +4,27 @@ use std::process::{Command, Stdio};
 
 use serde::Serialize;
 
+/// Finder-launched macOS apps receive `/usr/bin:/bin:…`, not the interactive
+/// shell PATH. Add the standard user and Homebrew locations once at startup.
+pub fn configure_process_path() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let mut paths = vec![
+        home.join(".lumen-cut/runtime/bin"),
+        home.join(".local/bin"),
+        std::path::PathBuf::from("/opt/homebrew/bin"),
+        std::path::PathBuf::from("/usr/local/bin"),
+    ];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    paths.dedup();
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
     pub name: String,
@@ -64,6 +85,15 @@ pub fn checks() -> Vec<Check> {
             .map(|command| format!("available via `{command}`"))
             .unwrap_or_else(|| "unavailable or failed its probe".into()),
     });
+    let asr = crate::asr::runtime_status();
+    output.push(Check {
+        name: "ASR runtime".into(),
+        ok: asr.runtime_ready,
+        detail: match asr.python_path {
+            Some(path) => format!("{} via {path}", asr.runtime_detail),
+            None => asr.runtime_detail,
+        },
+    });
     let token = std::env::var_os("HF_TOKEN").or_else(|| std::env::var_os("HUGGING_FACE_HUB_TOKEN"));
     output.push(Check {
         name: "HF_TOKEN".into(),
@@ -82,8 +112,6 @@ pub fn checks() -> Vec<Check> {
         ("Qwen3-ASR", config.asr_model.as_str()),
         ("ForcedAligner", config.asr_aligner.as_str()),
         ("pyannote", config.diarize_model.as_str()),
-        ("sortformer", "nvidia/diar_streaming_sortformer_4spk-v2.1"),
-        ("wespeaker", "pyannote/wespeaker-voxceleb-resnet34-LM"),
     ] {
         let ok = crate::data::modelconfig::model_cached(&home, model);
         output.push(Check {
@@ -115,7 +143,7 @@ mod tests {
     #[test]
     fn check_set_covers_tools_token_and_all_model_families() {
         let names: Vec<String> = checks().into_iter().map(|check| check.name).collect();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 10);
         for expected in [
             "ffmpeg",
             "ffprobe",
@@ -123,11 +151,10 @@ mod tests {
             "python3",
             "hf",
             "HF_TOKEN",
+            "ASR runtime",
             "Qwen3-ASR",
             "ForcedAligner",
             "pyannote",
-            "sortformer",
-            "wespeaker",
         ] {
             assert!(names.iter().any(|name| name == expected));
         }

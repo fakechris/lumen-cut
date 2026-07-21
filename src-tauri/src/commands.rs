@@ -923,15 +923,35 @@ pub async fn cut_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<CutSu
 }
 
 /// Settings as sent by the frontend over IPC (snake_case) and persisted
-/// to `~/.lumen-cut/settings.json` in camelCase — the worker script matches
-/// on `llmEndpoint`/`llmApiKey`/`llmModel`/`workerCount`.
+/// to `~/.lumen-cut/settings.json` in camelCase.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+#[serde(
+    rename_all(serialize = "camelCase", deserialize = "snake_case"),
+    default
+)]
 pub struct SettingsPayload {
+    pub asr_model: String,
+    pub asr_aligner: String,
+    pub diarize_model: String,
     pub llm_endpoint: String,
     pub llm_api_key: String,
     pub llm_model: String,
     pub worker_count: u32,
+}
+
+impl Default for SettingsPayload {
+    fn default() -> Self {
+        let config = crate::data::modelconfig::ModelConfig::default();
+        Self {
+            asr_model: config.asr_model,
+            asr_aligner: config.asr_aligner,
+            diarize_model: config.diarize_model,
+            llm_endpoint: config.llm_endpoint,
+            llm_api_key: config.llm_api_key,
+            llm_model: config.llm_model,
+            worker_count: config.worker_count,
+        }
+    }
 }
 
 #[tauri::command]
@@ -1498,6 +1518,25 @@ pub async fn model_list() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Report whether local ASR can really run. This imports the Python package
+/// and validates complete model snapshots instead of checking directory names.
+#[tauri::command]
+pub async fn asr_status() -> AppResult<crate::asr::RuntimeStatus> {
+    run_blocking("ASR environment probe", || Ok(crate::asr::runtime_status())).await
+}
+
+/// Create an app-owned Python 3.12 environment and install the ASR runtime.
+#[tauri::command]
+pub async fn asr_runtime_install() -> AppResult<crate::asr::RuntimeStatus> {
+    crate::asr::install_runtime().await
+}
+
+/// Download the configured ASR and word-alignment model snapshots.
+#[tauri::command]
+pub async fn asr_models_download() -> AppResult<crate::asr::RuntimeStatus> {
+    crate::asr::download_models().await
+}
+
 #[tauri::command]
 pub async fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(String, usize)>> {
     let dir = resolve_project_root(root).join(&pid).join("ai");
@@ -1756,7 +1795,7 @@ pub async fn recording_cancel(
 /// Run the environment health checks used by the CLI and diagnostics UI.
 #[tauri::command]
 pub async fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
-    Ok(crate::doctor::checks())
+    run_blocking("environment health checks", || Ok(crate::doctor::checks())).await
 }
 
 /// Burn-in export: write export.ass then ffmpeg → export.mp4.
@@ -2121,6 +2160,7 @@ mod tests {
             llm_api_key: "sk-test".into(),
             llm_model: "gpt-4o-mini".into(),
             worker_count: 7,
+            ..SettingsPayload::default()
         }
     }
 
@@ -2128,7 +2168,15 @@ mod tests {
     fn settings_serializes_camel_case_keys() {
         let v = serde_json::to_value(settings()).unwrap();
         let obj = v.as_object().unwrap();
-        for k in ["llmEndpoint", "llmApiKey", "llmModel", "workerCount"] {
+        for k in [
+            "asrModel",
+            "asrAligner",
+            "diarizeModel",
+            "llmEndpoint",
+            "llmApiKey",
+            "llmModel",
+            "workerCount",
+        ] {
             assert!(obj.contains_key(k), "missing camelCase key {k}");
         }
         assert!(!obj.contains_key("llm_endpoint"));

@@ -3,8 +3,10 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AsrStatus,
   AutoResult,
   Doc,
+  DoctorCheck,
   FinishCheckItem,
   MergeSummary,
   ModelConfig,
@@ -217,6 +219,22 @@ export async function configShow(): Promise<ModelConfig> {
   return invoke("config_show");
 }
 
+export async function asrStatus(): Promise<AsrStatus> {
+  return invoke("asr_status");
+}
+
+export async function asrRuntimeInstall(): Promise<AsrStatus> {
+  return invoke("asr_runtime_install");
+}
+
+export async function asrModelsDownload(): Promise<AsrStatus> {
+  return invoke("asr_models_download");
+}
+
+export async function runDoctor(): Promise<DoctorCheck[]> {
+  return invoke("run_doctor");
+}
+
 export async function speakersList(pid: string): Promise<SpeakerInfo[]> {
   return invoke("speakers_list", { pid, root: null });
 }
@@ -296,6 +314,9 @@ export async function agentWorkers(): Promise<unknown[]> {
 export async function settingsExport(s: Settings): Promise<string> {
   return invoke("settings_export", {
     settings: {
+      asr_model: s.asrModel,
+      asr_aligner: s.asrAligner,
+      diarize_model: s.diarizeModel,
       llm_endpoint: s.llmEndpoint,
       llm_api_key: s.llmApiKey,
       llm_model: s.llmModel,
@@ -324,6 +345,9 @@ export function saveSettings(s: Settings) {
 
 function defaultSettings(): Settings {
   return {
+    asrModel: "Qwen/Qwen3-ASR-0.6B",
+    asrAligner: "Qwen/Qwen3-ForcedAligner-0.6B",
+    diarizeModel: "pyannote/speaker-diarization-3.1",
     llmEndpoint: "",
     llmApiKey: "",
     llmModel: "",

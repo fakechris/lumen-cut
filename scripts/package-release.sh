@@ -50,7 +50,7 @@ tar -C "$RELEASE_DIR" -czf \
 
 (
   cd "$OUTPUT_DIR"
-  shasum -a 256 lumen-cut_* > SHA256SUMS.txt
+  shasum -a 256 lumen-cut_* lumen-cut-cli_* > SHA256SUMS.txt
 )
 
 echo "Release artifacts: $OUTPUT_DIR"

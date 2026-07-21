@@ -6,26 +6,31 @@ It is built with Rust, Tauri 2, React, and TypeScript.
 
 ## Features
 
-- Import local audio/video, download supported media URLs, or record a microphone.
-- Transcribe locally with Qwen3-ASR and optional word-level alignment.
+- Import local audio/video or record a microphone in the desktop app.
+- Prepare, select, and verify local Qwen3-ASR and word-alignment models from Settings.
 - Edit, split, merge, hide, search, and replace subtitle cues.
-- Identify, rename, and merge speakers.
+- Identify, rename, and merge speakers in transcript properties.
 - Translate, polish, repair punctuation, generate chapters, and suggest B-roll
   through an OpenAI-compatible or Anthropic API.
 - Review reversible speech-cleanup cuts on a media timeline.
-- Export SRT, VTT, ASS, Markdown, rendered video, and FCPXML.
+- Export SRT, VTT, ASS, Markdown, and rendered video from the desktop app.
 - Use the desktop app, `lumen-cut-cli`, or the local MCP/HTTP task interfaces.
+
+The CLI additionally exposes URL import, FCPXML, B-roll metadata, branches,
+versions, and automation interfaces. Those commands are not presented as
+desktop features until they have a discoverable, tested GUI workflow.
 
 ## Requirements
 
 - macOS 14 or newer on Apple silicon
-- Node.js 20 or newer
-- Rust stable
 - `ffmpeg` and `ffprobe` on `PATH`
-- Python 3.10 or newer for the local ASR and diarization sidecars
-- `yt-dlp` for URL imports
+- [`uv`](https://docs.astral.sh/uv/) for the one-click local transcription setup
+- `yt-dlp` only when using URL imports from the CLI
 
-Model files are downloaded separately and are not stored in this repository.
+The app creates an isolated Python 3.12 runtime under `~/.lumen-cut/runtime`
+and downloads selected model files into the Hugging Face cache. Neither is
+stored in this repository. Node.js 20+ and Rust stable are development-only
+requirements.
 
 ## Development
 

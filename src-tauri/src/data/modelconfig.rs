@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 /// Conservative defaults for Apple-silicon ASR and portable diarization.
 fn defaults() -> ModelConfig {
     ModelConfig {
-        asr_model: "mlx-community/Qwen3-ASR-0.6B-8bit".into(),
-        asr_aligner: "mlx-community/Qwen3-ForcedAligner-0.6B-8bit".into(),
+        // These ids are the native mlx-qwen3-asr runtime's supported defaults.
+        // Older mlx-audio conversions use a different weight layout and must not
+        // be reported as ready merely because they share the Qwen3-ASR name.
+        asr_model: "Qwen/Qwen3-ASR-0.6B".into(),
+        asr_aligner: "Qwen/Qwen3-ForcedAligner-0.6B".into(),
         diarize_model: "pyannote/speaker-diarization-3.1".into(),
         llm_endpoint: String::new(),
         llm_api_key: String::new(),
@@ -48,13 +51,23 @@ pub fn load() -> ModelConfig {
         {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(s) = v.get("asrModel").and_then(|x| x.as_str()) {
-                    cfg.asr_model = s.into();
+                    cfg.asr_model = match s {
+                        "mlx-community/Qwen3-ASR-0.6B-8bit" => "Qwen/Qwen3-ASR-0.6B".into(),
+                        "mlx-community/Qwen3-ASR-1.7B-8bit" => "Qwen/Qwen3-ASR-1.7B".into(),
+                        _ => s.into(),
+                    };
                 }
                 if let Some(s) = v.get("diarizeModel").and_then(|x| x.as_str()) {
                     cfg.diarize_model = s.into();
                 }
                 if let Some(s) = v.get("asrAligner").and_then(|x| x.as_str()) {
-                    cfg.asr_aligner = s.into();
+                    cfg.asr_aligner = match s {
+                        "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+                        | "mlx-community/Qwen3-ForcedAligner-0.6B-4bit" => {
+                            "Qwen/Qwen3-ForcedAligner-0.6B".into()
+                        }
+                        _ => s.into(),
+                    };
                 }
                 if let Some(s) = v.get("llmEndpoint").and_then(|x| x.as_str()) {
                     cfg.llm_endpoint = s.into();
@@ -89,7 +102,49 @@ pub fn cache_path(home: &std::path::Path, model_id: &str) -> std::path::PathBuf 
 }
 
 pub fn model_cached(home: &std::path::Path, model_id: &str) -> bool {
-    cache_path(home, model_id).is_dir()
+    let snapshots = cache_path(home, model_id).join("snapshots");
+    let Ok(revisions) = std::fs::read_dir(snapshots) else {
+        return false;
+    };
+
+    // Hugging Face creates the repository directory and refs before the large
+    // files have finished downloading. Require a usable snapshot with config
+    // plus at least one materialized weight file so an interrupted download is
+    // not shown as "cached" in the UI or doctor output.
+    revisions.filter_map(Result::ok).any(|revision| {
+        let snapshot = revision.path();
+        let json_config = snapshot.join("config.json").is_file();
+        let pipeline_config = snapshot
+            .join("config.yaml")
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false);
+        if !json_config && !pipeline_config {
+            return false;
+        }
+        let has_weights = walkdir::WalkDir::new(snapshot)
+            .max_depth(2)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                let is_weight = name.ends_with(".safetensors")
+                    || name.ends_with(".npz")
+                    || name.ends_with(".bin")
+                    || name.ends_with(".ckpt")
+                    || name.ends_with(".pt")
+                    || name.ends_with(".pth")
+                    || name.ends_with(".onnx");
+                is_weight
+                    && entry
+                        .metadata()
+                        .map(|metadata| metadata.len() > 1_000_000)
+                        .unwrap_or(false)
+            });
+        has_weights || pipeline_config
+    })
 }
 
 #[cfg(test)]
@@ -99,7 +154,8 @@ mod tests {
     #[test]
     fn defaults_name_supported_model_families() {
         let c = ModelConfig::default();
-        assert!(c.asr_model.contains("Qwen3-ASR"));
+        assert_eq!(c.asr_model, "Qwen/Qwen3-ASR-0.6B");
+        assert_eq!(c.asr_aligner, "Qwen/Qwen3-ForcedAligner-0.6B");
         assert_eq!(c.diarize_model, "pyannote/speaker-diarization-3.1");
         assert_eq!(c.worker_count, 4);
     }
@@ -140,5 +196,42 @@ mod tests {
             cache_path(std::path::Path::new("/home/me"), "org/model"),
             std::path::Path::new("/home/me/.cache/huggingface/hub/models--org--model")
         );
+    }
+
+    #[test]
+    fn incomplete_huggingface_directory_is_not_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = cache_path(home.path(), "org/model");
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "revision").unwrap();
+        assert!(!model_cached(home.path(), "org/model"));
+    }
+
+    #[test]
+    fn complete_snapshot_requires_config_and_materialized_weights() {
+        let home = tempfile::tempdir().unwrap();
+        let snapshot = cache_path(home.path(), "org/model")
+            .join("snapshots")
+            .join("revision");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("config.json"), "{}").unwrap();
+        std::fs::write(snapshot.join("model.safetensors"), vec![0; 1_000_001]).unwrap();
+        assert!(model_cached(home.path(), "org/model"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_snapshot_accepts_huggingface_weight_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = cache_path(home.path(), "org/model");
+        let snapshot = repo.join("snapshots/revision");
+        let blobs = repo.join("blobs");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(snapshot.join("config.json"), "{}").unwrap();
+        std::fs::write(blobs.join("weights"), vec![0; 1_000_001]).unwrap();
+        std::os::unix::fs::symlink("../../blobs/weights", snapshot.join("model.safetensors"))
+            .unwrap();
+        assert!(model_cached(home.path(), "org/model"));
     }
 }

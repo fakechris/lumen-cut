@@ -25,6 +25,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Tauri runtime entry point.
 pub fn run() {
+    // Apps launched from Finder inherit a minimal PATH that omits Homebrew and
+    // user tools. Normalize it before any ffmpeg/Python health check or job.
+    doctor::configure_process_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -70,6 +73,9 @@ pub fn run() {
             commands::diarize_pid,
             commands::timing_repair,
             commands::model_list,
+            commands::asr_status,
+            commands::asr_runtime_install,
+            commands::asr_models_download,
             commands::logs_list,
             commands::record_audio,
             commands::recording_start,

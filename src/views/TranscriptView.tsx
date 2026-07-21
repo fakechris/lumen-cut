@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   audit,
+  asrStatus,
   configShow,
   cutAuto,
   cutList,
@@ -38,6 +39,7 @@ import {
 import type { Lang } from "../i18n";
 import type {
   Doc,
+  AsrStatus,
   FinishCheckItem,
   SubtitleRow,
   SubtitleStyle,
@@ -117,6 +119,8 @@ const COPY = {
     pending: "待处理",
     done: "已完成",
     retry: "重试",
+    asrNotReady: "本地转写尚未准备好。请先安装转写引擎并下载模型。",
+    openAsrSettings: "前往设置",
   },
   en: {
     setup: "Setup",
@@ -163,6 +167,8 @@ const COPY = {
     pending: "pending",
     done: "done",
     retry: "Try again",
+    asrNotReady: "Local transcription is not ready. Install the runtime and download the models first.",
+    openAsrSettings: "Open Settings",
   },
 } as const;
 
@@ -237,6 +243,7 @@ export function TranscriptView({
   const [transcriptionJob, setTranscriptionJob] =
     useState<TranscriptionJobStatus | null>(null);
   const [agentConfigured, setAgentConfigured] = useState(false);
+  const [asrReadiness, setAsrReadiness] = useState<AsrStatus | null>(null);
   const previousPending = useRef(0);
 
   const reload = async (projectId: string, resetTab = true) => {
@@ -277,6 +284,7 @@ export function TranscriptView({
           Boolean(config.llmEndpoint.trim() && config.llmModel.trim()),
         ),
       ),
+      asrStatus().then(setAsrReadiness),
       transcriptionStatus(pid)
         .then((status) => {
           if (status.state === "running" || status.state === "cancelling") {
@@ -418,6 +426,13 @@ export function TranscriptView({
     setOperation("transcribe");
     setFeedback(null);
     try {
+      const readiness = await asrStatus();
+      setAsrReadiness(readiness);
+      if (!readiness.ready) {
+        setFeedback({ tone: "error", text: c.asrNotReady });
+        setOperation(null);
+        return;
+      }
       setTranscriptionJob(await transcriptionStart(
         doc.media.path,
         doc.meta.language ?? null,
@@ -772,6 +787,15 @@ export function TranscriptView({
             <p className="eyebrow">{c.imported}</p>
             <h2>{hasTranscript ? c.transcript : c.startTitle}</h2>
             <p>{hasTranscript ? c.transcribeHint : c.startDescription}</p>
+            {asrReadiness && !asrReadiness.ready && (
+              <div className="notice error-notice setup-readiness" role="alert">
+                <AlertIcon />
+                <span>{c.asrNotReady}</span>
+                <button className="button-quiet" onClick={onOpenSettings}>
+                  {c.openAsrSettings}
+                </button>
+              </div>
+            )}
             <button
               className="button-primary button-large"
               disabled={operation !== null}

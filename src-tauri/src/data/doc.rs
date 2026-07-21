@@ -425,4 +425,15 @@ mod tests {
         assert_eq!(saved["cues"][0]["text"], "edited");
         assert_eq!(saved["cues"][0]["hidden"], true);
     }
+
+    #[test]
+    fn frontend_project_fixture_matches_the_rust_ipc_contract() {
+        let fixture = include_str!("../../../src/test/fixtures/project.json");
+        let doc: Doc = serde_json::from_str(fixture).unwrap();
+        let serialized = serde_json::to_value(doc).unwrap();
+        assert_eq!(serialized["media"]["durationSeconds"], 2212.792018);
+        assert_eq!(serialized["media"]["sampleRate"], 44100);
+        assert_eq!(serialized["meta"]["createdAt"], "2026-07-21T10:08:00Z");
+        assert!(serialized["media"].get("duration_seconds").is_none());
+    }
 }

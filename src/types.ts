@@ -174,6 +174,23 @@ export interface ModelConfig {
   workerCount: number;
 }
 
+export interface AsrStatus {
+  pythonPath: string | null;
+  runtimeReady: boolean;
+  runtimeDetail: string;
+  modelId: string;
+  modelCached: boolean;
+  alignerId: string;
+  alignerCached: boolean;
+  ready: boolean;
+}
+
+export interface DoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
 export interface FinishCheckItem {
   code: string;
   ordinal: number;
@@ -207,6 +224,9 @@ export interface MergeSummary {
 }
 
 export interface Settings {
+  asrModel: string;
+  asrAligner: string;
+  diarizeModel: string;
   llmEndpoint: string;
   llmApiKey: string;
   llmModel: string;

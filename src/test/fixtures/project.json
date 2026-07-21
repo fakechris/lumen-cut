@@ -1,0 +1,19 @@
+{
+  "id": "project-1",
+  "schema": 1,
+  "media": {
+    "path": "/Users/example/Interview.mp4",
+    "durationSeconds": 2212.792018,
+    "sampleRate": 44100,
+    "channels": 2
+  },
+  "meta": {
+    "title": "Interview",
+    "description": "",
+    "language": null,
+    "createdAt": "2026-07-21T10:08:00Z",
+    "updatedAt": "2026-07-21T10:08:00Z"
+  },
+  "paragraphs": [],
+  "translations": {}
+}

@@ -6,23 +6,28 @@ import {
   agentServe,
   agentWorkers,
   auditCodes,
+  runDoctor,
   taskStatus,
   versionMerge,
 } from "../api";
-import type { MergeSummary } from "../types";
+import type { DoctorCheck, MergeSummary } from "../types";
+import type { Lang } from "../i18n";
 
 export function PipelineView({
   pid,
   embedded = false,
+  lang = "en",
 }: {
   pid: string | null;
   embedded?: boolean;
+  lang?: Lang;
 }) {
   const [port, setPort] = useState<number | null>(null);
   const [workers, setWorkers] = useState<unknown[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [checks, setChecks] = useState<DoctorCheck[] | null>(null);
 
   const startServer = async () => {
     setBusy(true);
@@ -93,6 +98,57 @@ export function PipelineView({
       setBusy(false);
     }
   };
+
+  const checkEnvironment = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      setChecks(await runDoctor());
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (embedded) {
+    const copy = lang === "zh"
+      ? {
+          title: "环境检查",
+          description: "Pipeline 和后台任务会在需要时自动启动，不需要手动启动服务器。",
+          checking: "正在检查…",
+          action: "运行环境检查",
+        }
+      : {
+          title: "Environment check",
+          description: "Pipeline and background tasks start automatically when needed. You do not need to start a server.",
+          checking: "Checking…",
+          action: "Run environment check",
+        };
+    return (
+      <section className="view pipeline-view embedded">
+        <div className="card diagnostics-card">
+          <h3>{copy.title}</h3>
+          <p className="muted">{copy.description}</p>
+          <button disabled={busy} onClick={checkEnvironment}>
+            {busy ? copy.checking : copy.action}
+          </button>
+          {checks && (
+            <ul className="diagnostic-list">
+              {checks.map((check) => (
+                <li key={check.name} className={check.ok ? "passed" : "failed"}>
+                  <span>{check.ok ? "✓" : "×"}</span>
+                  <strong>{check.name}</strong>
+                  <small>{check.detail}</small>
+                </li>
+              ))}
+            </ul>
+          )}
+          {err && <pre className="out error">{err}</pre>}
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className={`view pipeline-view${embedded ? " embedded" : ""}`}>

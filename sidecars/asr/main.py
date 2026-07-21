@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import Any
 
-# Default model id — resolves from the local HF cache
-# (mlx-community/Qwen3-ASR-0.6B-8bit or Qwen/Qwen3-ASR-0.6B).
-DEFAULT_MODEL = "mlx-community/Qwen3-ASR-0.6B-8bit"
-DEFAULT_ALIGNER = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+# Defaults supported by the pinned mlx-qwen3-asr runtime.
+DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
+DEFAULT_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +43,10 @@ def load_audio_duration(path: str) -> float:
 def words_for_segment(text: str, start: float, end: float) -> list[dict[str, Any]]:
     """Pseudo word-level timing: evenly space non-whitespace atoms across
     the segment window. Adequate when no forced aligner is configured."""
-    atoms = [c for c in text if not c.isspace()] or [text]
+    atoms = re.findall(r"\S+", text)
+    if len(atoms) == 1 and re.search(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+        atoms = [c for c in text if not c.isspace()]
+    atoms = atoms or [text]
     n = len(atoms)
     span = max(end - start, 0.0) / max(n, 1)
     return [
@@ -52,11 +55,43 @@ def words_for_segment(text: str, start: float, end: float) -> list[dict[str, Any
     ]
 
 
+def join_tokens(tokens: list[str]) -> str:
+    """Join English words with spaces while keeping CJK and punctuation tight."""
+    out = ""
+    cjk = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+    tight_left = set(",.!?;:%)]}，。！？；：、）】》")
+    tight_right = set("([{（【《")
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        needs_space = bool(out)
+        if out and (cjk.search(out[-1]) or cjk.search(token[0])):
+            needs_space = False
+        if token[0] in tight_left or (out and out[-1] in tight_right):
+            needs_space = False
+        out += (" " if needs_space else "") + token
+    return out
+
+
 def build_paragraphs(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group segments into one paragraph (lumen-cut's downstream pipeline
-    re-segments via the `segment` contract). Each sentence keeps its
-    words for word-level transcript rendering + cleanup/audit."""
+    """Group word/alignment segments into subtitle-friendly sentences."""
     sentences: list[dict[str, Any]] = []
+    cue_tokens: list[str] = []
+    cue_words: list[dict[str, Any]] = []
+    cue_start: float | None = None
+    cue_end = 0.0
+
+    def flush() -> None:
+        nonlocal cue_tokens, cue_words, cue_start, cue_end
+        text = join_tokens(cue_tokens)
+        if text:
+            sentences.append({"text": text, "words": cue_words})
+        cue_tokens = []
+        cue_words = []
+        cue_start = None
+        cue_end = 0.0
+
     for seg in segments:
         text = (seg.get("text") or "").strip()
         if not text:
@@ -64,7 +99,21 @@ def build_paragraphs(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         s = float(seg.get("start", 0.0))
         e = float(seg.get("end", s))
         words = seg.get("words") or words_for_segment(text, s, e)
-        sentences.append({"text": text, "words": words})
+        proposed = join_tokens([*cue_tokens, text])
+        if cue_tokens and (
+            s - cue_end > 0.8
+            or (cue_start is not None and e - cue_start > 6.0)
+            or len(proposed) > 48
+        ):
+            flush()
+        if cue_start is None:
+            cue_start = s
+        cue_tokens.append(text)
+        cue_words.extend(words)
+        cue_end = e
+        if text[-1:] in ".!?。！？":
+            flush()
+    flush()
     if not sentences:
         return []
     return [{"speaker": None, "sentences": sentences}]
@@ -83,23 +132,16 @@ def main() -> int:
         )
         return 2
 
-    fa = None
-    if args.align:
-        try:
-            from mlx_qwen3_asr import ForcedAligner  # type: ignore
-            fa = ForcedAligner.from_pretrained(args.align)
-        except Exception as e:  # noqa: BLE001
-            sys.stderr.write(f"lumen_cut_asr: forced aligner unavailable ({e}); "
-                             "falling back to segment-level timing\n")
-            fa = None
-
     try:
         result = transcribe(
             args.audio,
             model=args.model,
             language=args.language,
             return_timestamps=True,
-            forced_aligner=fa,
+            # mlx-qwen3-asr resolves a model id or local path itself. Passing
+            # the id also keeps compatibility with runtime releases whose
+            # ForcedAligner class has no `from_pretrained` constructor.
+            forced_aligner=args.align,
         )
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"lumen_cut_asr: transcription failed: {e}\n")
