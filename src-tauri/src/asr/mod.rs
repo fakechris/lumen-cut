@@ -219,6 +219,7 @@ pub struct AsrWord {
 
 impl From<AsrOutV1> for Doc {
     fn from(asr: AsrOutV1) -> Self {
+        let mut word_index = 0usize;
         let paragraphs = asr
             .paragraphs
             .into_iter()
@@ -236,12 +237,15 @@ impl From<AsrOutV1> for Doc {
                         words: s
                             .words
                             .into_iter()
-                            .enumerate()
-                            .map(|(wi, w)| Word {
-                                id: format!("w{}", wi),
-                                text: w.text,
-                                start: w.start,
-                                end: w.end,
+                            .map(|w| {
+                                let id = format!("w{word_index}");
+                                word_index += 1;
+                                Word {
+                                    id,
+                                    text: w.text,
+                                    start: w.start,
+                                    end: w.end,
+                                }
                             })
                             .collect(),
                     })
@@ -402,6 +406,43 @@ mod tests {
         let doc: Doc = parsed.into();
         assert_eq!(doc.paragraphs.len(), 1);
         assert_eq!(doc.paragraphs[0].sentences[0].text, "你好");
+    }
+
+    #[test]
+    fn generated_word_ids_are_unique_across_sentences() {
+        let parsed = AsrOutV1 {
+            schema_version: 1,
+            language: Some("English".into()),
+            duration_seconds: 1.0,
+            paragraphs: vec![AsrParagraph {
+                speaker: None,
+                sentences: vec![
+                    AsrSentence {
+                        text: "one".into(),
+                        words: vec![AsrWord {
+                            text: "one".into(),
+                            start: 0.0,
+                            end: 0.4,
+                        }],
+                    },
+                    AsrSentence {
+                        text: "two".into(),
+                        words: vec![AsrWord {
+                            text: "two".into(),
+                            start: 0.4,
+                            end: 0.8,
+                        }],
+                    },
+                ],
+            }],
+        };
+        let doc: Doc = parsed.into();
+        let ids: Vec<&str> = doc
+            .all_words()
+            .into_iter()
+            .map(|word| word.id.as_str())
+            .collect();
+        assert_eq!(ids, ["w0", "w1"]);
     }
 
     #[test]

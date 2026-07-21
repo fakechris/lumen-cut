@@ -20,6 +20,8 @@ from typing import Any
 # Defaults supported by the pinned mlx-qwen3-asr runtime.
 DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
+MAX_CUE_CHARS_LATIN = 42
+MAX_CUE_CHARS_CJK = 22
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +76,14 @@ def join_tokens(tokens: list[str]) -> str:
     return out
 
 
-def build_paragraphs(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def max_cue_chars(language: str | None) -> int:
+    value = (language or "").lower()
+    return MAX_CUE_CHARS_CJK if value in {"chinese", "japanese", "korean", "zh", "ja", "ko"} else MAX_CUE_CHARS_LATIN
+
+
+def build_paragraphs(
+    segments: list[dict[str, Any]], language: str | None = None
+) -> list[dict[str, Any]]:
     """Group word/alignment segments into subtitle-friendly sentences."""
     sentences: list[dict[str, Any]] = []
     cue_tokens: list[str] = []
@@ -100,10 +109,11 @@ def build_paragraphs(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         e = float(seg.get("end", s))
         words = seg.get("words") or words_for_segment(text, s, e)
         proposed = join_tokens([*cue_tokens, text])
+        visible_chars = sum(not character.isspace() for character in proposed)
         if cue_tokens and (
             s - cue_end > 0.8
             or (cue_start is not None and e - cue_start > 6.0)
-            or len(proposed) > 48
+            or visible_chars > max_cue_chars(language)
         ):
             flush()
         if cue_start is None:
@@ -148,7 +158,7 @@ def main() -> int:
         return 3
 
     segments = list(result.segments or [])
-    paragraphs = build_paragraphs(segments)
+    paragraphs = build_paragraphs(segments, result.language or args.language)
     duration = load_audio_duration(args.audio)
     out = {
         "schema_version": 1,

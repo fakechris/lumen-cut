@@ -196,7 +196,6 @@ impl Code {
             | Code::BrollEdgeIntrusion
             | Code::BrollOverlap
             | Code::SourceWidth
-            | Code::SourceFlash
             | Code::TargetWidth
             | Code::TargetFlash
             | Code::TargetWidthAim
@@ -213,6 +212,7 @@ impl Code {
             | Code::TranslationStampExtra
             | Code::TranslationExtra
             | Code::TranslationStale
+            | Code::SourceFlash
             | Code::TranslationAdjacentDuplicate
             | Code::TranslationBoundaryDrift
             | Code::TranslationSentenceEndMismatch
@@ -495,7 +495,13 @@ pub fn audit(doc: &Doc) -> Report {
     // than translated CJK, but still becomes an unusable flash above 17
     // visible characters per second.
     let source_lang = doc.meta.language.as_deref().unwrap_or("en");
-    let source_hard = crate::pipeline::translate::hard_chars_for_lang(source_lang);
+    // Source subtitles are rendered as up to two lines and use a wider Latin
+    // measure than translation prompt packets. Reusing the 17-character
+    // translation packing cap here rejected nearly every normal English cue.
+    let source_hard = match source_lang.to_ascii_lowercase().as_str() {
+        "zh" | "ja" | "ko" | "chinese" | "japanese" | "korean" => 22,
+        _ => 42,
+    };
     for sentence in doc
         .paragraphs
         .iter()
@@ -2123,7 +2129,7 @@ mod tests {
             vec![
                 Word {
                     id: "w0".into(),
-                    text: "an extremely long source subtitle".into(),
+                    text: "an extremely long source subtitle that cannot fit on two lines".into(),
                     start: 0.0,
                     end: 0.2,
                 },
@@ -2162,6 +2168,10 @@ mod tests {
         let report = audit(&d);
         assert_eq!(report.by_code(Code::SourceWidth).len(), 1);
         assert_eq!(report.by_code(Code::SourceFlash).len(), 1);
+        assert_eq!(
+            report.by_code(Code::SourceFlash)[0].severity,
+            Severity::Warn
+        );
         assert_eq!(report.by_code(Code::TranslationStampMissing).len(), 1);
         assert_eq!(report.by_code(Code::TranslationStampExtra).len(), 1);
         assert_eq!(report.by_code(Code::TranslationBoundaryDrift).len(), 1);

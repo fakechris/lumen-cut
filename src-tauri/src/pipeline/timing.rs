@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::doc::Doc;
 
-/// Minimum word duration (seconds). Matches the audit `zero-duration`
-/// 0.05 s threshold.
-pub const MIN_DUR: f64 = 0.05;
+/// Minimum word duration (seconds). Keep a 1 ms margin above the audit's
+/// strict 0.05 s threshold so floating-point serialization cannot round a
+/// repaired interval back below the gate.
+pub const MIN_DUR: f64 = 0.051;
 /// Overlap jitter tolerance — matches `audit::engine`'s 0.05 s window.
 pub const JITTER: f64 = 0.05;
 
@@ -51,9 +52,12 @@ pub fn repair(doc: &mut Doc) -> RepairReport {
             w.end = w.start + MIN_DUR;
             rep.fixed_zero += 1;
         }
-        if w.start < prev_end - JITTER {
+        // Repair every actual overlap, including overlaps inside the audit's
+        // jitter allowance. Otherwise extending a zero-duration word can
+        // create a new sentence-boundary failure in the following cue.
+        if w.start < prev_end {
             w.start = prev_end;
-            if w.end < w.start {
+            if w.end - w.start < MIN_DUR {
                 w.end = w.start + MIN_DUR;
             }
             rep.fixed_overlap += 1;
@@ -134,5 +138,9 @@ mod tests {
         let rep = repair(&mut d);
         assert_eq!(rep.fixed_overlap, 1);
         assert!(d.paragraphs[0].sentences[0].words[1].start >= 2.0 - JITTER);
+        assert!(
+            d.paragraphs[0].sentences[0].words[1].end - d.paragraphs[0].sentences[0].words[1].start
+                >= MIN_DUR
+        );
     }
 }

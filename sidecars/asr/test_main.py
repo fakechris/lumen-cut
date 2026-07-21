@@ -33,6 +33,26 @@ class SidecarFormattingTests(unittest.TestCase):
             ["First", "Second"],
         )
 
+    def test_cues_respect_the_editor_width_gate(self) -> None:
+        segments = [
+            {"text": token, "start": index * 0.3, "end": (index + 1) * 0.3}
+            for index, token in enumerate(
+                [
+                    "This", "subtitle", "must", "wrap", "before", "it", "becomes",
+                    "too", "wide", "for", "everyone", "watching", "today",
+                ]
+            )
+        ]
+        sentences = ASR.build_paragraphs(segments, "English")[0]["sentences"]
+        self.assertGreater(len(sentences), 1)
+        for sentence in sentences:
+            visible = sum(not character.isspace() for character in sentence["text"])
+            self.assertLessEqual(visible, ASR.MAX_CUE_CHARS_LATIN)
+
+    def test_cjk_uses_a_tighter_width_gate(self) -> None:
+        self.assertEqual(ASR.max_cue_chars("Chinese"), 22)
+        self.assertEqual(ASR.max_cue_chars("English"), 42)
+
 
 if __name__ == "__main__":
     unittest.main()

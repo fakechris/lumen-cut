@@ -359,6 +359,18 @@ pub struct AutoResult {
     pub paragraph_count: usize,
 }
 
+fn normalize_transcription_doc(doc: &mut Doc, language_hint: Option<String>) {
+    // Keep ASR language detection unless the user supplied an explicit hint.
+    // Assigning `None` here used to erase a valid detected language.
+    if let Some(language) = language_hint {
+        doc.meta.language = Some(language);
+    }
+    // Forced alignment can contain occasional zero-length or overlapping word
+    // boundaries. Normalize them before the first save so every downstream
+    // editor and export sees a valid timeline.
+    crate::pipeline::timing::repair(doc);
+}
+
 fn ensure_not_cancelled() -> AppResult<()> {
     if crate::proc::cancellation_requested() {
         Err(AppError::Cancelled)
@@ -437,7 +449,7 @@ where
         channels: info.channels,
     };
     doc.meta.title = args.title.clone().unwrap_or_else(|| pid_stem.clone());
-    doc.meta.language = args.lang.clone();
+    normalize_transcription_doc(&mut doc, args.lang.clone());
     doc.meta.updated_at = chrono::Utc::now();
     report("exporting", 94);
     let result = run_blocking("project save and subtitle export", move || {
@@ -2062,6 +2074,43 @@ mod tests {
     #[test]
     fn version_constant_is_nonempty() {
         assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn transcription_normalization_preserves_detected_language_and_repairs_timing() {
+        let mut doc: Doc = crate::asr::AsrOutV1 {
+            schema_version: 1,
+            language: Some("English".into()),
+            duration_seconds: 1.0,
+            paragraphs: vec![crate::asr::AsrParagraph {
+                speaker: None,
+                sentences: vec![crate::asr::AsrSentence {
+                    text: "hello world".into(),
+                    words: vec![
+                        crate::asr::AsrWord {
+                            text: "hello".into(),
+                            start: 0.0,
+                            end: 0.0,
+                        },
+                        crate::asr::AsrWord {
+                            text: "world".into(),
+                            start: 0.0,
+                            end: 0.2,
+                        },
+                    ],
+                }],
+            }],
+        }
+        .into();
+        normalize_transcription_doc(&mut doc, None);
+        assert_eq!(doc.meta.language.as_deref(), Some("English"));
+        let words = &doc.paragraphs[0].sentences[0].words;
+        assert!(words[0].end > words[0].start);
+        assert!(words[1].start >= words[0].end - crate::pipeline::timing::JITTER);
+        assert!(words[1].end - words[1].start >= crate::pipeline::timing::MIN_DUR);
+
+        normalize_transcription_doc(&mut doc, Some("Chinese".into()));
+        assert_eq!(doc.meta.language.as_deref(), Some("Chinese"));
     }
 
     #[tokio::test]

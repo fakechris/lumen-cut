@@ -1990,6 +1990,7 @@ async fn run_auto(
     };
     doc.meta.title = title.unwrap_or(&pid_stem).to_string();
     doc.meta.updated_at = Utc::now();
+    lumen_cut::pipeline::timing::repair(&mut doc);
     doc.save(&pid_dir)?;
 
     let srt_path = pid_dir.join("out.srt");
