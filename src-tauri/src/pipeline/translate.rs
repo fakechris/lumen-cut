@@ -3,9 +3,9 @@
 //! ## Why this matters
 //!
 //! Translation calls are the most expensive kind of agent call. Each
-//! answer is one sentence's translation in a target language, and a
-//! single 5-minute video can have ~80 sentences.  We don't want to send
-//! all 80 to one round-trip — the model is most useful when given the
+//! answer contains a bounded group of sentence translations, and a
+//! single 5-minute video can have ~80 sentences. We don't want to send
+//! every cue separately or all 80 in one round-trip — the model is most useful when given the
 //! surrounding glossary, brief, and recent translations, and least
 //! useful when given too many sentences at once.
 //!
@@ -21,7 +21,7 @@
 //!   materialized as `rt[]` on every relevant later page.
 //! * **Phase 2 (sentences)**: source sentences are translated whole, then
 //!   over-fit target groups are split/re-aligned by the align task. The
-//!   packer below is order-preserving greedy first-fit.
+//!   packer below is order-preserving contiguous greedy packing.
 
 use std::collections::HashMap;
 
@@ -30,6 +30,9 @@ use serde::{Deserialize, Serialize};
 /// Token budget per call. Default is 8192 (compatible with both
 /// `gpt-4o-mini` and `claude-3-5-haiku`).
 pub const DEFAULT_BUDGET: u32 = 8192;
+/// Room reserved for the task contract, JSON, neighbouring context, locked
+/// terms, and the model response.
+pub const REQUEST_OVERHEAD_BUDGET: u32 = 2048;
 /// Keep enough neighbouring cues in one request for discourse consistency
 /// without making a single provider call too large or slow to recover.
 pub const MAX_LINES_PER_REQUEST: usize = 32;
@@ -88,7 +91,14 @@ pub fn pack_for_requests(
     let max_lines = max_lines.max(1);
 
     for s in sentences {
-        let tokens = ((s.word_count as f64) * tokens_per_word).ceil() as u32 + 8;
+        let word_tokens = ((s.word_count as f64) * tokens_per_word).ceil() as u32;
+        let text_tokens = s
+            .text
+            .chars()
+            .map(|character| if character.is_ascii() { 0.25 } else { 1.0 })
+            .sum::<f64>()
+            .ceil() as u32;
+        let tokens = word_tokens.max(text_tokens).saturating_add(8);
         if !current.sentences.is_empty()
             && (current.sentences.len() >= max_lines
                 || current.estimated_tokens.saturating_add(tokens) > budget)
@@ -281,6 +291,17 @@ mod tests {
         assert_eq!(zh[0].estimated_tokens, 26);
         let en = pack_with_lang(vec![pkt("a", 4), pkt("b", 4)], 27, "en");
         assert_eq!(en.len(), 2);
+    }
+
+    #[test]
+    fn packer_accounts_for_text_when_word_timing_is_missing() {
+        let sentences = vec![SentencePacket {
+            sentence_id: "long".into(),
+            text: "字".repeat(200),
+            word_count: 0,
+        }];
+        let batches = pack_for_requests(sentences, 100, 32, "zh");
+        assert_eq!(batches[0].estimated_tokens, 208);
     }
 
     #[test]

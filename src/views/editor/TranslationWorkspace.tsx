@@ -32,15 +32,15 @@ export function TranslationWorkspace({
 }: Props) {
   const languages = Object.keys(doc.translations);
   const activeTaskLanguage = status?.kinds.find(
-    (item) => item.kind === "translate" && item.pending > 0 && item.lang,
+    (item) => item.kind === "translate" && item.lang,
   )?.lang;
   const [selected, setSelected] = useState(languages[0] || activeTaskLanguage || "en");
 
   useEffect(() => {
-    if (languages.length > 0 && !languages.includes(selected)) {
-      setSelected(languages[0]);
-    } else if (languages.length === 0 && activeTaskLanguage) {
+    if (activeTaskLanguage) {
       setSelected(activeTaskLanguage);
+    } else if (languages.length > 0 && !languages.includes(selected)) {
+      setSelected(languages[0]);
     }
   }, [languages.join("|"), activeTaskLanguage]);
 
@@ -61,6 +61,7 @@ export function TranslationWorkspace({
   const batchTotal = translateTask
     ? translateTask.calls ?? translateTask.pending + translateTask.done + translateTask.failed
     : 0;
+  const taskStopped = translateTask?.state === "paused" || translateTask?.state === "failed";
 
   return (
     <div className="translation-workspace">
@@ -81,7 +82,9 @@ export function TranslationWorkspace({
         {translateTask && (
           <div className="task-detail">
             <strong>{translateTask.pending > 0
-              ? (lang === "zh" ? "正在后台翻译" : "Translating in background")
+              ? taskStopped
+                ? (lang === "zh" ? "翻译已暂停" : "Translation paused")
+                : (lang === "zh" ? "正在后台翻译" : "Translating in background")
               : translateTask.failed > 0
                 ? (lang === "zh" ? "部分任务失败" : "Some calls failed")
                 : (lang === "zh" ? "最近翻译完成" : "Latest translation complete")}
@@ -106,10 +109,12 @@ export function TranslationWorkspace({
           <>
             <button
               className="button-primary"
-              disabled={busy || Boolean(translateTask?.pending)}
+              disabled={busy || Boolean(translateTask?.pending && !taskStopped)}
               onClick={() => onStart(selected)}
             >
-              {translateTask?.pending
+              {translateTask?.pending && taskStopped
+                ? (lang === "zh" ? "继续翻译" : "Resume translation")
+                : translateTask?.pending
                 ? (lang === "zh" ? "翻译进行中…" : "Translation running…")
                 : completed > 0
                   ? (lang === "zh" ? "更新翻译" : "Update translation")

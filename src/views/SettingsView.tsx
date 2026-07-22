@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   asrStatus,
   configShow,
@@ -167,17 +167,21 @@ export function SettingsView({ lang, pid }: Props) {
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
   const [modelCatalogState, setModelCatalogState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
   const [modelCatalogMessage, setModelCatalogMessage] = useState<string | null>(null);
+  const modelCatalogRequest = useRef(0);
 
   const refreshModels = async (source: Settings = settings) => {
     if (!source.llmEndpoint.trim()) return;
+    const requestId = ++modelCatalogRequest.current;
     setModelCatalogState("loading");
     setModelCatalogMessage(null);
     try {
       const models = await llmModelsList(source.llmEndpoint.trim(), source.llmApiKey.trim());
+      if (modelCatalogRequest.current !== requestId) return;
       setRemoteModels(models);
       setModelCatalogState("loaded");
       setModelCatalogMessage(c.modelsLoaded(models.length));
     } catch (error) {
+      if (modelCatalogRequest.current !== requestId) return;
       setRemoteModels([]);
       setModelCatalogState("error");
       setModelCatalogMessage(error instanceof Error ? error.message : String(error));
@@ -234,6 +238,7 @@ export function SettingsView({ lang, pid }: Props) {
       })
     return () => {
       disposed = true;
+      modelCatalogRequest.current += 1;
     };
   }, []);
 
@@ -279,8 +284,15 @@ export function SettingsView({ lang, pid }: Props) {
     };
   }, [setupJob?.state]);
 
-  const update = <K extends keyof Settings>(key: K, value: Settings[K]) =>
+  const update = <K extends keyof Settings>(key: K, value: Settings[K]) => {
+    if (key === "llmEndpoint" || key === "llmApiKey") {
+      modelCatalogRequest.current += 1;
+      setRemoteModels([]);
+      setModelCatalogState("idle");
+      setModelCatalogMessage(null);
+    }
     setSettings((previous) => ({ ...previous, [key]: value }));
+  };
 
   const selectedProvider = getLlmProvider(providerId);
   const modelOptions = Array.from(new Set([
@@ -298,6 +310,7 @@ export function SettingsView({ lang, pid }: Props) {
     setProviderId(nextId);
     setState("idle");
     setMessage(null);
+    modelCatalogRequest.current += 1;
     setRemoteModels([]);
     setModelCatalogState("idle");
     setModelCatalogMessage(null);

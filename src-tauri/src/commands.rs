@@ -1033,7 +1033,9 @@ async fn launch_prepared_task(
     let restore_allocator = allocator.clone();
     let restore_task = task.clone();
     let restored = match run_blocking("task recovery", move || {
-        crate::agent::task::restore_or_enqueue(&restore_allocator, &restore_task)
+        let restored = crate::agent::task::restore_or_enqueue(&restore_allocator, &restore_task)?;
+        crate::agent::task::set_task_state(&restore_task, "running", None)?;
+        Ok(restored)
     })
     .await
     {
@@ -1049,6 +1051,7 @@ async fn launch_prepared_task(
     };
     let project_mutation = project_mutation_mutex(&task.project_dir).await;
     let task_kind = task.kind.clone();
+    let status_task = task.clone();
     let pending = task.calls.len();
     let active_tasks = state.active_tasks.clone();
     tracing::info!(
@@ -1067,6 +1070,24 @@ async fn launch_prepared_task(
             project_mutation,
         )
         .await;
+        let terminal_state = match &result {
+            Ok(_) => "completed",
+            Err(error) if error.to_string().contains("paused after waiting") => "paused",
+            Err(_) => "failed",
+        };
+        let terminal_error = result.as_ref().err().map(ToString::to_string);
+        if let Err(error) = crate::agent::task::set_task_state(
+            &status_task,
+            terminal_state,
+            terminal_error.as_deref(),
+        ) {
+            tracing::error!(
+                pipeline = "ai-task",
+                kind = task_kind,
+                %error,
+                "failed to persist task state"
+            );
+        }
         active_tasks.lock().expect("state poisoned").remove(&key);
         match result {
             Ok(applied) => tracing::info!(
@@ -1164,6 +1185,7 @@ pub async fn task_resume(
 pub struct TaskKindStatus {
     pub kind: String,
     pub lang: Option<String>,
+    pub state: String,
     pub calls: usize,
     pub pending: usize,
     pub done: usize,
@@ -1192,68 +1214,84 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
         .filter_map(|entry| {
             let dir = entry.path();
             let kind = entry.file_name().to_string_lossy().into_owned();
-            let count = |name: &str| {
-                std::fs::read_dir(dir.join(name))
-                    .map(|entries| entries.filter_map(Result::ok).count())
-                    .unwrap_or_default()
-            };
-            let done = count("done");
-            let failed = count("failed");
-            let failed_names: std::collections::BTreeSet<std::ffi::OsString> =
-                std::fs::read_dir(dir.join("failed"))
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.file_name())
-                    .collect();
-            let done_names: std::collections::BTreeSet<std::ffi::OsString> =
-                std::fs::read_dir(dir.join("done"))
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.file_name())
-                    .collect();
-            let pending = std::fs::read_dir(dir.join("pending"))
-                .map(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .filter(|entry| {
-                            !failed_names.contains(&entry.file_name())
-                                && !done_names.contains(&entry.file_name())
-                        })
-                        .count()
-                })
-                .unwrap_or_default();
-            if pending + done + failed == 0 && !dir.join("task.json").exists() {
-                return None;
-            }
             let task_json = std::fs::read_to_string(dir.join("task.json"))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            let active_prefix = task_json
+                .as_ref()
+                .and_then(|value| value.get("runId"))
+                .and_then(|value| value.as_str())
+                .map(|run_id| format!("{kind}-{run_id}-"));
+            let entries_for = |name: &str| {
+                std::fs::read_dir(dir.join(name))
+                    .map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .filter(|entry| {
+                                active_prefix.as_ref().is_none_or(|prefix| {
+                                    entry.file_name().to_string_lossy().starts_with(prefix)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            let done_entries = entries_for("done");
+            let failed_entries = entries_for("failed");
+            let pending_entries = entries_for("pending");
+            let done = done_entries.len();
+            let failed = failed_entries.len();
+            let failed_names: std::collections::BTreeSet<std::ffi::OsString> = failed_entries
+                .iter()
+                .map(|entry| entry.file_name())
+                .collect();
+            let done_names: std::collections::BTreeSet<std::ffi::OsString> =
+                done_entries.iter().map(|entry| entry.file_name()).collect();
+            let pending = pending_entries
+                .iter()
+                .filter(|entry| {
+                    !failed_names.contains(&entry.file_name())
+                        && !done_names.contains(&entry.file_name())
+                })
+                .count();
+            if pending + done + failed == 0 && !dir.join("task.json").exists() {
+                return None;
+            }
             let lang = task_json
                 .as_ref()
                 .and_then(|value| value.get("lang"))
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
+            let state = task_json
+                .as_ref()
+                .and_then(|value| value.get("state"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(if pending > 0 { "running" } else { "completed" })
+                .to_string();
             let calls = task_json
                 .as_ref()
                 .and_then(|value| value.get("calls"))
                 .and_then(|value| value.as_u64())
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(pending + done + failed);
-            let last_error = std::fs::read_dir(dir.join("failed"))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .max_by_key(|entry| {
-                    entry
-                        .metadata()
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())
-                })
-                .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                .and_then(|value| value.get("error")?.as_str().map(str::to_string));
+            let last_error = task_json
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    failed_entries
+                        .iter()
+                        .max_by_key(|entry| {
+                            entry
+                                .metadata()
+                                .ok()
+                                .and_then(|metadata| metadata.modified().ok())
+                        })
+                        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+                });
             let updated_at = std::fs::metadata(dir.join("task.json"))
                 .or_else(|_| std::fs::metadata(&dir))
                 .ok()
@@ -1263,6 +1301,7 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
             Some(TaskKindStatus {
                 kind,
                 lang,
+                state,
                 calls,
                 pending,
                 done,
@@ -3540,6 +3579,10 @@ fn parse_llm_models(body: &str) -> AppResult<Vec<String>> {
 #[tauri::command]
 pub async fn llm_models_list(endpoint: String, api_key: String) -> AppResult<Vec<String>> {
     let catalog_url = derive_models_endpoint(&endpoint)?;
+    let anthropic = reqwest::Url::parse(&catalog_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| host == "api.anthropic.com" || host.ends_with(".anthropic.com"));
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(20))
@@ -3547,7 +3590,13 @@ pub async fn llm_models_list(endpoint: String, api_key: String) -> AppResult<Vec
         .map_err(|error| AppError::Schema(format!("model catalog client: {error}")))?;
     let mut request = client.get(catalog_url);
     if !api_key.trim().is_empty() {
-        request = request.bearer_auth(api_key.trim());
+        request = if anthropic {
+            request
+                .header("x-api-key", api_key.trim())
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            request.bearer_auth(api_key.trim())
+        };
     }
     let response = request
         .send()
@@ -5842,6 +5891,42 @@ mod tests {
         assert_eq!(
             status.kinds[0].last_error.as_deref(),
             Some("provider rejected the request")
+        );
+    }
+
+    #[tokio::test]
+    async fn task_status_only_counts_the_active_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let translate = tmp.path().join("p1/ai/translate");
+        std::fs::create_dir_all(translate.join("pending")).unwrap();
+        std::fs::create_dir_all(translate.join("done")).unwrap();
+        std::fs::create_dir_all(translate.join("failed")).unwrap();
+        std::fs::write(
+            translate.join("task.json"),
+            r#"{"kind":"translate","lang":"zh","runId":"current","calls":2,"state":"failed","error":"provider timeout"}"#,
+        )
+        .unwrap();
+        std::fs::write(translate.join("pending/translate-current-0001.json"), "{}").unwrap();
+        std::fs::write(translate.join("done/translate-current-0000.json"), "{}").unwrap();
+        std::fs::write(translate.join("done/translate-old-0000.json"), "{}").unwrap();
+        std::fs::write(
+            translate.join("failed/translate-old-0001.json"),
+            r#"{"error":"stale failure"}"#,
+        )
+        .unwrap();
+
+        let status = task_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        assert_eq!(status.kinds[0].calls, 2);
+        assert_eq!(status.kinds[0].done, 1);
+        assert_eq!(status.kinds[0].pending, 1);
+        assert_eq!(status.kinds[0].failed, 0);
+        assert_eq!(status.kinds[0].state, "failed");
+        assert_eq!(
+            status.kinds[0].last_error.as_deref(),
+            Some("provider timeout")
         );
     }
 

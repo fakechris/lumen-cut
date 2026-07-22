@@ -336,6 +336,8 @@ export function TranscriptView({
   const [brollPreviewJob, setBrollPreviewJob] = useState<BrollPreviewJobStatus | null>(null);
   const [brollPreviewPaths, setBrollPreviewPaths] = useState<string[]>([]);
   const previousPending = useRef(0);
+  const activeProject = useRef(pid);
+  activeProject.current = pid;
 
   const reload = async (projectId: string, resetTab = true) => {
     setFinishItems(null);
@@ -355,6 +357,7 @@ export function TranscriptView({
         return { suggestions: [], accepted: [], errors: [friendlyError(error, lang)] };
       }),
     ]);
+    if (activeProject.current !== projectId) return;
     setDoc(nextDoc);
     setSubtitleRows(nextRows);
     setSubtitleStyle(nextStyle);
@@ -365,7 +368,8 @@ export function TranscriptView({
       setActiveTab(nextDoc.paragraphs.length > 0 ? "transcript" : "setup");
     }
     try {
-      setCuts(await cutList(projectId));
+      const nextCuts = await cutList(projectId);
+      if (activeProject.current === projectId) setCuts(nextCuts);
     } catch {
       setCuts([]);
     }
@@ -393,9 +397,13 @@ export function TranscriptView({
     void Promise.all([
       reload(pid),
       taskStatus(pid).then(async (status) => {
+        if (activeProject.current !== pid) return;
         setTaskState(status);
-        if (status.pending > 0) {
+        if (status.kinds.some(
+          (task) => task.pending > 0 && task.state !== "paused" && task.state !== "failed",
+        )) {
           const recovery = await taskResume(pid);
+          if (activeProject.current !== pid) return;
           if (recovery.resumed > 0 || recovery.recoveredSubmissions > 0) {
             setFeedback({
               tone: "info",
@@ -482,35 +490,74 @@ export function TranscriptView({
   }, [pid]);
 
   useEffect(() => {
-    if (!pid || !taskState || taskState.pending < 1) return;
+    if (
+      !pid
+      || !taskState
+      || taskState.pending < 1
+      || !taskState.kinds.some((task) => task.pending > 0 && task.state !== "paused" && task.state !== "failed")
+    ) return;
+    let disposed = false;
+    let timer: number | undefined;
     let completedBatches = taskState.done;
-    const timer = window.setInterval(() => {
-      void taskStatus(pid)
-        .then(async (status) => {
-          setTaskState(status);
-          if (status.done > completedBatches) {
-            completedBatches = status.done;
-            await reload(pid, false);
-          }
-          if (status.pending > 0) await taskResume(pid);
-          else {
-            await reload(pid, false);
-            const failed = status.kinds.reduce((total, task) => total + task.failed, 0);
+    const watchedTasks = new Set(
+      taskState.kinds
+        .filter((task) => task.pending > 0)
+        .map((task) => `${task.kind}:${task.lang || ""}`),
+    );
+    const poll = async () => {
+      try {
+        const status = await taskStatus(pid);
+        if (disposed || activeProject.current !== pid) return;
+        setTaskState(status);
+        if (status.done > completedBatches) {
+          completedBatches = status.done;
+          await reload(pid, false);
+          if (disposed || activeProject.current !== pid) return;
+        }
+        const running = status.kinds.some(
+          (task) => task.pending > 0 && task.state !== "paused" && task.state !== "failed",
+        );
+        if (running) {
+          await taskResume(pid);
+        } else if (status.pending === 0) {
+          await reload(pid, false);
+          if (disposed || activeProject.current !== pid) return;
+          const translate = status.kinds.find(
+            (task) => task.kind === "translate" && watchedTasks.has(`${task.kind}:${task.lang || ""}`),
+          );
+          if (translate) {
             setFeedback({
-              tone: failed > 0 ? "error" : "success",
-              text: failed > 0
+              tone: translate.failed > 0 || translate.state === "failed" ? "error" : "success",
+              text: translate.failed > 0 || translate.state === "failed"
                 ? lang === "zh"
-                  ? `翻译已停止：${failed} 个批次失败，已完成的结果已经保存。`
-                  : `Translation stopped: ${failed} batches failed. Completed results were saved.`
+                  ? `翻译已停止：${translate.failed} 个批次失败，已完成的结果已经保存。`
+                  : `Translation stopped: ${translate.failed} batches failed. Completed results were saved.`
                 : lang === "zh"
                   ? "翻译完成，结果已保存。"
                   : "Translation complete. Results were saved.",
             });
           }
-        })
-        .catch(() => window.clearInterval(timer));
-    }, 2500);
-    return () => window.clearInterval(timer);
+        }
+      } catch (error) {
+        if (!disposed && activeProject.current === pid) {
+          setFeedback({
+            tone: "error",
+            text: lang === "zh"
+              ? `暂时无法读取后台进度，将自动重试：${friendlyError(error, lang)}`
+              : `Could not read background progress; retrying automatically: ${friendlyError(error, lang)}`,
+          });
+        }
+      } finally {
+        if (!disposed && activeProject.current === pid) {
+          timer = window.setTimeout(poll, 2500);
+        }
+      }
+    };
+    timer = window.setTimeout(poll, 2500);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [pid, taskState?.pending]);
 
   useEffect(() => {
@@ -782,6 +829,9 @@ export function TranscriptView({
   const isVideoExporting = videoExportJob !== null
     && ["running", "cancelling"].includes(videoExportJob.state);
   const failedTasks = taskState?.kinds.reduce((sum, task) => sum + task.failed, 0) ?? 0;
+  const stoppedTasks = taskState?.kinds.filter(
+    (task) => task.state === "paused" || task.state === "failed",
+  ).length ?? 0;
   const wordsByCue: Record<string, string[]> = {};
   const nextCueById: Record<string, string> = {};
   for (const paragraph of doc.paragraphs) {
@@ -1309,8 +1359,10 @@ export function TranscriptView({
         {taskState && taskState.kinds.length > 0 && (
           <details className="task-activity">
             <summary className="task-pill">
-              <span className={taskState.pending > 0 ? "pulse-dot" : failedTasks > 0 ? "failed-dot" : "done-dot"} />
-              {c.taskStatus}: {taskState.pending > 0
+              <span className={stoppedTasks > 0 ? "failed-dot" : taskState.pending > 0 ? "pulse-dot" : failedTasks > 0 ? "failed-dot" : "done-dot"} />
+              {c.taskStatus}: {stoppedTasks > 0
+                ? (lang === "zh" ? "需要处理" : "Needs attention")
+                : taskState.pending > 0
                 ? `${taskState.pending} ${c.pending}`
                 : failedTasks > 0
                   ? `${failedTasks} ${lang === "zh" ? "失败" : "failed"}`
@@ -1323,8 +1375,12 @@ export function TranscriptView({
                     <strong>{taskLabel(task.kind, lang)}</strong>
                     {task.lang && <small>{task.lang.toUpperCase()}</small>}
                   </span>
-                  <span className={task.failed > 0 ? "task-failed" : task.pending > 0 ? "task-running" : "task-done"}>
-                    {task.failed > 0
+                  <span className={task.failed > 0 || task.state === "paused" || task.state === "failed" ? "task-failed" : task.pending > 0 ? "task-running" : "task-done"}>
+                    {task.state === "paused"
+                      ? (lang === "zh" ? "已暂停" : "paused")
+                      : task.state === "failed" && task.failed === 0
+                        ? (lang === "zh" ? "需要重试" : "retry needed")
+                        : task.failed > 0
                       ? `${task.failed} ${lang === "zh" ? "失败" : "failed"}`
                       : task.pending > 0
                         ? `${task.pending} ${c.pending}`

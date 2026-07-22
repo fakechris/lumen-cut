@@ -1,7 +1,7 @@
 //! Task orchestration: materialise calls, validate submissions, and apply
 //! completed answers back to a project.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{Allocator, PendingCall};
 use crate::data::{ClipCuts, Cut, CutKind, Doc, TranslationGroup};
 use crate::error::{AppError, AppResult};
-use crate::pipeline::{pack_for_requests, SentencePacket, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST};
+use crate::pipeline::{
+    pack_for_requests, SentencePacket, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST,
+    REQUEST_OVERHEAD_BUDGET,
+};
 
 #[derive(Debug, Clone)]
 pub struct PreparedCall {
@@ -29,6 +32,17 @@ pub struct PreparedTask {
     pub lang: Option<String>,
     pub ai_dir: PathBuf,
     pub calls: Vec<PreparedCall>,
+}
+
+pub fn set_task_state(task: &PreparedTask, state: &str, error: Option<&str>) -> AppResult<()> {
+    let path = task.ai_dir.join("task.json");
+    let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Schema("task metadata is not an object".into()))?;
+    object.insert("state".into(), serde_json::Value::String(state.into()));
+    object.insert("error".into(), serde_json::json!(error));
+    crate::data::storage::write_json(&path, &value)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -527,9 +541,15 @@ fn translate_payloads(
         .enumerate()
         .map(|(index, sentence)| (sentence.sentence_id.as_str(), index))
         .collect();
-    pack_for_requests(packets, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST, lang)
+    let request_budget = DEFAULT_BUDGET.saturating_sub(REQUEST_OVERHEAD_BUDGET);
+    pack_for_requests(packets, request_budget, MAX_LINES_PER_REQUEST, lang)
         .into_iter()
         .map(|batch| {
+            if batch.estimated_tokens > request_budget {
+                return Err(AppError::Schema(
+                    "a source subtitle is too large for one translation request".into(),
+                ));
+            }
             let first = batch
                 .sentences
                 .first()
@@ -544,7 +564,7 @@ fn translate_payloads(
                 .unwrap_or(first);
             let context_line = |sentence: &SentencePacket| TranslateContextLine {
                 id: sentence.sentence_id.clone(),
-                source: sentence.text.clone(),
+                source: sentence.text.chars().take(500).collect(),
             };
             let after_start = last.saturating_add(1);
             let after_end = after_start.saturating_add(3).min(all_packets.len());
@@ -1717,7 +1737,6 @@ async fn wait_and_apply_translation(
         .map(|prepared| prepared.call.id.clone())
         .collect();
     let mut applied = 0usize;
-    let mut evidence = Vec::with_capacity(task.calls.len());
     let mut errors = Vec::new();
 
     while !remaining.is_empty() {
@@ -1750,8 +1769,6 @@ async fn wait_and_apply_translation(
                 errors.push(format!("task call {} failed: {error}", prepared.call.id));
                 continue;
             }
-            let request: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&prepared.pending_path)?)?;
             let parsed_answer = match parse_answer_value(&task.kind, &answer.text) {
                 Ok(answer) => answer,
                 Err(issues) => {
@@ -1762,30 +1779,48 @@ async fn wait_and_apply_translation(
                 }
             };
 
-            let _mutation = if let Some(mutation) = project_mutation.clone() {
+            let mutation_guard = if let Some(mutation) = project_mutation.clone() {
                 Some(mutation.lock_owned().await)
             } else {
                 None
             };
-            applied += apply_answer(&task, &prepared.call, &answer.text)?;
-            crate::data::storage::write_json(
-                &prepared.done_path,
-                &serde_json::json!({
-                    "callId": prepared.call.id,
-                    "request": request,
-                    "answer": answer,
-                }),
-            )?;
-            remove_if_exists(&prepared.pending_path)?;
-            remove_if_exists(&prepared.submitted_path)?;
-            evidence.push((request, parsed_answer));
+            let persist_task = task.clone();
+            let persist_call = prepared.clone();
+            let batch_applied = tokio::task::spawn_blocking(move || {
+                let _mutation_guard = mutation_guard;
+                let request: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&persist_call.pending_path)?)?;
+                let batch_applied = apply_answer(&persist_task, &persist_call.call, &answer.text)?;
+                let completed_evidence = completed_translation_evidence(
+                    &persist_task,
+                    &persist_call,
+                    &request,
+                    &parsed_answer,
+                )?;
+                persist_task_artifacts(&persist_task, &completed_evidence, 0)?;
+                crate::data::storage::write_json(
+                    &persist_call.done_path,
+                    &serde_json::json!({
+                        "callId": persist_call.call.id,
+                        "request": request,
+                        "answer": answer,
+                    }),
+                )?;
+                remove_if_exists(&persist_call.pending_path)?;
+                remove_if_exists(&persist_call.submitted_path)?;
+                Ok::<usize, AppError>(batch_applied)
+            })
+            .await
+            .map_err(|error| {
+                AppError::Schema(format!("translation persistence failed: {error}"))
+            })??;
+            applied += batch_applied;
         }
 
         if remaining.is_empty() {
             break;
         }
         if started.elapsed() >= timeout {
-            persist_task_artifacts(&task, &evidence, 0)?;
             return Err(AppError::Schema(format!(
                 "task {} paused after waiting for incomplete calls; completed batches were saved",
                 task.kind
@@ -1796,12 +1831,58 @@ async fn wait_and_apply_translation(
         }
     }
 
-    persist_task_artifacts(&task, &evidence, 0)?;
     if errors.is_empty() {
         Ok(applied)
     } else {
         Err(AppError::Schema(errors.join("; ")))
     }
+}
+
+/// Rebuild the active run's analysis evidence in call order, regardless of
+/// which parallel provider request completed first. The current batch is
+/// included before its done marker is published so `done` always means both
+/// the document and its analysis metadata are durable.
+fn completed_translation_evidence(
+    task: &PreparedTask,
+    current: &PreparedCall,
+    current_request: &serde_json::Value,
+    current_answer: &serde_json::Value,
+) -> AppResult<Vec<(serde_json::Value, serde_json::Value)>> {
+    let task_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(task.ai_dir.join("task.json"))?)?;
+    let run_id = task_json["runId"]
+        .as_str()
+        .ok_or_else(|| AppError::Schema("translation task is missing its run id".into()))?;
+    let prefix = format!("{}-{run_id}-", task.kind);
+    let mut ordered = BTreeMap::new();
+    let done_dir = task.ai_dir.join("done");
+    if let Ok(entries) = std::fs::read_dir(done_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let Some(call_id) = entry
+                .path()
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| value.starts_with(&prefix))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let artifact: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(entry.path())?)?;
+            let request = artifact["request"].clone();
+            let answer_text = artifact["answer"]["text"]
+                .as_str()
+                .ok_or_else(|| AppError::Schema(format!("done call {call_id} has no answer")))?;
+            let answer = parse_answer_value("translate", answer_text)
+                .map_err(|issues| AppError::Schema(format!("invalid done answer: {issues:?}")))?;
+            ordered.insert(call_id, (request, answer));
+        }
+    }
+    ordered.insert(
+        current.call.id.clone(),
+        (current_request.clone(), current_answer.clone()),
+    );
+    Ok(ordered.into_values().collect())
 }
 
 fn record_translation_failure(prepared: &PreparedCall, error: &str) -> AppResult<()> {
@@ -1831,11 +1912,7 @@ fn persist_task_artifacts(
     let previous_analysis = std::fs::read_to_string(&analysis_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok());
-    let analysis = merged_analysis(
-        evidence,
-        previous_analysis.as_ref(),
-        task.kind == "translate",
-    );
+    let analysis = merged_analysis(evidence, previous_analysis.as_ref());
     write_json_atomically(&analysis_path, &analysis)?;
 
     if task.kind != "polish" {
@@ -1914,33 +1991,17 @@ fn answer_sentences(value: &serde_json::Value, source_shape: bool) -> Vec<&str> 
 fn merged_analysis(
     evidence: &[(serde_json::Value, serde_json::Value)],
     previous: Option<&serde_json::Value>,
-    preserve_previous: bool,
 ) -> serde_json::Value {
     let mut summaries = Vec::new();
     let mut terms: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
     let mut named_entities = BTreeSet::new();
     if let Some(previous) = previous {
-        if preserve_previous {
-            if let Some(summary) = previous["summary"]
-                .as_str()
-                .filter(|text| !text.trim().is_empty())
-            {
-                summaries.push(summary.to_string());
-            }
-            named_entities.extend(
-                previous["namedEntities"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|value| value.as_str().map(str::to_string)),
-            );
-        }
         for term in previous["terms"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|term| preserve_previous || term["locked"].as_bool() == Some(true))
+            .filter(|term| term["locked"].as_bool() == Some(true))
         {
             if let Some(name) = term["term"].as_str() {
                 terms.insert(name.to_string(), term.clone());
@@ -2619,7 +2680,7 @@ mod tests {
         allocator
             .submit(&first_lease.lease_id, Some(answer(&first_answer)), None)
             .unwrap();
-        for _ in 0..20 {
+        for _ in 0..100 {
             if first_done.exists() {
                 break;
             }
@@ -2670,26 +2731,38 @@ mod tests {
     }
 
     #[test]
-    fn progressive_translation_analysis_preserves_previous_batch_context() {
-        let previous = serde_json::json!({
-            "summary": "first batch",
-            "terms": [{"term": "Lumen", "observedVariants": [], "locked": false}],
-            "namedEntities": ["Alice"],
-        });
-        let evidence = vec![(
-            serde_json::json!({}),
-            serde_json::json!({
-                "summary": "second batch",
-                "terms": [{"term": "Subtitles", "observedVariants": [], "locked": false}],
-                "namedEntities": ["Bob"],
+    fn progressive_translation_analysis_uses_document_order_not_completion_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        doc_with_sentences(40).save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        let first_request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&task.calls[0].pending_path).unwrap())
+                .unwrap();
+        let mut first_answer: serde_json::Value =
+            serde_json::from_str(&translation_answer_for(&task.calls[0])).unwrap();
+        first_answer["summary"] = serde_json::json!("first batch");
+        let second_request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&task.calls[1].pending_path).unwrap())
+                .unwrap();
+        let mut second_answer: serde_json::Value =
+            serde_json::from_str(&translation_answer_for(&task.calls[1])).unwrap();
+        second_answer["summary"] = serde_json::json!("second batch");
+        crate::data::storage::write_json(
+            &task.calls[1].done_path,
+            &serde_json::json!({
+                "callId": task.calls[1].call.id,
+                "request": second_request,
+                "answer": answer(&second_answer.to_string()),
             }),
-        )];
+        )
+        .unwrap();
 
-        let merged = merged_analysis(&evidence, Some(&previous), true);
+        let evidence =
+            completed_translation_evidence(&task, &task.calls[0], &first_request, &first_answer)
+                .unwrap();
+        let merged = merged_analysis(&evidence, None);
 
         assert_eq!(merged["summary"], "first batch\n\nsecond batch");
-        assert_eq!(merged["terms"].as_array().unwrap().len(), 2);
-        assert_eq!(merged["namedEntities"], serde_json::json!(["Alice", "Bob"]));
     }
 
     #[test]

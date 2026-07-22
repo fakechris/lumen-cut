@@ -218,6 +218,7 @@ export interface TaskStatus {
   kinds: Array<{
     kind: string;
     lang?: string | null;
+    state?: "running" | "completed" | "paused" | "failed";
     calls?: number;
     pending: number;
     done: number;
