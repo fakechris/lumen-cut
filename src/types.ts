@@ -127,6 +127,7 @@ export interface TranscriptionJobStatus {
   pid: string;
   state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
   phase:
+    | "waiting"
     | "preparing"
     | "downloading"
     | "extracting"
@@ -140,7 +141,75 @@ export interface TranscriptionJobStatus {
     | "cancelled"
     | "failed";
   progress: number;
+  current: number | null;
+  total: number | null;
+  device: "mlx-metal" | null;
+  elapsedSeconds: number | null;
+  cpuPercent: number | null;
+  peakMemoryMb: number | null;
+  memoryLimitMb: number | null;
+  mlxActiveMemoryMb: number | null;
+  mlxCacheMemoryMb: number | null;
   error?: string | null;
+}
+
+export interface SpeakerAnalysisJobStatus {
+  pid: string;
+  state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  phase:
+    | "waiting"
+    | "preparing"
+    | "loading"
+    | "segmenting"
+    | "counting"
+    | "embedding"
+    | "finalizing"
+    | "completed"
+    | "cancelling"
+    | "cancelled"
+    | "failed";
+  progress: number;
+  current: number | null;
+  total: number | null;
+  device: "mps" | "cpu" | null;
+  elapsedSeconds: number | null;
+  cpuPercent: number | null;
+  peakMemoryMb: number | null;
+  memoryLimitMb: number | null;
+  error: string | null;
+  preview: SpeakerReidentifyPreview | null;
+}
+
+export interface VideoExportJobStatus {
+  pid: string;
+  mode: "fast" | "quality";
+  state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  phase: "waiting" | "preparing" | "encoding" | "completed" | "cancelling" | "cancelled" | "failed";
+  progress: number;
+  currentSeconds: number | null;
+  totalSeconds: number | null;
+  encoder: "h264_videotoolbox" | "libx264" | null;
+  error: string | null;
+  path: string | null;
+}
+
+export interface SetupJobStatus {
+  kind: "asr-runtime" | "asr-models" | "speaker-runtime" | "speaker-model";
+  state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  phase: "waiting" | "installing" | "downloading" | "completed" | "cancelling" | "cancelled" | "failed";
+  error: string | null;
+}
+
+export interface BrollPreviewJobStatus {
+  pid: string;
+  state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  phase: "waiting" | "preparing" | "encoding" | "frames" | "completed" | "cancelling" | "cancelled" | "failed";
+  progress: number;
+  current: number | null;
+  total: number | null;
+  encoder: "h264_videotoolbox" | "libx264" | null;
+  error: string | null;
+  paths: string[];
 }
 
 export interface TaskStatus {

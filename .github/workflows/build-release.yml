@@ -38,8 +38,8 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Test Python sidecar formatting
-        run: python3 -m unittest sidecars/asr/test_main.py
+      - name: Test Python sidecars
+        run: python3 -m unittest sidecars/asr/test_main.py sidecars/diarize/test_main.py
 
       - name: Verify release tag matches package version
         if: startsWith(github.ref, 'refs/tags/')

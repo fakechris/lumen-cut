@@ -1281,6 +1281,89 @@ input::placeholder {
   margin-top: 10px;
 }
 
+.pipeline-resources {
+  color: var(--text-secondary);
+  display: block;
+  font-size: 10px;
+  margin-top: 8px;
+}
+
+.setup-job-progress {
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  margin-top: 14px;
+  padding: 13px 14px;
+}
+
+.setup-job-progress > div {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.setup-job-progress > div span,
+.setup-job-progress small {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.setup-job-progress progress {
+  accent-color: var(--accent);
+  display: block;
+  height: 7px;
+  width: 100%;
+}
+
+.setup-job-progress small {
+  display: block;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+.setup-job-progress button {
+  margin-top: 10px;
+}
+
+.broll-preview-progress {
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  margin-bottom: 18px;
+  padding: 13px 14px;
+}
+
+.broll-preview-progress > div {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.broll-preview-progress > div span {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.broll-preview-progress progress {
+  accent-color: var(--accent);
+  display: block;
+  height: 7px;
+  width: 100%;
+}
+
+.broll-preview-progress small {
+  color: var(--text-secondary);
+  display: block;
+  font-size: 10px;
+  margin-top: 8px;
+}
+
+.broll-preview-progress button {
+  margin-top: 10px;
+}
+
 .media-facts {
   background: var(--surface-subtle);
   border: 1px solid var(--border);
@@ -2100,6 +2183,46 @@ input::placeholder {
   font-size: 11px;
   line-height: 1.55;
   margin: -10px 0 18px;
+}
+
+.speaker-analysis-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.speaker-analysis-progress {
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  margin: -8px 0 18px;
+  padding: 13px 14px;
+}
+
+.speaker-analysis-progress > div {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.speaker-analysis-progress > div span {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.speaker-analysis-progress progress {
+  accent-color: var(--accent);
+  display: block;
+  height: 7px;
+  width: 100%;
+}
+
+.speaker-analysis-progress small {
+  color: var(--text-secondary);
+  display: block;
+  font-size: 10px;
+  margin-top: 8px;
 }
 
 .speaker-readiness {
@@ -2925,6 +3048,29 @@ input::placeholder {
   grid-row: 1 / span 2;
 }
 
+.video-export-mode {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 12px;
+}
+
+.video-export-mode > span {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.video-export-mode select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 10px;
+  max-width: 250px;
+  min-height: 30px;
+}
+
 .export-action {
   align-items: center;
   background: transparent;
@@ -2968,6 +3114,44 @@ input::placeholder {
   gap: 18px;
   grid-column: 2;
   justify-content: space-between;
+}
+
+.video-export-progress {
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  grid-column: 2;
+  padding: 14px;
+}
+
+.video-export-progress > div {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.video-export-progress > div span {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.video-export-progress progress {
+  accent-color: var(--accent);
+  display: block;
+  height: 7px;
+  width: 100%;
+}
+
+.video-export-progress small {
+  color: var(--text-secondary);
+  display: block;
+  font-size: 10px;
+  margin-top: 8px;
+}
+
+.video-export-progress button {
+  margin-top: 10px;
 }
 
 .export-footer > small {
@@ -3839,6 +4023,7 @@ pre.out {
   }
 
   .export-actions,
+  .video-export-progress,
   .export-footer {
     grid-column: 1;
     grid-row: auto;

@@ -2,10 +2,34 @@
 //! before the already-retimed ASS captions are burned in.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::data::broll::{BackgroundMode, BrollPlacement, FitMode, PlacementMode};
 use crate::data::{Cut, Doc};
 use crate::error::{AppError, AppResult};
+use crate::proc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderPurpose {
+    Preview,
+    Final,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoRenderProgress {
+    pub progress: u8,
+    pub current_seconds: f64,
+    pub total_seconds: f64,
+    pub encoder: String,
+}
+
+pub type VideoRenderProgressCallback = Arc<dyn Fn(VideoRenderProgress) + Send + Sync>;
+
+pub struct VideoRenderOptions {
+    pub purpose: RenderPurpose,
+    pub mode: Option<String>,
+    pub on_progress: Option<VideoRenderProgressCallback>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoFilter {
@@ -179,7 +203,7 @@ pub fn build_video_filter_with_broll(
 }
 
 pub async fn render_video(doc: &Doc, cuts: &[Cut], ass: &Path, output: &Path) -> AppResult<()> {
-    render_video_with_broll(doc, cuts, ass, output, &[]).await
+    render_video_with_broll_progress(doc, cuts, ass, output, &[], RenderPurpose::Final, None).await
 }
 
 pub async fn render_video_with_broll(
@@ -189,50 +213,228 @@ pub async fn render_video_with_broll(
     output: &Path,
     placements: &[BrollPlacement],
 ) -> AppResult<()> {
+    render_video_with_broll_progress(
+        doc,
+        cuts,
+        ass,
+        output,
+        placements,
+        RenderPurpose::Final,
+        None,
+    )
+    .await
+}
+
+pub async fn render_video_with_broll_progress(
+    doc: &Doc,
+    cuts: &[Cut],
+    ass: &Path,
+    output: &Path,
+    placements: &[BrollPlacement],
+    purpose: RenderPurpose,
+    on_progress: Option<VideoRenderProgressCallback>,
+) -> AppResult<()> {
+    render_video_with_broll_options(
+        doc,
+        cuts,
+        ass,
+        output,
+        placements,
+        VideoRenderOptions {
+            purpose,
+            mode: None,
+            on_progress,
+        },
+    )
+    .await
+}
+
+pub async fn render_video_with_broll_options(
+    doc: &Doc,
+    cuts: &[Cut],
+    ass: &Path,
+    output: &Path,
+    placements: &[BrollPlacement],
+    options: VideoRenderOptions,
+) -> AppResult<()> {
+    let VideoRenderOptions {
+        purpose,
+        mode,
+        on_progress,
+    } = options;
     for placement in placements {
         if !placement.file.exists() {
             return Err(AppError::ProjectNotFound(placement.file.clone()));
         }
     }
     let filter = build_video_filter_with_broll(doc, cuts, ass, placements)?;
-    let mut command = tokio::process::Command::new("ffmpeg");
-    command
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(&doc.media.path);
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-progress".into(),
+        "pipe:2".into(),
+        "-nostats".into(),
+        "-i".into(),
+        doc.media.path.display().to_string(),
+    ];
     for input in &filter.broll_inputs {
         if is_still_image(input) {
-            command.args(["-loop", "1"]);
+            args.extend(["-loop".into(), "1".into()]);
         } else {
-            command.args(["-stream_loop", "-1"]);
+            args.extend(["-stream_loop".into(), "-1".into()]);
         }
-        command.arg("-i").arg(input);
+        args.extend(["-i".into(), input.display().to_string()]);
     }
-    command
-        .arg("-filter_complex")
-        .arg(&filter.filter_complex)
-        .args(["-map", "[vout]"]);
+    args.extend([
+        "-filter_complex".into(),
+        filter.filter_complex,
+        "-map".into(),
+        "[vout]".into(),
+    ]);
     if let Some(audio_map) = &filter.audio_map {
-        command.args(["-map", audio_map, "-c:a", "aac"]);
+        args.extend([
+            "-map".into(),
+            audio_map.clone(),
+            "-c:a".into(),
+            "aac".into(),
+        ]);
     }
     let output_duration: f64 = super::project::kept_intervals(doc, cuts)
         .iter()
         .map(|(start, end)| end - start)
         .sum();
-    let status = command
-        .args(["-c:v", "libx264", "-movflags", "+faststart"])
-        .arg("-t")
-        .arg(format!("{output_duration:.6}"))
-        .arg(output)
-        .status()
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(format!("ffmpeg: {error}"))))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::Schema(
-            "ffmpeg cut-aware video export failed".into(),
-        ))
+    let encoder = encoder_for_mode(mode.as_deref())?;
+    args.extend(encoder_args(&encoder, purpose));
+    args.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        "-t".into(),
+        format!("{output_duration:.6}"),
+        output.display().to_string(),
+    ]);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some(callback) = &on_progress {
+        callback(VideoRenderProgress {
+            progress: 0,
+            current_seconds: 0.0,
+            total_seconds: output_duration,
+            encoder: encoder.clone(),
+        });
     }
+    let progress_callback = on_progress.clone();
+    let callback_encoder = encoder.clone();
+    let _ = proc::run_with_progress(
+        "ffmpeg",
+        &arg_refs,
+        Arc::new(move |line| {
+            let Some(current_seconds) = ffmpeg_out_time_seconds(&line) else {
+                return;
+            };
+            let progress = if output_duration > 0.0 {
+                ((current_seconds / output_duration) * 100.0)
+                    .floor()
+                    .clamp(0.0, 99.0) as u8
+            } else {
+                0
+            };
+            if let Some(callback) = &progress_callback {
+                callback(VideoRenderProgress {
+                    progress,
+                    current_seconds: current_seconds.min(output_duration),
+                    total_seconds: output_duration,
+                    encoder: callback_encoder.clone(),
+                });
+            }
+        }),
+    )
+    .await?;
+    if let Some(callback) = on_progress {
+        callback(VideoRenderProgress {
+            progress: 100,
+            current_seconds: output_duration,
+            total_seconds: output_duration,
+            encoder,
+        });
+    }
+    Ok(())
+}
+
+fn selected_encoder() -> String {
+    if let Ok(configured) = std::env::var("LUMEN_CUT_VIDEO_ENCODER") {
+        if matches!(configured.as_str(), "libx264" | "h264_videotoolbox") {
+            return configured;
+        }
+    }
+    if cfg!(target_os = "macos") {
+        "h264_videotoolbox".into()
+    } else {
+        "libx264".into()
+    }
+}
+
+pub fn encoder_for_mode(mode: Option<&str>) -> AppResult<String> {
+    match mode.unwrap_or("auto") {
+        "auto" => Ok(selected_encoder()),
+        "quality" => Ok("libx264".into()),
+        "fast" if cfg!(target_os = "macos") => Ok("h264_videotoolbox".into()),
+        "fast" => Ok("libx264".into()),
+        other => Err(AppError::Schema(format!(
+            "unknown video export mode: {other}"
+        ))),
+    }
+}
+
+fn encoder_args(encoder: &str, purpose: RenderPurpose) -> Vec<String> {
+    if encoder == "h264_videotoolbox" {
+        let quality = if purpose == RenderPurpose::Preview {
+            "55"
+        } else {
+            "65"
+        };
+        let mut args = vec![
+            "-c:v".into(),
+            encoder.into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-profile:v".into(),
+            "high".into(),
+            "-q:v".into(),
+            quality.into(),
+        ];
+        if purpose == RenderPurpose::Preview {
+            args.extend([
+                "-realtime".into(),
+                "1".into(),
+                "-prio_speed".into(),
+                "1".into(),
+            ]);
+        }
+        args
+    } else {
+        let (preset, crf) = if purpose == RenderPurpose::Preview {
+            ("veryfast", "23")
+        } else {
+            ("medium", "18")
+        };
+        vec![
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            preset.into(),
+            "-crf".into(),
+            crf.into(),
+        ]
+    }
+}
+
+fn ffmpeg_out_time_seconds(line: &str) -> Option<f64> {
+    line.strip_prefix("out_time_us=")?
+        .parse::<f64>()
+        .ok()
+        .map(|microseconds| microseconds / 1_000_000.0)
 }
 
 fn is_still_image(path: &Path) -> bool {
@@ -440,5 +642,36 @@ mod tests {
         assert!(plan.filter_complex.contains("hypot("));
         assert!(plan.filter_complex.contains("[brround0]"));
         assert!(plan.filter_complex.contains("[vbase][brround0]overlay="));
+    }
+
+    #[test]
+    fn parses_ffmpeg_machine_progress_without_fake_percentages() {
+        assert_eq!(ffmpeg_out_time_seconds("out_time_us=2500000"), Some(2.5));
+        assert_eq!(ffmpeg_out_time_seconds("progress=continue"), None);
+        assert_eq!(ffmpeg_out_time_seconds("out_time_us=N/A"), None);
+    }
+
+    #[test]
+    fn videotoolbox_profiles_separate_preview_speed_from_final_quality() {
+        let preview = encoder_args("h264_videotoolbox", RenderPurpose::Preview);
+        let final_render = encoder_args("h264_videotoolbox", RenderPurpose::Final);
+        assert!(preview.windows(2).any(|pair| pair == ["-realtime", "1"]));
+        assert!(preview.windows(2).any(|pair| pair == ["-q:v", "55"]));
+        assert!(final_render.windows(2).any(|pair| pair == ["-q:v", "65"]));
+        assert!(!final_render
+            .windows(2)
+            .any(|pair| pair == ["-realtime", "1"]));
+    }
+
+    #[test]
+    fn export_mode_makes_the_speed_quality_tradeoff_explicit() {
+        assert_eq!(encoder_for_mode(Some("quality")).unwrap(), "libx264");
+        let fast = encoder_for_mode(Some("fast")).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(fast, "h264_videotoolbox");
+        } else {
+            assert_eq!(fast, "libx264");
+        }
+        assert!(encoder_for_mode(Some("mystery")).is_err());
     }
 }

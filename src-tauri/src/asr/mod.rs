@@ -228,17 +228,12 @@ async fn ensure_managed_runtime(home: &Path, uv: &Path) -> AppResult<PathBuf> {
     tokio::fs::create_dir_all(home.join(".lumen-cut")).await?;
     let python = managed_python(home);
     if !python.is_file() {
-        let output = tokio::process::Command::new(uv)
-            .args(["venv", "--python", "3.12"])
-            .arg(&runtime_dir)
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(AppError::Sidecar {
-                sidecar: "lumen_cut_asr",
-                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
+        let runtime = runtime_dir.display().to_string();
+        proc::run(
+            &uv.to_string_lossy(),
+            &["venv", "--python", "3.12", &runtime],
+        )
+        .await?;
     }
     Ok(python)
 }
@@ -249,24 +244,20 @@ async fn install_packages(
     packages: &[&str],
     sidecar: &'static str,
 ) -> AppResult<()> {
-    let output = tokio::process::Command::new(uv)
-        .arg("pip")
-        .arg("install")
-        .arg("--python")
-        .arg(python)
-        .args(packages)
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(AppError::Sidecar {
+    let python = python.display().to_string();
+    let mut args = vec!["pip", "install", "--python", python.as_str()];
+    args.extend_from_slice(packages);
+    proc::run(&uv.to_string_lossy(), &args)
+        .await
+        .map_err(|error| AppError::Sidecar {
             sidecar,
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
+            message: error.to_string(),
+        })?;
     Ok(())
 }
 
 pub async fn install_asr_runtime() -> AppResult<RuntimeStatus> {
+    let _heavy_work = crate::performance::acquire_heavy("install-asr-runtime").await?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -277,23 +268,17 @@ pub async fn install_asr_runtime() -> AppResult<RuntimeStatus> {
     })?;
     let python = ensure_managed_runtime(&home, &uv).await?;
     install_packages(&uv, &python, &[ASR_PACKAGE], "lumen_cut_asr").await?;
-    let validation = tokio::process::Command::new(&python)
-        .args(["-c", "import mlx_qwen3_asr"])
-        .output()
-        .await?;
-    if !validation.status.success() {
-        return Err(AppError::Sidecar {
+    proc::run(&python.to_string_lossy(), &["-c", "import mlx_qwen3_asr"])
+        .await
+        .map_err(|error| AppError::Sidecar {
             sidecar: "lumen_cut_asr",
-            message: format!(
-                "installed packages could not be imported: {}",
-                String::from_utf8_lossy(&validation.stderr).trim()
-            ),
-        });
-    }
+            message: format!("installed packages could not be imported: {error}"),
+        })?;
     Ok(runtime_status())
 }
 
 pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
+    let _heavy_work = crate::performance::acquire_heavy("install-speaker-runtime").await?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -315,26 +300,23 @@ pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
         "lumen_cut_diarize",
     )
     .await?;
-    let validation = tokio::process::Command::new(&python)
-        .args([
+    proc::run(
+        &python.to_string_lossy(),
+        &[
             "-c",
             "import pyannote.audio, torch, torchaudio, huggingface_hub",
-        ])
-        .output()
-        .await?;
-    if !validation.status.success() {
-        return Err(AppError::Sidecar {
-            sidecar: "lumen_cut_diarize",
-            message: format!(
-                "installed packages could not be imported: {}",
-                String::from_utf8_lossy(&validation.stderr).trim()
-            ),
-        });
-    }
+        ],
+    )
+    .await
+    .map_err(|error| AppError::Sidecar {
+        sidecar: "lumen_cut_diarize",
+        message: format!("installed packages could not be imported: {error}"),
+    })?;
     Ok(runtime_status())
 }
 
 pub async fn download_asr_models() -> AppResult<RuntimeStatus> {
+    let _heavy_work = crate::performance::acquire_heavy("download-asr-models").await?;
     let status = runtime_status();
     let python = status.python_path.ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_asr",
@@ -343,20 +325,13 @@ pub async fn download_asr_models() -> AppResult<RuntimeStatus> {
     let script =
         "from huggingface_hub import snapshot_download; import sys; snapshot_download(sys.argv[1])";
     for model in [&status.model_id, &status.aligner_id] {
-        let mut command = tokio::process::Command::new(&python);
-        command.args(["-c", script, model]);
-        let output = command.output().await?;
-        if !output.status.success() {
-            return Err(AppError::Sidecar {
-                sidecar: "lumen_cut_asr",
-                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
+        proc::run(&python, &["-c", script, model]).await?;
     }
     Ok(runtime_status())
 }
 
 pub async fn download_diarize_model() -> AppResult<RuntimeStatus> {
+    let _heavy_work = crate::performance::acquire_heavy("download-speaker-model").await?;
     let status = runtime_status();
     if status.diarize_model_cached {
         return Ok(status);
@@ -386,16 +361,12 @@ pub async fn download_diarize_model() -> AppResult<RuntimeStatus> {
         })?;
     let diarize_script =
         "from pyannote.audio import Pipeline; import sys; Pipeline.from_pretrained(sys.argv[1])";
-    let mut command = tokio::process::Command::new(&python);
-    command.args(["-c", diarize_script, &status.diarize_model_id]);
-    command.env("HF_TOKEN", token);
-    let output = command.output().await?;
-    if !output.status.success() {
-        return Err(AppError::Sidecar {
-            sidecar: "lumen_cut_diarize",
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
+    proc::run_with_env(
+        &python,
+        &["-c", diarize_script, &status.diarize_model_id],
+        &[("HF_TOKEN", token.as_str())],
+    )
+    .await?;
     Ok(runtime_status())
 }
 
@@ -436,6 +407,20 @@ pub struct AsrProgress {
     pub progress: u8,
     pub current: Option<u32>,
     pub total: Option<u32>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<f64>,
+    #[serde(default)]
+    pub cpu_percent: Option<u32>,
+    #[serde(default)]
+    pub peak_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub mlx_active_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub mlx_cache_memory_mb: Option<u64>,
 }
 
 pub type AsrProgressCallback = Arc<dyn Fn(AsrProgress) + Send + Sync>;
@@ -640,13 +625,20 @@ mod tests {
     #[test]
     fn parses_structured_sidecar_progress_without_accepting_log_noise() {
         let progress = parse_sidecar_progress(
-            r#"LUMEN_CUT_PROGRESS {"phase":"aligning","progress":81,"current":12,"total":20}"#,
+            r#"LUMEN_CUT_PROGRESS {"phase":"aligning","progress":81,"current":12,"total":20,"device":"mlx-metal","elapsed_seconds":18.2,"cpu_percent":74,"peak_memory_mb":2870,"memory_limit_mb":6144,"mlx_active_memory_mb":1900,"mlx_cache_memory_mb":240}"#,
         )
         .unwrap();
         assert_eq!(progress.phase, "aligning");
         assert_eq!(progress.progress, 81);
         assert_eq!(progress.current, Some(12));
         assert_eq!(progress.total, Some(20));
+        assert_eq!(progress.device.as_deref(), Some("mlx-metal"));
+        assert_eq!(progress.elapsed_seconds, Some(18.2));
+        assert_eq!(progress.cpu_percent, Some(74));
+        assert_eq!(progress.peak_memory_mb, Some(2870));
+        assert_eq!(progress.memory_limit_mb, Some(6144));
+        assert_eq!(progress.mlx_active_memory_mb, Some(1900));
+        assert_eq!(progress.mlx_cache_memory_mb, Some(240));
         assert!(parse_sidecar_progress("Fetching model files").is_none());
     }
 

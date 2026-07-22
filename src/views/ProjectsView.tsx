@@ -213,6 +213,7 @@ function recordingClock(elapsedSeconds: number) {
 
 function ingestPhaseLabel(phase: TranscriptionJobStatus["phase"], lang: Lang) {
   const labels: Record<TranscriptionJobStatus["phase"], [string, string]> = {
+    waiting: ["正在等待计算资源", "Waiting for compute capacity"],
     preparing: ["正在准备下载", "Preparing download"],
     downloading: ["正在下载媒体", "Downloading media"],
     extracting: ["正在提取音频", "Extracting audio"],
@@ -761,6 +762,15 @@ export function ProjectsView({
               <span>{urlJob.status.progress}%</span>
             </div>
             <progress max={100} value={urlJob.status.progress} />
+            {urlJob.status.device && (
+              <small className="pipeline-resources">
+                MLX · Metal
+                {urlJob.status.elapsedSeconds !== null ? ` · ${Math.round(urlJob.status.elapsedSeconds)}s` : ""}
+                {urlJob.status.peakMemoryMb !== null
+                  ? ` · ${lang === "zh" ? "峰值内存" : "Peak memory"} ${(urlJob.status.peakMemoryMb / 1024).toFixed(1)} GB`
+                  : ""}
+              </small>
+            )}
             <button
               className="button-quiet"
               disabled={urlJob.status.state === "cancelling"}

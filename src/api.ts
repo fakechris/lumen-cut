@@ -9,6 +9,7 @@ import type {
   BrollPlacement,
   BrollPlacementInput,
   BrollSuggestion,
+  BrollPreviewJobStatus,
   Doc,
   DoctorCheck,
   FinishCheckItem,
@@ -19,7 +20,9 @@ import type {
   RecordingStopped,
   ReportSummary,
   Settings,
+  SetupJobStatus,
   SpeakerEvidence,
+  SpeakerAnalysisJobStatus,
   SpeakerInfo,
   SpeakerReidentifyPreview,
   SpeakerReidentifyProposal,
@@ -28,6 +31,7 @@ import type {
   TaskStatus,
   TranscriptionJobStatus,
   VersionHistory,
+  VideoExportJobStatus,
 } from "./types";
 
 export interface CutSummary {
@@ -262,8 +266,24 @@ export async function diarizeModelDownload(): Promise<AsrStatus> {
   return invoke("diarize_model_download");
 }
 
+export async function setupJobStart(kind: SetupJobStatus["kind"]): Promise<SetupJobStatus> {
+  return invoke("setup_job_start", { kind });
+}
+
+export async function setupJobStatus(): Promise<SetupJobStatus> {
+  return invoke("setup_job_status");
+}
+
+export async function setupJobCancel(): Promise<SetupJobStatus> {
+  return invoke("setup_job_cancel");
+}
+
 export async function runDoctor(): Promise<DoctorCheck[]> {
   return invoke("run_doctor");
+}
+
+export async function revealLogs(): Promise<string> {
+  return invoke("logs_reveal");
 }
 
 export async function speakersList(pid: string): Promise<SpeakerInfo[]> {
@@ -306,6 +326,24 @@ export async function speakerReidentifyPreview(
   pid: string,
 ): Promise<SpeakerReidentifyPreview> {
   return invoke("speaker_reidentify_preview", { pid, root: null });
+}
+
+export async function speakerReidentifyStart(
+  pid: string,
+): Promise<SpeakerAnalysisJobStatus> {
+  return invoke("speaker_reidentify_start", { pid, root: null });
+}
+
+export async function speakerReidentifyStatus(
+  pid: string,
+): Promise<SpeakerAnalysisJobStatus> {
+  return invoke("speaker_reidentify_status", { pid });
+}
+
+export async function speakerReidentifyCancel(
+  pid: string,
+): Promise<SpeakerAnalysisJobStatus> {
+  return invoke("speaker_reidentify_cancel", { pid });
 }
 
 export async function speakerReidentifyApply(
@@ -355,6 +393,18 @@ export async function brollPreview(pid: string): Promise<string[]> {
   return invoke("broll_preview", { pid, at: [], root: null });
 }
 
+export async function brollPreviewStart(pid: string): Promise<BrollPreviewJobStatus> {
+  return invoke("broll_preview_start", { pid });
+}
+
+export async function brollPreviewStatus(pid: string): Promise<BrollPreviewJobStatus> {
+  return invoke("broll_preview_status", { pid });
+}
+
+export async function brollPreviewCancel(pid: string): Promise<BrollPreviewJobStatus> {
+  return invoke("broll_preview_cancel", { pid });
+}
+
 export async function finishCheck(pid: string): Promise<FinishCheckItem[]> {
   return invoke("finish_check_pid", { pid, root: null });
 }
@@ -397,6 +447,21 @@ export async function exportSubtitles(
 
 export async function exportVideo(pid: string): Promise<string> {
   return invoke("export_video", { pid, root: null });
+}
+
+export async function videoExportStart(
+  pid: string,
+  mode: VideoExportJobStatus["mode"],
+): Promise<VideoExportJobStatus> {
+  return invoke("video_export_start", { pid, mode });
+}
+
+export async function videoExportStatus(pid: string): Promise<VideoExportJobStatus> {
+  return invoke("video_export_status", { pid });
+}
+
+export async function videoExportCancel(pid: string): Promise<VideoExportJobStatus> {
+  return invoke("video_export_cancel", { pid });
 }
 
 export async function exportFinalCut(pid: string): Promise<string> {

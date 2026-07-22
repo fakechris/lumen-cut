@@ -5,7 +5,9 @@ import {
   brollAcceptSuggestion,
   brollAdd,
   brollList,
-  brollPreview,
+  brollPreviewCancel,
+  brollPreviewStart,
+  brollPreviewStatus,
   brollRemove,
   brollUpdate,
   branchCreate,
@@ -16,7 +18,6 @@ import {
   cutRestore,
   exportSubtitles,
   exportFinalCut,
-  exportVideo,
   finishCheck,
   mergeSubtitles,
   pickBrollFile,
@@ -27,7 +28,9 @@ import {
   speakerEvidence,
   speakerMerge,
   speakerReidentifyApply,
-  speakerReidentifyPreview,
+  speakerReidentifyCancel,
+  speakerReidentifyStart,
+  speakerReidentifyStatus,
   speakerRename,
   splitSubtitle,
   styleGet,
@@ -44,6 +47,9 @@ import {
   versionCommit,
   versionList,
   versionRestore,
+  videoExportCancel,
+  videoExportStart,
+  videoExportStatus,
 } from "../api";
 import type { CutSummary } from "../api";
 import {
@@ -58,18 +64,21 @@ import type {
   AsrStatus,
   BrollOverview,
   BrollPlacementInput,
+  BrollPreviewJobStatus,
   BrollSuggestion,
   FinishCheckItem,
   SubtitleRow,
   SubtitleStyle,
   ReportSummary,
   SpeakerEvidence,
+  SpeakerAnalysisJobStatus,
   SpeakerReidentifyProposal,
   SpeakerInfo,
   SpeakerReidentifyPreview,
   TaskStatus,
   TranscriptionJobStatus,
   VersionHistory,
+  VideoExportJobStatus,
 } from "../types";
 import { StyleWorkspace } from "./editor/StyleWorkspace";
 import { EnhancementPanel } from "./editor/EnhancementPanel";
@@ -264,6 +273,7 @@ function taskLabel(kind: string, lang: Lang) {
 
 function transcriptionPhaseLabel(phase: TranscriptionJobStatus["phase"], lang: Lang) {
   const labels: Record<TranscriptionJobStatus["phase"], [string, string]> = {
+    waiting: ["正在等待计算资源", "Waiting for compute capacity"],
     preparing: ["正在准备项目", "Preparing the project"],
     downloading: ["正在下载媒体", "Downloading media"],
     extracting: ["正在提取音频", "Extracting audio"],
@@ -306,9 +316,13 @@ export function TranscriptView({
     unlabelled: 0,
   });
   const [speakerPreview, setSpeakerPreview] = useState<SpeakerReidentifyPreview | null>(null);
+  const [speakerAnalysisJob, setSpeakerAnalysisJob] =
+    useState<SpeakerAnalysisJobStatus | null>(null);
   const [transcriptionJob, setTranscriptionJob] =
     useState<TranscriptionJobStatus | null>(null);
   const [transcriptionFailure, setTranscriptionFailure] = useState<string | null>(null);
+  const [videoExportJob, setVideoExportJob] = useState<VideoExportJobStatus | null>(null);
+  const [videoExportMode, setVideoExportMode] = useState<VideoExportJobStatus["mode"]>("fast");
   const [agentConfigured, setAgentConfigured] = useState(false);
   const [asrReadiness, setAsrReadiness] = useState<AsrStatus | null>(null);
   const [versionHistory, setVersionHistory] = useState<VersionHistory | null>(null);
@@ -317,6 +331,8 @@ export function TranscriptView({
     accepted: [],
     errors: [],
   });
+  const [brollPreviewJob, setBrollPreviewJob] = useState<BrollPreviewJobStatus | null>(null);
+  const [brollPreviewPaths, setBrollPreviewPaths] = useState<string[]>([]);
   const previousPending = useRef(0);
 
   const reload = async (projectId: string, resetTab = true) => {
@@ -363,10 +379,14 @@ export function TranscriptView({
     setOperation(null);
     setTranscriptionJob(null);
     setTranscriptionFailure(null);
+    setVideoExportJob(null);
     setVersionHistory(null);
     setSpeakerEvidenceState({ speakers: [], turns: [], identified: false, unlabelled: 0 });
     setSpeakerPreview(null);
+    setSpeakerAnalysisJob(null);
     setBrollOverview({ suggestions: [], accepted: [], errors: [] });
+    setBrollPreviewJob(null);
+    setBrollPreviewPaths([]);
     if (!pid) return;
     void Promise.all([
       reload(pid),
@@ -387,6 +407,41 @@ export function TranscriptView({
             const failure = friendlyError(status.error || "Transcription failed", lang);
             setTranscriptionFailure(failure);
             setFeedback({ tone: "error", text: failure });
+          }
+        })
+        .catch(() => undefined),
+      speakerReidentifyStatus(pid)
+        .then((status) => {
+          if (status.state === "running" || status.state === "cancelling") {
+            setSpeakerAnalysisJob(status);
+            setOperation("speakers-preview");
+          } else if (status.state === "failed") {
+            setFeedback({
+              tone: "error",
+              text: friendlyError(status.error || "Speaker analysis failed", lang),
+            });
+          }
+        })
+        .catch(() => undefined),
+      videoExportStatus(pid)
+        .then((status) => {
+          if (status.state === "running" || status.state === "cancelling") {
+            setVideoExportJob(status);
+          } else if (status.state === "failed") {
+            setFeedback({
+              tone: "error",
+              text: friendlyError(status.error || "Video export failed", lang),
+            });
+          }
+        })
+        .catch(() => undefined),
+      brollPreviewStatus(pid)
+        .then((status) => {
+          if (status.state === "running" || status.state === "cancelling") {
+            setBrollPreviewJob(status);
+          } else if (status.state === "completed") {
+            setBrollPreviewJob(status);
+            setBrollPreviewPaths(status.paths);
           }
         })
         .catch(() => undefined),
@@ -471,6 +526,172 @@ export function TranscriptView({
   }, [pid, transcriptionJob?.state, lang]);
 
   useEffect(() => {
+    if (
+      !pid ||
+      !videoExportJob ||
+      !["running", "cancelling"].includes(videoExportJob.state)
+    ) {
+      return;
+    }
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const status = await videoExportStatus(pid);
+        if (disposed) return;
+        if (status.state === "completed") {
+          setVideoExportJob(status);
+          setFeedback({
+            tone: "success",
+            text: lang === "zh"
+              ? `视频已导出：${status.path}`
+              : `Video exported: ${status.path}`,
+          });
+          return;
+        }
+        if (status.state === "cancelled") {
+          setVideoExportJob(status);
+          setFeedback({
+            tone: "info",
+            text: lang === "zh" ? "视频导出已取消，原有导出文件未被覆盖。" : "Video export cancelled; the previous export was preserved.",
+          });
+          return;
+        }
+        if (status.state === "failed") {
+          setVideoExportJob(status);
+          setFeedback({
+            tone: "error",
+            text: friendlyError(status.error || "Video export failed", lang),
+          });
+          return;
+        }
+        setVideoExportJob(status);
+        timer = window.setTimeout(poll, 500);
+      } catch (error) {
+        if (disposed) return;
+        setFeedback({ tone: "error", text: friendlyError(error, lang) });
+        setVideoExportJob(null);
+      }
+    };
+    timer = window.setTimeout(poll, 350);
+    return () => {
+      disposed = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [pid, videoExportJob?.state, lang]);
+
+  useEffect(() => {
+    if (
+      !pid ||
+      !brollPreviewJob ||
+      !["running", "cancelling"].includes(brollPreviewJob.state)
+    ) {
+      return;
+    }
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const status = await brollPreviewStatus(pid);
+        if (disposed) return;
+        if (status.state === "completed") {
+          setBrollPreviewJob(status);
+          setBrollPreviewPaths(status.paths);
+          setFeedback({
+            tone: "success",
+            text: lang === "zh" ? "B-roll 画面预览已生成。" : "B-roll frame previews are ready.",
+          });
+          return;
+        }
+        if (status.state === "cancelled") {
+          setBrollPreviewJob(status);
+          setFeedback({ tone: "info", text: lang === "zh" ? "B-roll 预览已取消。" : "B-roll preview cancelled." });
+          return;
+        }
+        if (status.state === "failed") {
+          setBrollPreviewJob(status);
+          setFeedback({ tone: "error", text: friendlyError(status.error || "B-roll preview failed", lang) });
+          return;
+        }
+        setBrollPreviewJob(status);
+        timer = window.setTimeout(poll, 500);
+      } catch (error) {
+        if (!disposed) {
+          setFeedback({ tone: "error", text: friendlyError(error, lang) });
+          setBrollPreviewJob(null);
+        }
+      }
+    };
+    timer = window.setTimeout(poll, 350);
+    return () => {
+      disposed = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [pid, brollPreviewJob?.state, lang]);
+
+  useEffect(() => {
+    if (
+      !pid ||
+      !speakerAnalysisJob ||
+      !["running", "cancelling"].includes(speakerAnalysisJob.state)
+    ) {
+      return;
+    }
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const status = await speakerReidentifyStatus(pid);
+        if (disposed) return;
+        if (status.state === "completed") {
+          if (!status.preview) throw new Error("Speaker analysis completed without a preview");
+          setSpeakerPreview(status.preview);
+          setActiveTab("properties");
+          setFeedback({
+            tone: "info",
+            text: lang === "zh"
+              ? `分析完成：${status.preview.changed} 个段落标签可能改变。项目尚未被修改。`
+              : `Analysis complete: ${status.preview.changed} paragraph labels may change. The project is unchanged.`,
+          });
+          setOperation(null);
+          setSpeakerAnalysisJob(null);
+          return;
+        }
+        if (status.state === "cancelled") {
+          setFeedback({
+            tone: "info",
+            text: lang === "zh" ? "说话人分析已取消，项目没有被修改。" : "Speaker analysis was cancelled. The project was not changed.",
+          });
+          setOperation(null);
+          setSpeakerAnalysisJob(null);
+          return;
+        }
+        if (status.state === "failed") {
+          setFeedback({
+            tone: "error",
+            text: friendlyError(status.error || "Speaker analysis failed", lang),
+          });
+          setOperation(null);
+          setSpeakerAnalysisJob(null);
+          return;
+        }
+        setSpeakerAnalysisJob(status);
+        timer = window.setTimeout(poll, 500);
+      } catch (error) {
+        if (disposed) return;
+        setFeedback({ tone: "error", text: friendlyError(error, lang) });
+        setOperation(null);
+        setSpeakerAnalysisJob(null);
+      }
+    };
+    timer = window.setTimeout(poll, 350);
+    return () => {
+      disposed = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [pid, speakerAnalysisJob?.state, lang]);
+
+  useEffect(() => {
     const pending = taskState?.pending ?? 0;
     if (pid && previousPending.current > 0 && pending === 0) {
       void reload(pid, false);
@@ -505,6 +726,8 @@ export function TranscriptView({
   const failedFinishItems = finishItems?.filter((item) => !item.pass) ?? [];
   const exportReady = finishItems !== null && failedFinishItems.length === 0;
   const exportAllowed = exportReady || allowDraftExport;
+  const isVideoExporting = videoExportJob !== null
+    && ["running", "cancelling"].includes(videoExportJob.state);
   const failedTasks = taskState?.kinds.reduce((sum, task) => sum + task.failed, 0) ?? 0;
   const wordsByCue: Record<string, string[]> = {};
   const nextCueById: Record<string, string> = {};
@@ -697,17 +920,25 @@ export function TranscriptView({
   };
 
   const previewSpeakers = async () => {
-    await performRecoverable("speakers-preview", async () => {
-      const preview = await speakerReidentifyPreview(pid);
-      setSpeakerPreview(preview);
-      setActiveTab("properties");
-      setFeedback({
-        tone: "info",
-        text: lang === "zh"
-          ? `分析完成：${preview.changed} 个段落标签可能改变。项目尚未被修改。`
-          : `Analysis complete: ${preview.changed} paragraph labels may change. The project is unchanged.`,
-      });
-    });
+    setOperation("speakers-preview");
+    setFeedback(null);
+    setSpeakerPreview(null);
+    setActiveTab("properties");
+    try {
+      setSpeakerAnalysisJob(await speakerReidentifyStart(pid));
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+      setOperation(null);
+      throw error;
+    }
+  };
+
+  const cancelSpeakerAnalysis = async () => {
+    try {
+      setSpeakerAnalysisJob(await speakerReidentifyCancel(pid));
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+    }
   };
 
   const applySpeakerPreview = async (proposals: SpeakerReidentifyProposal[]) => {
@@ -861,7 +1092,24 @@ export function TranscriptView({
     });
   };
 
-  const previewBroll = () => performRecoverable("broll-preview", () => brollPreview(pid));
+  const previewBroll = async () => {
+    try {
+      setFeedback(null);
+      setBrollPreviewPaths([]);
+      setBrollPreviewJob(await brollPreviewStart(pid));
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+      throw error;
+    }
+  };
+
+  const cancelBrollPreview = async () => {
+    try {
+      setBrollPreviewJob(await brollPreviewCancel(pid));
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+    }
+  };
 
   const renameSpeaker = async (from: string, to: string) => {
     setOperation(`speaker-rename-${from}`);
@@ -949,14 +1197,22 @@ export function TranscriptView({
       });
     });
 
-  const runVideoExport = () =>
-    perform("export-video", async () => {
-      const path = await exportVideo(pid);
-      setFeedback({
-        tone: "success",
-        text: lang === "zh" ? `视频已导出：${path}` : `Video exported: ${path}`,
-      });
-    });
+  const runVideoExport = async () => {
+    try {
+      setFeedback(null);
+      setVideoExportJob(await videoExportStart(pid, videoExportMode));
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+    }
+  };
+
+  const cancelVideoExport = async () => {
+    try {
+      setVideoExportJob(await videoExportCancel(pid));
+    } catch (error) {
+      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+    }
+  };
 
   const runFinalCutExport = () =>
     perform("export-fcp", async () => {
@@ -1099,6 +1355,22 @@ export function TranscriptView({
                   <span>{transcriptionJob.progress}%</span>
                 </div>
                 <progress max={100} value={transcriptionJob.progress} />
+                {transcriptionJob.device && (
+                  <small className="pipeline-resources">
+                    MLX · Metal
+                    {transcriptionJob.elapsedSeconds !== null ? ` · ${Math.round(transcriptionJob.elapsedSeconds)}s` : ""}
+                    {transcriptionJob.cpuPercent !== null ? ` · CPU ${transcriptionJob.cpuPercent}%` : ""}
+                    {transcriptionJob.peakMemoryMb !== null
+                      ? ` · ${lang === "zh" ? "峰值内存" : "Peak memory"} ${(transcriptionJob.peakMemoryMb / 1024).toFixed(1)} GB`
+                      : ""}
+                    {transcriptionJob.memoryLimitMb !== null
+                      ? ` / ${(transcriptionJob.memoryLimitMb / 1024).toFixed(1)} GB`
+                      : ""}
+                    {transcriptionJob.current !== null && transcriptionJob.total !== null
+                      ? ` · ${transcriptionJob.current}/${transcriptionJob.total}`
+                      : ""}
+                  </small>
+                )}
                 <button
                   className="button-quiet"
                   disabled={transcriptionJob.state === "cancelling"}
@@ -1194,6 +1466,7 @@ export function TranscriptView({
 
       {activeTab === "properties" && (
         <PropertiesWorkspace
+          analysis={speakerAnalysisJob}
           busy={operation !== null}
           diarizeReady={asrReadiness?.diarizeReady ?? false}
           doc={doc}
@@ -1203,6 +1476,7 @@ export function TranscriptView({
           speakers={speakers}
           onApplyPreview={applySpeakerPreview}
           onAssign={assignSpeaker}
+          onCancelAnalysis={cancelSpeakerAnalysis}
           onMerge={mergeSpeaker}
           onOpenSettings={onOpenSettings}
           onPreview={previewSpeakers}
@@ -1239,8 +1513,11 @@ export function TranscriptView({
           doc={doc}
           lang={lang}
           overview={brollOverview}
+          previewJob={brollPreviewJob}
+          previewPaths={brollPreviewPaths}
           onAcceptSuggestion={acceptBrollSuggestion}
           onAdd={addBroll}
+          onCancelPreview={cancelBrollPreview}
           onPickFile={pickBrollAsset}
           onPreview={previewBroll}
           onRefresh={() => performRecoverable("broll-load", refreshBroll)}
@@ -1390,6 +1667,21 @@ export function TranscriptView({
             )}
           </section>
           <div className="export-actions">
+            <label className="video-export-mode">
+              <span>{lang === "zh" ? "视频编码模式" : "Video encoding mode"}</span>
+              <select
+                disabled={isVideoExporting || operation !== null}
+                value={videoExportMode}
+                onChange={(event) => setVideoExportMode(event.target.value as VideoExportJobStatus["mode"])}
+              >
+                <option value="fast">
+                  {lang === "zh" ? "硬件低负载 · 低 CPU / 较大文件" : "Hardware low-load · low CPU / larger file"}
+                </option>
+                <option value="quality">
+                  {lang === "zh" ? "高压缩质量 · 高 CPU / 较小文件" : "Compression quality · high CPU / smaller file"}
+                </option>
+              </select>
+            </label>
             <button
               className="export-action"
               disabled={operation !== null || !exportAllowed}
@@ -1403,13 +1695,17 @@ export function TranscriptView({
             </button>
             <button
               className="export-action"
-              disabled={operation !== null || !exportAllowed}
+              disabled={operation !== null || !exportAllowed || isVideoExporting}
               onClick={runVideoExport}
             >
-              {operation === "export-video" ? <span className="spinner" /> : <PlayIcon />}
+              {isVideoExporting ? <span className="spinner" /> : <PlayIcon />}
               <span>
                 <strong>{c.exportVideo}</strong>
-                <small>MP4 · burn-in subtitles · B-roll</small>
+                <small>
+                  {videoExportMode === "fast"
+                    ? "MP4 · VideoToolbox · low CPU"
+                    : "MP4 · libx264 · smaller file"}
+                </small>
               </span>
             </button>
             <button
@@ -1424,6 +1720,46 @@ export function TranscriptView({
               </span>
             </button>
           </div>
+          {videoExportJob && isVideoExporting && (
+            <div className="video-export-progress" role="status" aria-live="polite">
+              <div>
+                <strong>
+                  {videoExportJob.phase === "preparing"
+                    ? lang === "zh" ? "正在准备视频导出" : "Preparing video export"
+                    : videoExportJob.phase === "waiting"
+                      ? lang === "zh" ? "正在等待计算资源" : "Waiting for compute capacity"
+                    : videoExportJob.state === "cancelling"
+                      ? lang === "zh" ? "正在停止导出" : "Stopping export"
+                      : lang === "zh" ? "正在硬件编码" : "Hardware encoding"}
+                </strong>
+                <span>{videoExportJob.progress}%</span>
+              </div>
+              <progress
+                aria-label={lang === "zh" ? "视频导出进度" : "Video export progress"}
+                max={100}
+                value={videoExportJob.progress}
+              />
+              <small>
+                {videoExportJob.encoder === "h264_videotoolbox"
+                  ? "VideoToolbox · Apple Media Engine"
+                  : videoExportJob.encoder === "libx264"
+                    ? "libx264 · CPU"
+                    : lang === "zh" ? "正在选择编码后端…" : "Selecting encoder…"}
+                {videoExportJob.currentSeconds !== null && videoExportJob.totalSeconds !== null
+                  ? ` · ${Math.round(videoExportJob.currentSeconds)}s / ${Math.round(videoExportJob.totalSeconds)}s`
+                  : ""}
+              </small>
+              <button
+                className="button-quiet"
+                disabled={videoExportJob.state === "cancelling"}
+                onClick={() => void cancelVideoExport()}
+              >
+                {videoExportJob.state === "cancelling"
+                  ? lang === "zh" ? "正在停止…" : "Stopping…"
+                  : lang === "zh" ? "取消导出" : "Cancel export"}
+              </button>
+            </div>
+          )}
           <div className="export-footer">
             <small>{c.videoExportHint}</small>
             <button

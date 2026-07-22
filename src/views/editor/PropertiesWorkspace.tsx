@@ -4,6 +4,7 @@ import { allowProjectMedia } from "../../api";
 import type { Lang } from "../../i18n";
 import type {
   Doc,
+  SpeakerAnalysisJobStatus,
   SpeakerEvidence,
   SpeakerInfo,
   SpeakerReidentifyPreview,
@@ -11,6 +12,7 @@ import type {
 } from "../../types";
 
 interface Props {
+  analysis: SpeakerAnalysisJobStatus | null;
   busy: boolean;
   diarizeReady: boolean;
   doc: Doc;
@@ -20,6 +22,7 @@ interface Props {
   speakers: SpeakerInfo[];
   onApplyPreview: (proposals: SpeakerReidentifyProposal[]) => Promise<void>;
   onAssign: (paragraphId: number, speaker: string | null) => Promise<void>;
+  onCancelAnalysis: () => Promise<void>;
   onMerge: (from: string, into: string) => Promise<void>;
   onOpenSettings: () => void;
   onPreview: () => Promise<void>;
@@ -42,6 +45,7 @@ const LANGUAGE_OPTIONS = [
 ] as const;
 
 export function PropertiesWorkspace({
+  analysis,
   busy,
   diarizeReady,
   doc,
@@ -51,6 +55,7 @@ export function PropertiesWorkspace({
   speakers,
   onApplyPreview,
   onAssign,
+  onCancelAnalysis,
   onMerge,
   onOpenSettings,
   onPreview,
@@ -143,6 +148,23 @@ export function PropertiesWorkspace({
         || (turn.speaker || "").toLowerCase().includes(query));
   }, [evidence.turns, turnQuery]);
   const visibleTurns = filteredTurns.slice(0, turnLimit);
+  const isAnalyzing = analysis !== null
+    && (analysis.state === "running" || analysis.state === "cancelling");
+  const analysisPhase = analysis
+      ? ({
+        waiting: ["正在等待计算资源", "Waiting for compute capacity"],
+        preparing: ["正在准备音频", "Preparing audio"],
+        loading: ["正在加载说话人模型", "Loading speaker model"],
+        segmenting: ["正在检测语音活动", "Detecting speech activity"],
+        counting: ["正在估算说话人数", "Estimating speaker count"],
+        embedding: ["正在提取声纹特征", "Extracting voice features"],
+        finalizing: ["正在聚类并生成提案", "Clustering and preparing proposals"],
+        completed: ["分析完成", "Analysis complete"],
+        cancelling: ["正在安全停止", "Stopping safely"],
+        cancelled: ["已取消", "Cancelled"],
+        failed: ["分析失败", "Analysis failed"],
+      } satisfies Record<SpeakerAnalysisJobStatus["phase"], [string, string]>)[analysis.phase][lang === "zh" ? 0 : 1]
+    : null;
 
   const saveMeta = async () => {
     if (!title.trim() || !metaDirty) return;
@@ -275,28 +297,82 @@ export function PropertiesWorkspace({
           <div>
             <p className="eyebrow">{lang === "zh" ? "说话人" : "Speakers"}</p>
             <h2>
-              {speakers.length} {lang === "zh" ? "位说话人" : speakers.length === 1 ? "speaker" : "speakers"}
+              {isAnalyzing
+                ? lang === "zh" ? "正在识别说话人" : "Identifying speakers"
+                : <>{speakers.length} {lang === "zh" ? "位说话人" : speakers.length === 1 ? "speaker" : "speakers"}</>}
             </h2>
           </div>
-          <button
-            className={speakers.length ? "button-quiet" : "button-primary"}
-            disabled={busy || working !== null || doc.paragraphs.length === 0 || !diarizeReady}
-            onClick={async () => {
-              setWorking("preview");
-              try {
-                await onPreview();
-              } finally {
-                setWorking(null);
-              }
-            }}
-          >
-            {working === "preview"
-              ? lang === "zh" ? "正在分析，不会覆盖现有标签…" : "Analyzing without changing labels…"
-              : speakers.length
-                ? lang === "zh" ? "预览重新识别" : "Preview identification"
-                : lang === "zh" ? "分析说话人" : "Analyze speakers"}
-          </button>
+          <div className="speaker-analysis-actions">
+            <button
+              className={speakers.length ? "button-quiet" : "button-primary"}
+              disabled={busy || working !== null || doc.paragraphs.length === 0 || !diarizeReady}
+              onClick={async () => {
+                setWorking("preview");
+                try {
+                  await onPreview();
+                } finally {
+                  setWorking(null);
+                }
+              }}
+            >
+              {isAnalyzing
+                ? `${analysisPhase} ${analysis?.progress ?? 0}%`
+                : working === "preview"
+                  ? lang === "zh" ? "正在启动分析…" : "Starting analysis…"
+                  : speakers.length
+                    ? lang === "zh" ? "预览重新识别" : "Preview identification"
+                    : lang === "zh" ? "分析说话人" : "Analyze speakers"}
+            </button>
+            {isAnalyzing && (
+              <button
+                className="button-quiet"
+                disabled={analysis?.state === "cancelling"}
+                onClick={() => void onCancelAnalysis()}
+              >
+                {analysis?.state === "cancelling"
+                  ? lang === "zh" ? "正在停止…" : "Stopping…"
+                  : lang === "zh" ? "取消分析" : "Cancel analysis"}
+              </button>
+            )}
+          </div>
         </header>
+
+        {isAnalyzing && analysis && (
+          <div className="speaker-analysis-progress" role="status" aria-live="polite">
+            <div>
+              <strong>{analysisPhase}</strong>
+              <span>{analysis.progress}%</span>
+            </div>
+            <progress
+              aria-label={lang === "zh" ? "说话人分析进度" : "Speaker analysis progress"}
+              max={100}
+              value={analysis.progress}
+            />
+            <small>
+              {analysis.current !== null && analysis.total !== null
+                ? lang === "zh"
+                  ? `处理批次 ${analysis.current} / ${analysis.total}`
+                  : `Batch ${analysis.current} of ${analysis.total}`
+                : lang === "zh"
+                  ? "正在初始化当前阶段…"
+                  : "Initializing this stage…"}
+              {lang === "zh" ? " · 现有标签不会被覆盖" : " · Existing labels will not be changed"}
+            </small>
+            {analysis.device && (
+              <small className="speaker-analysis-resources">
+                {analysis.device === "mps" ? "Metal (MPS)" : "CPU"}
+                {analysis.elapsedSeconds !== null ? ` · ${Math.round(analysis.elapsedSeconds)}s` : ""}
+                {analysis.cpuPercent !== null ? ` · CPU ${analysis.cpuPercent}%` : ""}
+                {analysis.peakMemoryMb !== null
+                  ? ` · ${lang === "zh" ? "内存" : "Memory"} ${(analysis.peakMemoryMb / 1024).toFixed(1)} GB`
+                  : ""}
+                {analysis.memoryLimitMb !== null
+                  ? ` / ${(analysis.memoryLimitMb / 1024).toFixed(1)} GB`
+                  : ""}
+              </small>
+            )}
+          </div>
+        )}
 
         <p className="speaker-safety-note">
           {lang === "zh"

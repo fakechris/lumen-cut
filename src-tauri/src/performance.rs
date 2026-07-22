@@ -1,0 +1,103 @@
+//! Global admission control for memory/compute-heavy pipelines.
+//!
+//! Apple unified memory is shared by CPU and GPU. Running ASR, diarization,
+//! and video rendering together can therefore make every job slower and can
+//! destabilize the desktop. Keep one heavy job active while lightweight UI,
+//! file, and network work remains concurrent.
+
+use std::sync::{Arc, Mutex, OnceLock};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::error::{AppError, AppResult};
+
+#[derive(Clone)]
+pub struct HeavyWorkGate {
+    permits: Arc<Semaphore>,
+    active: Arc<Mutex<Option<String>>>,
+}
+
+pub struct HeavyWorkPermit {
+    _permit: OwnedSemaphorePermit,
+    active: Arc<Mutex<Option<String>>>,
+}
+
+impl Drop for HeavyWorkPermit {
+    fn drop(&mut self) {
+        *self.active.lock().expect("heavy work gate poisoned") = None;
+    }
+}
+
+impl HeavyWorkGate {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn active_label(&self) -> Option<String> {
+        self.active
+            .lock()
+            .expect("heavy work gate poisoned")
+            .clone()
+    }
+
+    pub async fn acquire(&self, label: &str) -> AppResult<HeavyWorkPermit> {
+        let permit = loop {
+            tokio::select! {
+                permit = self.permits.clone().acquire_owned() => {
+                    break permit.map_err(|_| AppError::Schema("heavy work gate closed".into()))?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    if crate::proc::cancellation_requested() {
+                        return Err(AppError::Cancelled);
+                    }
+                }
+            }
+        };
+        *self.active.lock().expect("heavy work gate poisoned") = Some(label.to_string());
+        Ok(HeavyWorkPermit {
+            _permit: permit,
+            active: self.active.clone(),
+        })
+    }
+}
+
+fn global_gate() -> &'static HeavyWorkGate {
+    static GATE: OnceLock<HeavyWorkGate> = OnceLock::new();
+    GATE.get_or_init(|| HeavyWorkGate::new(1))
+}
+
+pub async fn acquire_heavy(label: &str) -> AppResult<HeavyWorkPermit> {
+    global_gate().acquire(label).await
+}
+
+pub fn active_heavy_label() -> Option<String> {
+    global_gate().active_label()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn heavy_work_is_serialized_across_pipeline_kinds() {
+        let gate = HeavyWorkGate::new(1);
+        let first = gate.acquire("transcription").await.unwrap();
+        let waiting = gate.acquire("video-export");
+        tokio::pin!(waiting);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
+                .await
+                .is_ok()
+        );
+    }
+}

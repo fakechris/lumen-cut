@@ -56,6 +56,50 @@ let speakerEvidenceState: {
   identified: boolean;
   unlabelled: number;
 };
+let speakerAnalysisStatusState: {
+  pid: string;
+  state: string;
+  phase: string;
+  progress: number;
+  current: number | null;
+  total: number | null;
+  error: string | null;
+  preview: Record<string, unknown> | null;
+};
+let speakerAnalysisStartState: typeof speakerAnalysisStatusState;
+let speakerAnalysisHasExistingJob: boolean;
+let videoExportHasExistingJob: boolean;
+let videoExportStatusState: {
+  pid: string;
+  mode: string;
+  state: string;
+  phase: string;
+  progress: number;
+  currentSeconds: number | null;
+  totalSeconds: number | null;
+  encoder: string | null;
+  error: string | null;
+  path: string | null;
+};
+let setupJobHasExistingJob: boolean;
+let setupJobStatusState: {
+  kind: string;
+  state: string;
+  phase: string;
+  error: string | null;
+};
+let brollPreviewHasExistingJob: boolean;
+let brollPreviewStatusState: {
+  pid: string;
+  state: string;
+  phase: string;
+  progress: number;
+  current: number | null;
+  total: number | null;
+  encoder: string | null;
+  error: string | null;
+  paths: string[];
+};
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `asset://${path}`,
@@ -90,6 +134,74 @@ beforeEach(() => {
   brollOverview = { suggestions: [], accepted: [], errors: [] };
   brollListError = null;
   speakerEvidenceState = { speakers: [], turns: [], identified: false, unlabelled: 0 };
+  speakerAnalysisStatusState = {
+    pid: "project-1",
+    state: "completed",
+    phase: "completed",
+    progress: 100,
+    current: null,
+    total: null,
+    error: null,
+    preview: {
+      segments: 3,
+      changed: 1,
+      unassigned: 0,
+      proposals: [{
+        paragraphId: 1,
+        current: "Alice",
+        cluster: "SPEAKER_00",
+        proposed: "SPEAKER_00",
+        start: 0,
+        end: 1,
+        text: "Hello world",
+        coverage: 0.94,
+        margin: 0.88,
+      }],
+    },
+  };
+  speakerAnalysisStartState = {
+    pid: "project-1",
+    state: "running",
+    phase: "preparing",
+    progress: 0,
+    current: null,
+    total: null,
+    error: null,
+    preview: null,
+  };
+  speakerAnalysisHasExistingJob = false;
+  videoExportHasExistingJob = false;
+  videoExportStatusState = {
+    pid: "project-1",
+    mode: "fast",
+    state: "running",
+    phase: "encoding",
+    progress: 47,
+    currentSeconds: 14.2,
+    totalSeconds: 30,
+    encoder: "h264_videotoolbox",
+    error: null,
+    path: null,
+  };
+  setupJobHasExistingJob = false;
+  setupJobStatusState = {
+    kind: "asr-runtime",
+    state: "running",
+    phase: "installing",
+    error: null,
+  };
+  brollPreviewHasExistingJob = false;
+  brollPreviewStatusState = {
+    pid: "project-1",
+    state: "running",
+    phase: "encoding",
+    progress: 67,
+    current: 12,
+    total: 30,
+    encoder: "h264_videotoolbox",
+    error: null,
+    paths: [],
+  };
   invoke.mockReset();
   projectDoc = structuredClone(serializedProject);
   invoke.mockImplementation(async (command) => {
@@ -172,6 +284,14 @@ beforeEach(() => {
             margin: 0.88,
           }],
         };
+      case "speaker_reidentify_start":
+        speakerAnalysisHasExistingJob = true;
+        return speakerAnalysisStartState;
+      case "speaker_reidentify_status":
+        if (!speakerAnalysisHasExistingJob) throw new Error("no speaker analysis job");
+        return speakerAnalysisStatusState;
+      case "speaker_reidentify_cancel":
+        return { ...speakerAnalysisStatusState, state: "cancelling", phase: "cancelling" };
       case "speaker_reidentify_apply":
         return 1;
       case "speaker_assign":
@@ -182,6 +302,22 @@ beforeEach(() => {
         return ["/projects/project-1/export.srt"];
       case "export_video":
         return "/projects/project-1/export.mp4";
+      case "video_export_start":
+        videoExportHasExistingJob = true;
+        return videoExportStatusState;
+      case "video_export_status":
+        if (!videoExportHasExistingJob) throw new Error("no video export job");
+        return videoExportStatusState;
+      case "video_export_cancel":
+        return { ...videoExportStatusState, state: "cancelling", phase: "cancelling" };
+      case "setup_job_start":
+        setupJobHasExistingJob = true;
+        return setupJobStatusState;
+      case "setup_job_status":
+        if (!setupJobHasExistingJob) throw new Error("no setup job");
+        return setupJobStatusState;
+      case "setup_job_cancel":
+        return { ...setupJobStatusState, state: "cancelling", phase: "cancelling" };
       case "export_fcp":
         return "/projects/project-1/export.fcpxml";
       case "project_reveal":
@@ -230,6 +366,14 @@ beforeEach(() => {
         brollOverview = { ...brollOverview, accepted: [placement] };
         return placement;
       }
+      case "broll_preview_start":
+        brollPreviewHasExistingJob = true;
+        return brollPreviewStatusState;
+      case "broll_preview_status":
+        if (!brollPreviewHasExistingJob) throw new Error("no B-roll preview job");
+        return brollPreviewStatusState;
+      case "broll_preview_cancel":
+        return { ...brollPreviewStatusState, state: "cancelling", phase: "cancelling" };
       case "version_commit":
         if (versionCommitError) throw versionCommitError;
         return "v0";
@@ -373,9 +517,12 @@ test("speaker re-identification is previewed before it can change labels", async
 
   expect(await screen.findByText("1 个段落标签将改变")).toBeVisible();
   expect(screen.getByText("Alice → SPEAKER_00")).toBeVisible();
-  expect(invoke).toHaveBeenCalledWith("speaker_reidentify_preview", {
+  expect(invoke).toHaveBeenCalledWith("speaker_reidentify_start", {
     pid: "project-1",
     root: null,
+  });
+  expect(invoke).toHaveBeenCalledWith("speaker_reidentify_status", {
+    pid: "project-1",
   });
   expect(invoke).not.toHaveBeenCalledWith("speaker_reidentify_apply", expect.anything());
   expect(screen.getByRole("button", { name: "请先勾选" })).toBeDisabled();
@@ -389,6 +536,45 @@ test("speaker re-identification is previewed before it can change labels", async
   }));
 });
 
+test("speaker analysis exposes its current phase and real progress", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: null,
+      sentences: [{
+        id: "s1",
+        text: "Hello world",
+        words: [
+          { id: "w1", text: "Hello", start: 0, end: 0.5 },
+          { id: "w2", text: "world", start: 0.5, end: 1 },
+        ],
+      }],
+    }],
+  };
+  speakerAnalysisStatusState = {
+    pid: "project-1",
+    state: "running",
+    phase: "embedding",
+    progress: 81,
+    current: 3,
+    total: 5,
+    error: null,
+    preview: null,
+  };
+  speakerAnalysisStartState = speakerAnalysisStatusState;
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "属性" }));
+  fireEvent.click(screen.getByRole("button", { name: "分析说话人" }));
+
+  expect(await screen.findByText("正在提取声纹特征")).toBeVisible();
+  expect(screen.getByText("81%")).toBeVisible();
+  expect(screen.getByRole("progressbar", { name: "说话人分析进度" })).toHaveValue(81);
+  expect(screen.getByText(/处理批次 3 \/ 5/)).toBeVisible();
+});
+
 test("setup blocks transcription until the local runtime and models are ready", async () => {
   asrReady = false;
   render(<App />);
@@ -399,6 +585,21 @@ test("setup blocks transcription until the local runtime and models are ready", 
 
   expect(await screen.findAllByText(/本地转写尚未准备好/)).not.toHaveLength(0);
   expect(invoke).not.toHaveBeenCalledWith("transcription_start", expect.anything());
+});
+
+test("runtime setup runs as a cancellable background job with explicit indeterminate progress", async () => {
+  asrReady = false;
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+  fireEvent.click(await screen.findByRole("button", { name: "安装或修复转写引擎" }));
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("setup_job_start", {
+    kind: "asr-runtime",
+  }));
+  expect(screen.getByRole("progressbar", { name: "环境准备进度" })).not.toHaveAttribute("value");
+  expect(screen.getByText(/没有提供可信的总字节数/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("setup_job_cancel"));
 });
 
 test("a long transcription reports the word-alignment phase instead of looking stuck", async () => {
@@ -471,6 +672,40 @@ test("export requires a delivery check and exposes Final Cut output", async () =
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("export_fcp", {
     pid: "project-1",
     root: null,
+  }));
+});
+
+test("video export reports hardware backend, real progress, and cancellation", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Ready to export",
+        words: [{ id: "w1", text: "Ready", start: 0, end: 1 }],
+      }],
+    }],
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "导出" }));
+  fireEvent.click(screen.getByRole("button", { name: "开始检查" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: /导出带字幕视频/ })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: /导出带字幕视频/ }));
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("video_export_start", {
+    pid: "project-1",
+    mode: "fast",
+  }));
+  expect(await screen.findByRole("progressbar", { name: "视频导出进度" })).toHaveValue(47);
+  expect(screen.getByText(/VideoToolbox · Apple Media Engine/)).toBeVisible();
+  expect(screen.getByText(/14s \/ 30s/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "取消导出" }));
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("video_export_cancel", {
+    pid: "project-1",
   }));
 });
 
@@ -725,4 +960,51 @@ test("B-roll suggestions have a discoverable asset acceptance flow", async () =>
   });
   expect(await screen.findByText("素材已按建议时段加入 B-roll 轨道。")).toBeVisible();
   expect(screen.getByRole("heading", { name: "已加入成片" }).closest("header")).toHaveTextContent("1");
+});
+
+test("B-roll preview reports render progress, hardware backend, and cancellation", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Alice",
+      sentences: [{
+        id: "s1",
+        text: "Show the product",
+        words: [
+          { id: "w1", text: "Show", start: 4, end: 5 },
+          { id: "w2", text: "product", start: 6, end: 7 },
+        ],
+      }],
+    }],
+  };
+  brollOverview = {
+    suggestions: [],
+    accepted: [{
+      id: "br-1",
+      file: "/Users/example/product.png",
+      start: 4,
+      end: 7,
+      mode: "pip",
+      rect: null,
+      fit: "cover",
+      background: "black",
+      sourceStart: 0,
+      radius: 0,
+      name: "product",
+    }],
+    errors: [],
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "补充画面" }));
+  fireEvent.click(await screen.findByRole("button", { name: "生成画面预览" }));
+
+  expect(await screen.findByRole("progressbar", { name: "B-roll 预览进度" })).toHaveValue(67);
+  expect(screen.getByText(/VideoToolbox · Apple Media Engine/)).toBeVisible();
+  expect(screen.getByText(/12 \/ 30/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "取消预览" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("broll_preview_cancel", {
+    pid: "project-1",
+  }));
 });

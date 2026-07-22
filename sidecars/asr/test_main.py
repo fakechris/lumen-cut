@@ -4,6 +4,7 @@ import pathlib
 import subprocess
 import types
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("main.py")
@@ -14,6 +15,25 @@ SPEC.loader.exec_module(ASR)
 
 
 class SidecarFormattingTests(unittest.TestCase):
+    def test_mlx_memory_policy_caps_unified_memory_and_cache(self) -> None:
+        calls: list[tuple[str, int]] = []
+        fake_mx = types.SimpleNamespace(
+            set_memory_limit=lambda value: calls.append(("memory", value)),
+            set_cache_limit=lambda value: calls.append(("cache", value)),
+            reset_peak_memory=lambda: None,
+        )
+        with mock.patch.dict(
+            ASR.os.environ,
+            {"LUMEN_CUT_MAX_SIDECAR_MEMORY_MB": "4096"},
+        ):
+            monitor = ASR.configure_mlx_memory(fake_mx)
+
+        self.assertEqual(calls, [
+            ("memory", 4096 * 1024 * 1024),
+            ("cache", 256 * 1024 * 1024),
+        ])
+        self.assertEqual(monitor.memory_limit_mb, 4096)
+
     def test_word_segments_become_one_readable_cue(self) -> None:
         segments = [
             {"text": "Hello", "start": 0.0, "end": 0.4},

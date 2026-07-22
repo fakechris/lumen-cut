@@ -5,6 +5,7 @@ import type {
   BrollOverview,
   BrollPlacement,
   BrollPlacementInput,
+  BrollPreviewJobStatus,
   BrollSuggestion,
   Doc,
 } from "../../types";
@@ -14,10 +15,13 @@ interface Props {
   doc: Doc;
   lang: Lang;
   overview: BrollOverview;
+  previewJob: BrollPreviewJobStatus | null;
+  previewPaths: string[];
   onAcceptSuggestion: (suggestion: BrollSuggestion) => Promise<boolean>;
   onAdd: (input: BrollPlacementInput) => Promise<void>;
   onPickFile: () => Promise<string | null>;
-  onPreview: () => Promise<string[]>;
+  onPreview: () => Promise<void>;
+  onCancelPreview: () => Promise<void>;
   onRefresh: () => Promise<void>;
   onRemove: (id: string) => Promise<void>;
   onUpdate: (id: string, input: BrollPlacementInput) => Promise<void>;
@@ -58,10 +62,13 @@ export function BrollWorkspace({
   doc,
   lang,
   overview,
+  previewJob,
+  previewPaths,
   onAcceptSuggestion,
   onAdd,
   onPickFile,
   onPreview,
+  onCancelPreview,
   onRefresh,
   onRemove,
   onUpdate,
@@ -76,7 +83,6 @@ export function BrollWorkspace({
   const [drafts, setDrafts] = useState<Record<string, BrollPlacementInput>>({});
   const [newPlacement, setNewPlacement] = useState<BrollPlacementInput>(EMPTY_INPUT);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
-  const [previewPaths, setPreviewPaths] = useState<string[]>([]);
   const run = (action: Promise<unknown>) => {
     void action.catch(() => undefined);
   };
@@ -88,7 +94,6 @@ export function BrollWorkspace({
         current[placement.id] || inputFromPlacement(placement),
       ]),
     ));
-    setPreviewPaths([]);
   }, [overview.accepted]);
 
   const chooseNewAsset = async () => {
@@ -117,9 +122,8 @@ export function BrollWorkspace({
     }
   };
 
-  const preview = async () => {
-    setPreviewPaths(await onPreview());
-  };
+  const isRendering = previewJob !== null
+    && (previewJob.state === "running" || previewJob.state === "cancelling");
 
   const validNew = Boolean(newPlacement.file)
     && Number.isFinite(newPlacement.start)
@@ -142,12 +146,47 @@ export function BrollWorkspace({
         </div>
         <button
           className="button-primary"
-          disabled={busy || overview.accepted.length === 0}
-          onClick={() => run(preview())}
+          disabled={busy || isRendering || overview.accepted.length === 0}
+          onClick={() => run(onPreview())}
         >
-          {busy ? (zh ? "正在生成…" : "Rendering…") : (zh ? "生成画面预览" : "Render previews")}
+          {isRendering ? `${zh ? "正在生成" : "Rendering"} ${previewJob.progress}%` : (zh ? "生成画面预览" : "Render previews")}
         </button>
       </header>
+
+      {isRendering && previewJob && (
+        <section className="broll-preview-progress" role="status" aria-live="polite">
+          <div>
+            <strong>
+              {previewJob.phase === "waiting"
+                ? zh ? "正在等待计算资源" : "Waiting for compute capacity"
+                : previewJob.phase === "preparing"
+                  ? zh ? "正在准备时间线" : "Preparing timeline"
+                  : previewJob.phase === "frames"
+                    ? zh ? "正在提取预览帧" : "Extracting preview frames"
+                    : previewJob.state === "cancelling"
+                      ? zh ? "正在安全停止" : "Stopping safely"
+                      : zh ? "正在硬件渲染时间线" : "Rendering timeline in hardware"}
+            </strong>
+            <span>{previewJob.progress}%</span>
+          </div>
+          <progress max={100} value={previewJob.progress} aria-label={zh ? "B-roll 预览进度" : "B-roll preview progress"} />
+          <small>
+            {previewJob.encoder === "h264_videotoolbox" ? "VideoToolbox · Apple Media Engine" : ""}
+            {previewJob.current !== null && previewJob.total !== null
+              ? ` · ${Math.round(previewJob.current)} / ${Math.round(previewJob.total)}`
+              : ""}
+          </small>
+          <button
+            className="button-quiet"
+            disabled={previewJob.state === "cancelling"}
+            onClick={() => run(onCancelPreview())}
+          >
+            {previewJob.state === "cancelling"
+              ? zh ? "正在停止…" : "Stopping…"
+              : zh ? "取消预览" : "Cancel preview"}
+          </button>
+        </section>
+      )}
 
       {previewPaths.length > 0 && (
         <section className="broll-previews" aria-label={zh ? "B-roll 画面预览" : "B-roll previews"}>

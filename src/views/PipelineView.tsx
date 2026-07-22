@@ -6,6 +6,7 @@ import {
   agentServe,
   agentWorkers,
   auditCodes,
+  revealLogs,
   runDoctor,
   taskStatus,
   versionMerge,
@@ -111,6 +112,19 @@ export function PipelineView({
     }
   };
 
+  const openLogs = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const path = await revealLogs();
+      setInfo(lang === "zh" ? `日志目录：${path}` : `Log folder: ${path}`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (embedded) {
     const copy = lang === "zh"
       ? {
@@ -118,21 +132,28 @@ export function PipelineView({
           description: "Pipeline 和后台任务会在需要时自动启动，不需要手动启动服务器。",
           checking: "正在检查…",
           action: "运行环境检查",
+          logs: "打开运行日志",
         }
       : {
           title: "Environment check",
           description: "Pipeline and background tasks start automatically when needed. You do not need to start a server.",
           checking: "Checking…",
           action: "Run environment check",
+          logs: "Open runtime logs",
         };
     return (
       <section className="view pipeline-view embedded">
         <div className="card diagnostics-card">
           <h3>{copy.title}</h3>
           <p className="muted">{copy.description}</p>
-          <button disabled={busy} onClick={checkEnvironment}>
-            {busy ? copy.checking : copy.action}
-          </button>
+          <div className="row">
+            <button disabled={busy} onClick={checkEnvironment}>
+              {busy ? copy.checking : copy.action}
+            </button>
+            <button className="button-quiet" disabled={busy} onClick={openLogs}>
+              {copy.logs}
+            </button>
+          </div>
           {checks && (
             <ul className="diagnostic-list">
               {checks.map((check) => (
@@ -145,6 +166,7 @@ export function PipelineView({
             </ul>
           )}
           {err && <pre className="out error">{err}</pre>}
+          {info && <pre className="out">{info}</pre>}
         </div>
       </section>
     );

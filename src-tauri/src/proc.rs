@@ -11,6 +11,8 @@ use tokio::process::Command as TokioCommand;
 
 use crate::error::{AppError, AppResult};
 
+const STDERR_TAIL_BYTES: usize = 256 * 1024;
+
 tokio::task_local! {
     static CANCEL_FLAG: Arc<AtomicBool>;
 }
@@ -61,18 +63,33 @@ pub async fn run_with_env(
     run_with_env_and_progress(bin, args, environment, None).await
 }
 
+/// Run a cancellable subprocess with an explicit environment overlay while
+/// streaming complete stderr lines to the caller.
+pub async fn run_with_env_progress(
+    bin: &str,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    on_stderr_line: ProgressLineCallback,
+) -> AppResult<String> {
+    run_with_env_and_progress(bin, args, environment, Some(on_stderr_line)).await
+}
+
 async fn run_with_env_and_progress(
     bin: &str,
     args: &[&str],
     environment: &[(&str, &str)],
     on_stderr_line: Option<ProgressLineCallback>,
 ) -> AppResult<String> {
+    let process = label(bin);
+    let started = std::time::Instant::now();
+    tracing::info!(process, "subprocess started");
     let mut command = TokioCommand::new(bin);
     command
         .args(args)
         .envs(environment.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|e| AppError::Sidecar {
@@ -103,6 +120,10 @@ async fn run_with_env_and_progress(
                 break;
             }
             bytes.extend_from_slice(&line);
+            if bytes.len() > STDERR_TAIL_BYTES * 2 {
+                let excess = bytes.len() - STDERR_TAIL_BYTES;
+                bytes.drain(..excess);
+            }
             if let Some(callback) = &on_stderr_line {
                 callback(
                     String::from_utf8_lossy(&line)
@@ -110,6 +131,10 @@ async fn run_with_env_and_progress(
                         .to_string(),
                 );
             }
+        }
+        if bytes.len() > STDERR_TAIL_BYTES {
+            let excess = bytes.len() - STDERR_TAIL_BYTES;
+            bytes.drain(..excess);
         }
         Ok::<Vec<u8>, std::io::Error>(bytes)
     });
@@ -133,16 +158,32 @@ async fn run_with_env_and_progress(
         .map_err(|error| AppError::Schema(format!("stderr reader failed: {error}")))??;
 
     if was_cancelled {
+        tracing::info!(
+            process,
+            elapsed_ms = started.elapsed().as_millis(),
+            "subprocess cancelled"
+        );
         return Err(AppError::Cancelled);
     }
     if !status.success() {
         let tail = String::from_utf8_lossy(&err);
+        tracing::warn!(
+            process,
+            exit_code = status.code().unwrap_or(-1),
+            elapsed_ms = started.elapsed().as_millis(),
+            "subprocess failed"
+        );
         return Err(AppError::Sidecar {
             sidecar: label(bin),
             message: format!("exit {}: {}", status.code().unwrap_or(-1), tail.trim()),
         });
     }
 
+    tracing::info!(
+        process,
+        elapsed_ms = started.elapsed().as_millis(),
+        "subprocess completed"
+    );
     Ok(String::from_utf8(out).unwrap_or_default())
 }
 
@@ -195,10 +236,15 @@ mod tests {
     #[test]
     fn process_termination_does_not_spawn_synchronous_commands() {
         let source = include_str!("proc.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
         let forbidden = ["std::process::", "Command"].concat();
         assert!(
             !source.contains(&forbidden),
             "cancellation must not block the async subprocess runner"
+        );
+        assert!(
+            production.contains("kill_on_drop(true)"),
+            "child processes must not survive an app shutdown"
         );
     }
 
@@ -215,6 +261,26 @@ mod tests {
             AppError::Sidecar { message, .. } => assert!(message.contains("exit")),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn failure_output_keeps_a_bounded_tail() {
+        let err = run(
+            "/bin/sh",
+            &[
+                "-c",
+                "yes x | head -c 1048576 >&2; printf 'TAIL_MARKER' >&2; exit 1",
+            ],
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.len() < 300_000,
+            "stderr was not bounded: {}",
+            message.len()
+        );
+        assert!(message.ends_with("TAIL_MARKER"));
     }
 
     #[tokio::test]

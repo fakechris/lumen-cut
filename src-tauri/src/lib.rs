@@ -15,6 +15,7 @@ pub mod error;
 pub mod export;
 pub mod media;
 pub mod media_url;
+pub mod performance;
 pub mod pipeline;
 pub mod proc;
 
@@ -22,6 +23,15 @@ pub use commands::greet;
 pub use error::{AppError, AppResult};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Persistent diagnostics for GUI launches, which otherwise have no terminal.
+/// Keep this outside project folders so exports and repositories never pick it up.
+pub fn log_directory() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".lumen-cut/logs")
+}
 
 /// Tauri runtime entry point.
 pub fn run() {
@@ -36,6 +46,9 @@ pub fn run() {
         .manage(commands::MediaAssetState::default())
         .manage(commands::BrollPreviewState::default())
         .manage(commands::TranscriptionState::default())
+        .manage(commands::SpeakerAnalysisState::default())
+        .manage(commands::VideoExportState::default())
+        .manage(commands::SetupJobState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::pick_media_file,
@@ -75,6 +88,9 @@ pub fn run() {
             commands::speaker_merge,
             commands::speaker_assign,
             commands::speaker_reidentify_preview,
+            commands::speaker_reidentify_start,
+            commands::speaker_reidentify_status,
+            commands::speaker_reidentify_cancel,
             commands::speaker_reidentify_apply,
             commands::broll_list,
             commands::broll_add,
@@ -82,6 +98,9 @@ pub fn run() {
             commands::broll_update,
             commands::broll_remove,
             commands::broll_preview,
+            commands::broll_preview_start,
+            commands::broll_preview_status,
+            commands::broll_preview_cancel,
             commands::diarize_pid,
             commands::timing_repair,
             commands::model_list,
@@ -90,13 +109,20 @@ pub fn run() {
             commands::asr_models_download,
             commands::diarize_runtime_install,
             commands::diarize_model_download,
+            commands::setup_job_start,
+            commands::setup_job_status,
+            commands::setup_job_cancel,
             commands::logs_list,
+            commands::logs_reveal,
             commands::record_audio,
             commands::recording_start,
             commands::recording_stop,
             commands::recording_cancel,
             commands::run_doctor,
             commands::export_video,
+            commands::video_export_start,
+            commands::video_export_status,
+            commands::video_export_cancel,
             commands::export_fcp,
             commands::export_subtitles,
             commands::version_list,

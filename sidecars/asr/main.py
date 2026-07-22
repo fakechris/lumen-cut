@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import resource
 import subprocess
 import sys
+import time
 from typing import Any
 
 # Defaults supported by the pinned mlx-qwen3-asr runtime.
@@ -24,6 +27,54 @@ DEFAULT_ALIGNER = "mlx-community/Qwen3-ForcedAligner-0.6B-4bit"
 MAX_CUE_CHARS_LATIN = 42
 MAX_CUE_CHARS_CJK = 22
 PROGRESS_PREFIX = "LUMEN_CUT_PROGRESS "
+DEFAULT_MEMORY_LIMIT_MB = 6144
+MLX_CACHE_LIMIT_MB = 256
+
+
+class MlxResourceMonitor:
+    def __init__(self, mx: Any, memory_limit_mb: int) -> None:
+        self.mx = mx
+        self.memory_limit_mb = memory_limit_mb
+        self.started_at = time.monotonic()
+        self.started_cpu = time.process_time()
+
+    @staticmethod
+    def peak_rss_mb() -> float:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+        return peak / divisor
+
+    def snapshot(self) -> dict[str, Any]:
+        elapsed = max(0.001, time.monotonic() - self.started_at)
+        cpu_seconds = max(0.0, time.process_time() - self.started_cpu)
+        mlx_active_mb = self.mx.get_active_memory() / (1024 * 1024)
+        mlx_cache_mb = self.mx.get_cache_memory() / (1024 * 1024)
+        mlx_peak_mb = self.mx.get_peak_memory() / (1024 * 1024)
+        peak_rss_mb = self.peak_rss_mb()
+        if max(mlx_peak_mb, peak_rss_mb) > self.memory_limit_mb:
+            raise MemoryError(
+                "transcription exceeded its memory guardrail "
+                f"({max(mlx_peak_mb, peak_rss_mb):.0f} MB > {self.memory_limit_mb} MB)"
+            )
+        return {
+            "device": "mlx-metal",
+            "elapsed_seconds": round(elapsed, 1),
+            "cpu_percent": round(cpu_seconds / elapsed * 100),
+            "peak_memory_mb": round(max(mlx_peak_mb, peak_rss_mb)),
+            "memory_limit_mb": self.memory_limit_mb,
+            "mlx_active_memory_mb": round(mlx_active_mb),
+            "mlx_cache_memory_mb": round(mlx_cache_mb),
+        }
+
+
+def configure_mlx_memory(mx: Any) -> MlxResourceMonitor:
+    memory_limit_mb = int(
+        os.environ.get("LUMEN_CUT_MAX_SIDECAR_MEMORY_MB", DEFAULT_MEMORY_LIMIT_MB)
+    )
+    mx.set_memory_limit(memory_limit_mb * 1024 * 1024)
+    mx.set_cache_limit(MLX_CACHE_LIMIT_MB * 1024 * 1024)
+    mx.reset_peak_memory()
+    return MlxResourceMonitor(mx, memory_limit_mb)
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,14 +188,30 @@ def build_paragraphs(
     return [{"speaker": None, "sentences": sentences}]
 
 
-def emit_progress(phase: str, progress: int, **details: Any) -> None:
+def emit_progress(
+    phase: str,
+    progress: int,
+    *,
+    monitor: MlxResourceMonitor | None = None,
+    **details: Any,
+) -> None:
+    details = {
+        key: value.item() if hasattr(value, "item") else value
+        for key, value in details.items()
+    }
+    if monitor is not None:
+        details.update(monitor.snapshot())
     payload = {"phase": phase, "progress": max(0, min(100, int(progress))), **details}
     sys.stderr.write(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stderr.flush()
 
 
 def recognition_worker(args: argparse.Namespace) -> dict[str, Any]:
+    import mlx.core as mx
+    monitor = configure_mlx_memory(mx)
     from mlx_qwen3_asr import transcribe  # type: ignore
+
+    emit_progress("transcribing", 45, monitor=monitor, current=0, total=None)
 
     def on_progress(event: dict[str, Any]) -> None:
         ratio = float(event.get("progress", 0.0) or 0.0)
@@ -153,6 +220,7 @@ def recognition_worker(args: argparse.Namespace) -> dict[str, Any]:
             45 + round(ratio * 27),
             current=event.get("chunk_index"),
             total=event.get("total_chunks"),
+            monitor=monitor,
         )
 
     result = transcribe(
@@ -176,16 +244,16 @@ def alignment_worker(args: argparse.Namespace, recognized: dict[str, Any]) -> di
     from mlx_qwen3_asr import ForcedAligner  # type: ignore
     from mlx_qwen3_asr.audio import SAMPLE_RATE, load_audio_np  # type: ignore
 
+    monitor = configure_mlx_memory(mx)
     # Keep reusable buffers small. Model weights remain resident, but this worker
     # never loads the ASR model, so both 0.6B models cannot occupy unified memory
     # at the same time.
-    mx.set_cache_limit(256 * 1024 * 1024)
     audio = np.asarray(load_audio_np(args.audio, sr=SAMPLE_RATE), dtype=np.float32)
     chunks = list(recognized.get("chunks") or [])
     aligner = ForcedAligner(args.align)
     segments: list[dict[str, Any]] = []
     total = len(chunks)
-    emit_progress("aligning", 72, current=0, total=total)
+    emit_progress("aligning", 72, current=0, total=total, monitor=monitor)
 
     for index, chunk in enumerate(chunks, start=1):
         text = str(chunk.get("text") or "").strip()
@@ -216,6 +284,7 @@ def alignment_worker(args: argparse.Namespace, recognized: dict[str, Any]) -> di
             72 + round(index / max(total, 1) * 15),
             current=index,
             total=total,
+            monitor=monitor,
         )
     return {"segments": segments}
 

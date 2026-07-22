@@ -8,6 +8,7 @@
 pub mod assign;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -30,6 +31,33 @@ pub struct DiarSegment {
     pub end: f64,
 }
 
+const PROGRESS_PREFIX: &str = "LUMEN_CUT_PROGRESS ";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiarizeProgress {
+    pub phase: String,
+    pub progress: u8,
+    pub current: Option<u32>,
+    pub total: Option<u32>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<f64>,
+    #[serde(default)]
+    pub cpu_percent: Option<u32>,
+    #[serde(default)]
+    pub peak_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+}
+
+pub type DiarizeProgressCallback = Arc<dyn Fn(DiarizeProgress) + Send + Sync>;
+
+fn parse_sidecar_progress(line: &str) -> Option<DiarizeProgress> {
+    let payload = line.strip_prefix(PROGRESS_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// Run the diarization sidecar against an audio file.  Returns raw segments;
 /// the caller is responsible for aligning them with ASR sentences (see
 /// [`assign_speakers`]).
@@ -39,6 +67,14 @@ pub async fn diarize_file(wav: &Path) -> AppResult<DiarizeOutV1> {
 }
 
 pub async fn diarize_file_with_model(wav: &Path, model: &str) -> AppResult<DiarizeOutV1> {
+    diarize_file_with_model_progress(wav, model, None).await
+}
+
+pub async fn diarize_file_with_model_progress(
+    wav: &Path,
+    model: &str,
+    on_progress: Option<DiarizeProgressCallback>,
+) -> AppResult<DiarizeOutV1> {
     let sidecar = locate_sidecar("sidecars/diarize/main.py").ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_diarize",
         message: "sidecar script not found — set LUMEN_CUT_DIARIZE_SCRIPT, place it at \
@@ -61,7 +97,21 @@ pub async fn diarize_file_with_model(wav: &Path, model: &str) -> AppResult<Diari
         .as_deref()
         .map(|token| vec![("HF_TOKEN", token)])
         .unwrap_or_default();
-    let raw = proc::run_with_env(&py, &arg_refs, &environment).await?;
+    let raw = if let Some(callback) = on_progress {
+        proc::run_with_env_progress(
+            &py,
+            &arg_refs,
+            &environment,
+            Arc::new(move |line| {
+                if let Some(progress) = parse_sidecar_progress(&line) {
+                    callback(progress);
+                }
+            }),
+        )
+        .await?
+    } else {
+        proc::run_with_env(&py, &arg_refs, &environment).await?
+    };
     let parsed: DiarizeOutV1 = serde_json::from_str(&raw).map_err(|e| AppError::Sidecar {
         sidecar: "lumen_cut_diarize",
         message: format!("json: {e}"),
@@ -176,6 +226,24 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--model", "pyannote/speaker-diarization-3.1"]));
+    }
+
+    #[test]
+    fn parses_structured_progress_without_accepting_log_noise() {
+        let progress = parse_sidecar_progress(
+            r#"LUMEN_CUT_PROGRESS {"phase":"embedding","progress":81,"current":3,"total":5,"device":"mps","elapsed_seconds":12.4,"cpu_percent":87,"peak_memory_mb":2431,"memory_limit_mb":6144}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.phase, "embedding");
+        assert_eq!(progress.progress, 81);
+        assert_eq!(progress.current, Some(3));
+        assert_eq!(progress.total, Some(5));
+        assert_eq!(progress.device.as_deref(), Some("mps"));
+        assert_eq!(progress.elapsed_seconds, Some(12.4));
+        assert_eq!(progress.cpu_percent, Some(87));
+        assert_eq!(progress.peak_memory_mb, Some(2431));
+        assert_eq!(progress.memory_limit_mb, Some(6144));
+        assert!(parse_sidecar_progress("Downloading model files").is_none());
     }
 
     #[tokio::test]

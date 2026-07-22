@@ -1,17 +1,16 @@
 import { useEffect, useState } from "react";
 import {
-  asrModelsDownload,
-  asrRuntimeInstall,
   asrStatus,
   configShow,
-  diarizeModelDownload,
-  diarizeRuntimeInstall,
   loadSettings,
   saveSettings,
+  setupJobCancel,
+  setupJobStart,
+  setupJobStatus,
   settingsExport,
 } from "../api";
 import type { Lang } from "../i18n";
-import type { AsrStatus, Settings } from "../types";
+import type { AsrStatus, Settings, SetupJobStatus } from "../types";
 import { PipelineView } from "./PipelineView";
 
 interface Props {
@@ -121,11 +120,16 @@ export function SettingsView({ lang, pid }: Props) {
   const [message, setMessage] = useState<string | null>(null);
   const [asr, setAsr] = useState<AsrStatus | null>(null);
   const [asrAction, setAsrAction] = useState<"install" | "download" | "install-speakers" | "download-speakers" | "check" | null>("check");
+  const [setupJob, setSetupJob] = useState<SetupJobStatus | null>(null);
 
   useEffect(() => {
     let disposed = false;
-    void Promise.all([configShow(), asrStatus()])
-      .then(([config, status]) => {
+    void Promise.all([
+      configShow(),
+      asrStatus(),
+      setupJobStatus().catch(() => null),
+    ])
+      .then(([config, status, setup]) => {
         if (disposed) return;
         setSettings({
           asrModel: config.asrModel,
@@ -138,17 +142,67 @@ export function SettingsView({ lang, pid }: Props) {
           workerCount: config.workerCount,
         });
         setAsr(status);
+        if (setup && (setup.state === "running" || setup.state === "cancelling")) {
+          setSetupJob(setup);
+          setAsrAction(({
+            "asr-runtime": "install",
+            "asr-models": "download",
+            "speaker-runtime": "install-speakers",
+            "speaker-model": "download-speakers",
+          } as const)[setup.kind]);
+        } else {
+          setAsrAction(null);
+        }
       })
       .catch((error) => {
         if (!disposed) setMessage(String(error));
       })
-      .finally(() => {
-        if (!disposed) setAsrAction(null);
-      });
     return () => {
       disposed = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!setupJob || !["running", "cancelling"].includes(setupJob.state)) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const next = await setupJobStatus();
+        if (disposed) return;
+        if (next.state === "completed") {
+          setAsr(await asrStatus());
+          if (disposed) return;
+          setSetupJob(next);
+          setAsrAction(null);
+          return;
+        }
+        if (next.state === "cancelled") {
+          setSetupJob(next);
+          setAsrAction(null);
+          return;
+        }
+        if (next.state === "failed") {
+          setSetupJob(next);
+          setMessage(next.error || "Setup failed");
+          setAsrAction(null);
+          return;
+        }
+        setSetupJob(next);
+        timer = window.setTimeout(poll, 500);
+      } catch (error) {
+        if (!disposed) {
+          setMessage(error instanceof Error ? error.message : String(error));
+          setAsrAction(null);
+        }
+      }
+    };
+    timer = window.setTimeout(poll, 350);
+    return () => {
+      disposed = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [setupJob?.state]);
 
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setSettings((previous) => ({ ...previous, [key]: value }));
@@ -191,55 +245,38 @@ export function SettingsView({ lang, pid }: Props) {
     }
   };
 
-  const installAsr = async () => {
-    setAsrAction("install");
+  const beginSetup = async (
+    kind: SetupJobStatus["kind"],
+    action: Exclude<typeof asrAction, "check" | null>,
+    persistSettings: boolean,
+  ) => {
+    setAsrAction(action);
     setMessage(null);
     try {
-      setAsr(await asrRuntimeInstall());
+      if (persistSettings) {
+        saveSettings(settings);
+        await settingsExport(settings);
+      }
+      setSetupJob(await setupJobStart(kind));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
       setAsrAction(null);
     }
   };
 
-  const downloadAsrModels = async () => {
-    setAsrAction("download");
-    setMessage(null);
-    try {
-      saveSettings(settings);
-      await settingsExport(settings);
-      setAsr(await asrModelsDownload());
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setAsrAction(null);
-    }
-  };
+  const installAsr = () => beginSetup("asr-runtime", "install", false);
 
-  const installSpeakers = async () => {
-    setAsrAction("install-speakers");
-    setMessage(null);
-    try {
-      setAsr(await diarizeRuntimeInstall());
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setAsrAction(null);
-    }
-  };
+  const downloadAsrModels = () => beginSetup("asr-models", "download", true);
 
-  const downloadSpeakerModel = async () => {
-    setAsrAction("download-speakers");
-    setMessage(null);
+  const installSpeakers = () => beginSetup("speaker-runtime", "install-speakers", false);
+
+  const downloadSpeakerModel = () => beginSetup("speaker-model", "download-speakers", true);
+
+  const cancelSetup = async () => {
     try {
-      saveSettings(settings);
-      await settingsExport(settings);
-      setAsr(await diarizeModelDownload());
+      setSetupJob(await setupJobCancel());
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setAsrAction(null);
     }
   };
 
@@ -406,6 +443,37 @@ export function SettingsView({ lang, pid }: Props) {
               {c.refreshStatus}
             </button>
           </div>
+          {setupJob && ["running", "cancelling"].includes(setupJob.state) && (
+            <div className="setup-job-progress" role="status" aria-live="polite">
+              <div>
+                <strong>
+                  {setupJob.phase === "waiting"
+                    ? lang === "zh" ? "正在等待计算资源" : "Waiting for compute capacity"
+                    : setupJob.phase === "downloading"
+                      ? lang === "zh" ? "正在下载模型文件" : "Downloading model files"
+                      : setupJob.phase === "installing"
+                        ? lang === "zh" ? "正在安装本地运行环境" : "Installing local runtime"
+                        : lang === "zh" ? "正在安全停止" : "Stopping safely"}
+                </strong>
+                <span>{setupJob.kind}</span>
+              </div>
+              <progress aria-label={lang === "zh" ? "环境准备进度" : "Setup progress"} />
+              <small>
+                {lang === "zh"
+                  ? "当前工具没有提供可信的总字节数，因此这里明确显示不定进度；详细失败输出会保留末尾日志。"
+                  : "This tool does not expose a trustworthy total byte count, so progress is explicitly indeterminate; failure output keeps a bounded log tail."}
+              </small>
+              <button
+                className="button-quiet"
+                disabled={setupJob.state === "cancelling"}
+                onClick={() => void cancelSetup()}
+              >
+                {setupJob.state === "cancelling"
+                  ? lang === "zh" ? "正在停止…" : "Stopping…"
+                  : lang === "zh" ? "取消任务" : "Cancel setup"}
+              </button>
+            </div>
+          )}
           {message && (
             <div className="notice error-notice" role="alert">
               <span>{message}</span>

@@ -6,9 +6,17 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() {
+    let file_appender =
+        tracing_appender::rolling::daily(lumen_cut::log_directory(), "lumen-cut.log");
+    let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
     // EnvFilter: RUST_LOG wins, otherwise default to info from lumen-cut + warn from others.
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer),
+        )
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "lumen_cut=info,warn".into()),

@@ -30,9 +30,37 @@ where
     T: Send + 'static,
     F: FnOnce() -> AppResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(work)
         .await
-        .map_err(|error| AppError::Schema(format!("{label} task failed: {error}")))?
+        .map_err(|error| AppError::Schema(format!("{label} task failed: {error}")))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    if elapsed_ms >= 500 {
+        tracing::warn!(
+            operation = label,
+            elapsed_ms,
+            "blocking worker operation was slow"
+        );
+    } else {
+        tracing::debug!(
+            operation = label,
+            elapsed_ms,
+            "blocking worker operation completed"
+        );
+    }
+    result
+}
+
+fn trace_pipeline_started(pipeline: &str, pid: &str) {
+    tracing::info!(pipeline, pid, "pipeline job started");
+}
+
+fn trace_pipeline_finished(pipeline: &str, pid: &str, state: &str, error: Option<&str>) {
+    if let Some(error) = error {
+        tracing::error!(pipeline, pid, state, error, "pipeline job finished");
+    } else {
+        tracing::info!(pipeline, pid, state, "pipeline job finished");
+    }
 }
 
 /// Tauri apps do not have a reliable working directory. Keep GUI projects in
@@ -512,10 +540,12 @@ fn ensure_not_cancelled() -> AppResult<()> {
 
 async fn run_auto_impl<F>(args: AutoArgs, report: F) -> AppResult<AutoResult>
 where
-    F: Fn(&str, u8) + Send + Sync + 'static,
+    F: Fn(&str, u8, Option<crate::asr::AsrProgress>) + Send + Sync + 'static,
 {
     let report = Arc::new(report);
-    report("preparing", 5);
+    report("waiting", 1, None);
+    let _heavy_work = crate::performance::acquire_heavy("transcription").await?;
+    report("preparing", 5, None);
     ensure_not_cancelled()?;
     let out_dir = resolve_project_root(args.out);
     tokio::fs::create_dir_all(&out_dir).await?;
@@ -527,8 +557,17 @@ where
         .unwrap_or_else(|| out_dir.clone());
     tokio::fs::create_dir_all(&download_dir).await?;
     let media_path = if args.media.starts_with("http://") || args.media.starts_with("https://") {
-        report("downloading", 12);
-        crate::media_url::download(&args.media, &download_dir.join("source.%(ext)s")).await?
+        report("downloading", 12, None);
+        let download_report = report.clone();
+        crate::media_url::download_with_progress(
+            &args.media,
+            &download_dir.join("source.%(ext)s"),
+            Some(Arc::new(move |progress| {
+                let whole_job_progress = 12 + ((u16::from(progress.percent) * 11) / 100) as u8;
+                download_report("downloading", whole_job_progress.min(23), None);
+            })),
+        )
+        .await?
     } else {
         PathBuf::from(&args.media)
     };
@@ -551,18 +590,18 @@ where
     // A recording project already uses `<pid>/audio.wav` as its media source.
     // Avoid asking ffmpeg to overwrite its own input.
     if media_path != wav {
-        report("extracting", 25);
+        report("extracting", 25, None);
         extract_audio_wav(&media_path, &wav).await?;
     }
     ensure_not_cancelled()?;
-    report("analyzing", 35);
+    report("analyzing", 35, None);
     let info = probe(&media_path).await?;
     ensure_not_cancelled()?;
 
     let model_config =
         run_blocking("model config load", || Ok(crate::data::modelconfig::load())).await?;
     let model = args.model.as_deref().unwrap_or(&model_config.asr_model);
-    report("transcribing", 45);
+    report("transcribing", 45, None);
     let progress_report = report.clone();
     let asr_out = crate::asr::transcribe_file_with_aligner_progress(
         &wav,
@@ -570,13 +609,14 @@ where
         args.lang.as_deref(),
         Some(&model_config.asr_aligner),
         Some(Arc::new(move |progress| {
-            progress_report(&progress.phase, progress.progress);
+            let phase = progress.phase.clone();
+            progress_report(&phase, progress.progress, Some(progress));
         })),
     )
     .await?;
     ensure_not_cancelled()?;
 
-    report("saving", 88);
+    report("saving", 88, None);
     let mut doc: Doc = asr_out.into();
     doc.id = pid_stem.clone();
     doc.media = MediaRef {
@@ -588,7 +628,7 @@ where
     doc.meta.title = args.title.clone().unwrap_or_else(|| pid_stem.clone());
     normalize_transcription_doc(&mut doc, args.lang.clone());
     doc.meta.updated_at = chrono::Utc::now();
-    report("exporting", 94);
+    report("exporting", 94, None);
     let result = run_blocking("project save and subtitle export", move || {
         doc.save(&pid_dir)?;
         let srt = pid_dir.join("out.srt");
@@ -610,13 +650,13 @@ where
         })
     })
     .await?;
-    report("completed", 100);
+    report("completed", 100, None);
     Ok(result)
 }
 
 #[tauri::command]
 pub async fn run_auto(args: AutoArgs) -> AppResult<AutoResult> {
-    run_auto_impl(args, |_, _| {}).await
+    run_auto_impl(args, |_, _, _| {}).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -626,6 +666,24 @@ pub struct TranscriptionJobStatus {
     pub state: String,
     pub phase: String,
     pub progress: u8,
+    #[serde(default)]
+    pub current: Option<u32>,
+    #[serde(default)]
+    pub total: Option<u32>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<f64>,
+    #[serde(default)]
+    pub cpu_percent: Option<u32>,
+    #[serde(default)]
+    pub peak_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub mlx_active_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub mlx_cache_memory_mb: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -686,14 +744,34 @@ fn update_transcription_job(
     pid: &str,
     phase: &str,
     progress: u8,
+    details: Option<crate::asr::AsrProgress>,
 ) {
     if let Some(job) = jobs
         .lock()
         .expect("transcription state poisoned")
         .get_mut(pid)
     {
+        if job.status.phase != phase {
+            tracing::info!(
+                pipeline = "transcription",
+                pid,
+                phase,
+                "pipeline phase changed"
+            );
+        }
         job.status.phase = phase.to_string();
         job.status.progress = progress;
+        if let Some(details) = details {
+            job.status.current = details.current;
+            job.status.total = details.total;
+            job.status.device = details.device;
+            job.status.elapsed_seconds = details.elapsed_seconds;
+            job.status.cpu_percent = details.cpu_percent;
+            job.status.peak_memory_mb = details.peak_memory_mb;
+            job.status.memory_limit_mb = details.memory_limit_mb;
+            job.status.mlx_active_memory_mb = details.mlx_active_memory_mb;
+            job.status.mlx_cache_memory_mb = details.mlx_cache_memory_mb;
+        }
     }
 }
 
@@ -720,6 +798,15 @@ pub async fn transcription_start(
         state: "running".into(),
         phase: "preparing".into(),
         progress: 0,
+        current: None,
+        total: None,
+        device: None,
+        elapsed_seconds: None,
+        cpu_percent: None,
+        peak_memory_mb: None,
+        memory_limit_mb: None,
+        mlx_active_memory_mb: None,
+        mlx_cache_memory_mb: None,
         error: None,
     };
     {
@@ -754,14 +841,15 @@ pub async fn transcription_start(
             .remove(&pid);
         return Err(error);
     }
+    trace_pipeline_started("transcription", &pid);
 
     let jobs = state.jobs.clone();
     let task_pid = pid.clone();
     tauri::async_runtime::spawn(async move {
         let report_jobs = jobs.clone();
         let report_pid = task_pid.clone();
-        let work = run_auto_impl(args, move |phase, progress| {
-            update_transcription_job(&report_jobs, &report_pid, phase, progress);
+        let work = run_auto_impl(args, move |phase, progress, details| {
+            update_transcription_job(&report_jobs, &report_pid, phase, progress, details);
         });
         let result = crate::proc::with_cancellation(cancel.clone(), work).await;
         if result.is_err() && remove_incomplete_url_project {
@@ -792,6 +880,12 @@ pub async fn transcription_start(
             }
             job.status.clone()
         };
+        trace_pipeline_finished(
+            "transcription",
+            &task_pid,
+            &final_status.state,
+            final_status.error.as_deref(),
+        );
         let _ = tokio::task::spawn_blocking(move || {
             save_transcription_status(&status_path, &final_status)
         })
@@ -872,6 +966,8 @@ pub async fn task_start(
     state: tauri::State<'_, AgentServerState>,
     args: TaskStartArgs,
 ) -> AppResult<TaskStartResult> {
+    let task_pid = args.pid.clone();
+    let task_kind = args.kind.clone();
     let dir = resolve_project_dir(&args.pid, args.root.clone())?;
     let kind = args.kind;
     let lang = args.lang;
@@ -895,6 +991,13 @@ pub async fn task_start(
     for prepared in &task.calls {
         allocator.enqueue(prepared.call.clone());
     }
+    tracing::info!(
+        pipeline = "ai-task",
+        pid = task_pid,
+        kind = task_kind,
+        pending,
+        "pipeline job started"
+    );
     tokio::spawn(async move {
         if let Err(error) = crate::agent::task::wait_and_apply_with_lock(
             allocator,
@@ -1803,13 +1906,117 @@ pub struct SpeakerReidentifyProposal {
     pub margin: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakerReidentifyPreview {
     pub segments: usize,
     pub changed: usize,
     pub unassigned: usize,
     pub proposals: Vec<SpeakerReidentifyProposal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerAnalysisJobStatus {
+    pub pid: String,
+    pub state: String,
+    pub phase: String,
+    pub progress: u8,
+    pub current: Option<u32>,
+    pub total: Option<u32>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<f64>,
+    #[serde(default)]
+    pub cpu_percent: Option<u32>,
+    #[serde(default)]
+    pub peak_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    pub error: Option<String>,
+    pub preview: Option<SpeakerReidentifyPreview>,
+}
+
+struct SpeakerAnalysisJob {
+    status: SpeakerAnalysisJobStatus,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+pub struct SpeakerAnalysisState {
+    jobs: Arc<Mutex<HashMap<String, SpeakerAnalysisJob>>>,
+}
+
+fn speaker_analysis_status_path(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
+    let _ = resolve_project_dir(pid, root.clone())?;
+    Ok(resolve_project_root(root)
+        .join(".jobs")
+        .join(format!("{pid}.speakers.json")))
+}
+
+fn save_speaker_analysis_status(
+    path: &std::path::Path,
+    status: &SpeakerAnalysisJobStatus,
+) -> AppResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Schema("speaker analysis status has no parent directory".into())
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_speaker_analysis_status(path: &std::path::Path) -> AppResult<SpeakerAnalysisJobStatus> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn load_recovered_speaker_analysis_status(
+    path: &std::path::Path,
+) -> AppResult<SpeakerAnalysisJobStatus> {
+    let mut status = load_speaker_analysis_status(path)?;
+    if matches!(status.state.as_str(), "running" | "cancelling") {
+        status.state = "failed".into();
+        status.phase = "failed".into();
+        status.error = Some(
+            "the previous speaker analysis was interrupted when lumen-cut closed; start it again"
+                .into(),
+        );
+        save_speaker_analysis_status(path, &status)?;
+    }
+    Ok(status)
+}
+
+fn update_speaker_analysis_job(
+    jobs: &Mutex<HashMap<String, SpeakerAnalysisJob>>,
+    pid: &str,
+    progress: crate::diarize::DiarizeProgress,
+) {
+    if let Some(job) = jobs
+        .lock()
+        .expect("speaker analysis state poisoned")
+        .get_mut(pid)
+    {
+        if job.status.phase != progress.phase {
+            tracing::info!(
+                pipeline = "speaker-analysis",
+                pid,
+                phase = progress.phase,
+                "pipeline phase changed"
+            );
+        }
+        job.status.phase = progress.phase;
+        job.status.progress = progress.progress;
+        job.status.current = progress.current;
+        job.status.total = progress.total;
+        job.status.device = progress.device;
+        job.status.elapsed_seconds = progress.elapsed_seconds;
+        job.status.cpu_percent = progress.cpu_percent;
+        job.status.peak_memory_mb = progress.peak_memory_mb;
+        job.status.memory_limit_mb = progress.memory_limit_mb;
+    }
 }
 
 fn paragraph_bounds(paragraph: &crate::data::Paragraph) -> Option<(f64, f64)> {
@@ -1827,6 +2034,28 @@ pub async fn speaker_reidentify_preview(
     pid: String,
     root: Option<PathBuf>,
 ) -> AppResult<SpeakerReidentifyPreview> {
+    speaker_reidentify_preview_impl(pid, root, None).await
+}
+
+async fn speaker_reidentify_preview_impl(
+    pid: String,
+    root: Option<PathBuf>,
+    on_progress: Option<crate::diarize::DiarizeProgressCallback>,
+) -> AppResult<SpeakerReidentifyPreview> {
+    if let Some(callback) = on_progress.as_ref() {
+        callback(crate::diarize::DiarizeProgress {
+            phase: "waiting".into(),
+            progress: 0,
+            current: None,
+            total: None,
+            device: None,
+            elapsed_seconds: None,
+            cpu_percent: None,
+            peak_memory_mb: None,
+            memory_limit_mb: None,
+        });
+    }
+    let _heavy_work = crate::performance::acquire_heavy("speaker-analysis").await?;
     let dir = resolve_project_dir(&pid, root)?;
     let audio_mutation = lock_project_mutation(&dir).await;
     let load_dir = dir.clone();
@@ -1842,7 +2071,8 @@ pub async fn speaker_reidentify_preview(
         extract_audio_wav(&doc.media.path, &wav).await?;
     }
     drop(audio_mutation);
-    let output = crate::diarize::diarize_file_with_model(&wav, &model).await?;
+    let output =
+        crate::diarize::diarize_file_with_model_progress(&wav, &model, on_progress).await?;
     let segment_count = output.segments.len();
     run_blocking("speaker preview", move || {
         let mut unassigned = 0;
@@ -1925,6 +2155,161 @@ pub async fn speaker_reidentify_preview(
         })
     })
     .await
+}
+
+#[tauri::command]
+pub async fn speaker_reidentify_start(
+    pid: String,
+    root: Option<PathBuf>,
+    state: tauri::State<'_, SpeakerAnalysisState>,
+) -> AppResult<SpeakerAnalysisJobStatus> {
+    let status_path = speaker_analysis_status_path(&pid, root.clone())?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let status = SpeakerAnalysisJobStatus {
+        pid: pid.clone(),
+        state: "running".into(),
+        phase: "preparing".into(),
+        progress: 0,
+        current: None,
+        total: None,
+        device: None,
+        elapsed_seconds: None,
+        cpu_percent: None,
+        peak_memory_mb: None,
+        memory_limit_mb: None,
+        error: None,
+        preview: None,
+    };
+    {
+        let mut jobs = state.jobs.lock().expect("speaker analysis state poisoned");
+        if jobs
+            .get(&pid)
+            .is_some_and(|job| matches!(job.status.state.as_str(), "running" | "cancelling"))
+        {
+            return Err(AppError::Schema(
+                "this project already has a speaker analysis in progress".into(),
+            ));
+        }
+        jobs.insert(
+            pid.clone(),
+            SpeakerAnalysisJob {
+                status: status.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+    }
+    let initial_status = status.clone();
+    let initial_path = status_path.clone();
+    if let Err(error) = run_blocking("save speaker analysis status", move || {
+        save_speaker_analysis_status(&initial_path, &initial_status)
+    })
+    .await
+    {
+        state
+            .jobs
+            .lock()
+            .expect("speaker analysis state poisoned")
+            .remove(&pid);
+        return Err(error);
+    }
+    trace_pipeline_started("speaker-analysis", &pid);
+
+    let jobs = state.jobs.clone();
+    let task_pid = pid.clone();
+    tauri::async_runtime::spawn(async move {
+        let progress_jobs = jobs.clone();
+        let progress_pid = task_pid.clone();
+        let work = speaker_reidentify_preview_impl(
+            task_pid.clone(),
+            root,
+            Some(Arc::new(move |progress| {
+                update_speaker_analysis_job(&progress_jobs, &progress_pid, progress);
+            })),
+        );
+        let result = crate::proc::with_cancellation(cancel, work).await;
+        let final_status = {
+            let mut guard = jobs.lock().expect("speaker analysis state poisoned");
+            let Some(job) = guard.get_mut(&task_pid) else {
+                return;
+            };
+            match result {
+                Ok(preview) => {
+                    job.status.state = "completed".into();
+                    job.status.phase = "completed".into();
+                    job.status.progress = 100;
+                    job.status.current = None;
+                    job.status.total = None;
+                    job.status.error = None;
+                    job.status.preview = Some(preview);
+                }
+                Err(AppError::Cancelled) => {
+                    job.status.state = "cancelled".into();
+                    job.status.phase = "cancelled".into();
+                    job.status.error = None;
+                }
+                Err(error) => {
+                    job.status.state = "failed".into();
+                    job.status.phase = "failed".into();
+                    job.status.error = Some(error.to_string());
+                }
+            }
+            job.status.clone()
+        };
+        trace_pipeline_finished(
+            "speaker-analysis",
+            &task_pid,
+            &final_status.state,
+            final_status.error.as_deref(),
+        );
+        let _ = tokio::task::spawn_blocking(move || {
+            save_speaker_analysis_status(&status_path, &final_status)
+        })
+        .await;
+    });
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn speaker_reidentify_status(
+    pid: String,
+    state: tauri::State<'_, SpeakerAnalysisState>,
+) -> AppResult<SpeakerAnalysisJobStatus> {
+    if let Some(status) = state
+        .jobs
+        .lock()
+        .expect("speaker analysis state poisoned")
+        .get(&pid)
+        .map(|job| job.status.clone())
+    {
+        return Ok(status);
+    }
+    let status_path = speaker_analysis_status_path(&pid, None)?;
+    run_blocking("load speaker analysis status", move || {
+        load_recovered_speaker_analysis_status(&status_path).map_err(|error| match error {
+            AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                AppError::Schema("no speaker analysis job for this project".into())
+            }
+            other => other,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn speaker_reidentify_cancel(
+    pid: String,
+    state: tauri::State<'_, SpeakerAnalysisState>,
+) -> AppResult<SpeakerAnalysisJobStatus> {
+    let mut jobs = state.jobs.lock().expect("speaker analysis state poisoned");
+    let job = jobs
+        .get_mut(&pid)
+        .ok_or_else(|| AppError::Schema("no speaker analysis job for this project".into()))?;
+    if job.status.state == "running" {
+        job.cancel.store(true, Ordering::Relaxed);
+        job.status.state = "cancelling".into();
+        job.status.phase = "cancelling".into();
+    }
+    Ok(job.status.clone())
 }
 
 #[tauri::command]
@@ -2029,14 +2414,105 @@ pub struct BrollOverview {
     pub errors: Vec<String>,
 }
 
-pub struct BrollPreviewState {
-    current: Mutex<Vec<PathBuf>>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrollPreviewJobStatus {
+    pub pid: String,
+    pub state: String,
+    pub phase: String,
+    pub progress: u8,
+    pub current: Option<f64>,
+    pub total: Option<f64>,
+    pub encoder: Option<String>,
+    pub error: Option<String>,
+    pub paths: Vec<String>,
 }
 
-impl Default for BrollPreviewState {
-    fn default() -> Self {
-        Self {
-            current: Mutex::new(Vec::new()),
+struct BrollPreviewJob {
+    status: BrollPreviewJobStatus,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+pub struct BrollPreviewState {
+    current: Arc<Mutex<Vec<PathBuf>>>,
+    jobs: Arc<Mutex<HashMap<String, BrollPreviewJob>>>,
+}
+
+#[derive(Clone)]
+struct BrollPreviewProgress {
+    phase: String,
+    progress: u8,
+    current: Option<f64>,
+    total: Option<f64>,
+    encoder: Option<String>,
+}
+
+type BrollPreviewProgressCallback = Arc<dyn Fn(BrollPreviewProgress) + Send + Sync>;
+
+fn broll_preview_status_path(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
+    let _ = resolve_project_dir(pid, root.clone())?;
+    Ok(resolve_project_root(root)
+        .join(".jobs")
+        .join(format!("{pid}.broll-preview.json")))
+}
+
+fn save_broll_preview_status(
+    path: &std::path::Path,
+    status: &BrollPreviewJobStatus,
+) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Schema("B-roll preview status has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_broll_preview_status(path: &std::path::Path) -> AppResult<BrollPreviewJobStatus> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn load_recovered_broll_preview_status(path: &std::path::Path) -> AppResult<BrollPreviewJobStatus> {
+    let mut status = load_broll_preview_status(path)?;
+    if matches!(status.state.as_str(), "running" | "cancelling") {
+        status.state = "failed".into();
+        status.phase = "failed".into();
+        status.error = Some(
+            "the previous B-roll preview was interrupted when lumen-cut closed; start it again"
+                .into(),
+        );
+        save_broll_preview_status(path, &status)?;
+    }
+    Ok(status)
+}
+
+fn update_broll_preview_job(
+    jobs: &Mutex<HashMap<String, BrollPreviewJob>>,
+    pid: &str,
+    progress: BrollPreviewProgress,
+) {
+    if let Some(job) = jobs
+        .lock()
+        .expect("B-roll preview state poisoned")
+        .get_mut(pid)
+    {
+        if job.status.phase != progress.phase {
+            tracing::info!(
+                pipeline = "broll-preview",
+                pid,
+                phase = progress.phase,
+                "pipeline phase changed"
+            );
+        }
+        job.status.phase = progress.phase;
+        job.status.progress = progress.progress;
+        job.status.current = progress.current;
+        job.status.total = progress.total;
+        if progress.encoder.is_some() {
+            job.status.encoder = progress.encoder;
         }
     }
 }
@@ -2363,6 +2839,36 @@ pub async fn broll_preview(
     app: tauri::AppHandle,
     state: tauri::State<'_, BrollPreviewState>,
 ) -> AppResult<Vec<String>> {
+    broll_preview_impl(pid, at, root, app, state.inner().clone(), None).await
+}
+
+async fn broll_preview_impl(
+    pid: String,
+    at: Vec<f64>,
+    root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: BrollPreviewState,
+    on_progress: Option<BrollPreviewProgressCallback>,
+) -> AppResult<Vec<String>> {
+    if let Some(callback) = on_progress.as_ref() {
+        callback(BrollPreviewProgress {
+            phase: "waiting".into(),
+            progress: 0,
+            current: None,
+            total: None,
+            encoder: None,
+        });
+    }
+    let _heavy_work = crate::performance::acquire_heavy("broll-preview").await?;
+    if let Some(callback) = on_progress.as_ref() {
+        callback(BrollPreviewProgress {
+            phase: "preparing".into(),
+            progress: 3,
+            current: None,
+            total: None,
+            encoder: None,
+        });
+    }
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     let prepare_dir = dir.clone();
@@ -2389,20 +2895,59 @@ pub async fn broll_preview(
                 .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
         }
         current.clear();
+        if let Some(callback) = on_progress {
+            callback(BrollPreviewProgress {
+                phase: "completed".into(),
+                progress: 100,
+                current: None,
+                total: None,
+                encoder: None,
+            });
+        }
         return Ok(Vec::new());
     }
     let video = dir.join("broll-preview.mp4");
-    crate::export::render_video_with_broll(&doc, &cuts.cuts, &ass, &video, &placements).await?;
+    let render_report = on_progress.clone();
+    crate::export::video::render_video_with_broll_progress(
+        &doc,
+        &cuts.cuts,
+        &ass,
+        &video,
+        &placements,
+        crate::export::video::RenderPurpose::Preview,
+        render_report.map(|callback| {
+            Arc::new(move |progress: crate::export::video::VideoRenderProgress| {
+                callback(BrollPreviewProgress {
+                    phase: "encoding".into(),
+                    progress: 5 + ((u16::from(progress.progress) * 85) / 100) as u8,
+                    current: Some(progress.current_seconds),
+                    total: Some(progress.total_seconds),
+                    encoder: Some(progress.encoder),
+                });
+            }) as crate::export::video::VideoRenderProgressCallback
+        }),
+    )
+    .await?;
     let timestamps = if at.is_empty() {
         broll_preview_timestamps(&doc, &cuts, &placements)
     } else {
         at
     };
     let mut outputs = Vec::new();
-    for timestamp in timestamps {
+    let frame_total = timestamps.len();
+    for (index, timestamp) in timestamps.into_iter().enumerate() {
         let output = dir.join(format!("broll-preview-{timestamp:.1}.png"));
         crate::media::extract_frame(&video, timestamp, &output).await?;
         outputs.push(output.to_string_lossy().into_owned());
+        if let Some(callback) = on_progress.as_ref() {
+            callback(BrollPreviewProgress {
+                phase: "frames".into(),
+                progress: 90 + (((index + 1) * 9) / frame_total.max(1)) as u8,
+                current: Some((index + 1) as f64),
+                total: Some(frame_total as f64),
+                encoder: None,
+            });
+        }
     }
     let scope = app.asset_protocol_scope();
     let output_paths = outputs.iter().map(PathBuf::from).collect::<Vec<_>>();
@@ -2421,7 +2966,169 @@ pub async fn broll_preview(
             .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
     }
     *current = output_paths;
+    if let Some(callback) = on_progress {
+        callback(BrollPreviewProgress {
+            phase: "completed".into(),
+            progress: 100,
+            current: None,
+            total: None,
+            encoder: None,
+        });
+    }
     Ok(outputs)
+}
+
+#[tauri::command]
+pub async fn broll_preview_start(
+    pid: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrollPreviewState>,
+) -> AppResult<BrollPreviewJobStatus> {
+    let status_path = broll_preview_status_path(&pid, None)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let status = BrollPreviewJobStatus {
+        pid: pid.clone(),
+        state: "running".into(),
+        phase: "waiting".into(),
+        progress: 0,
+        current: None,
+        total: None,
+        encoder: None,
+        error: None,
+        paths: vec![],
+    };
+    {
+        let mut jobs = state.jobs.lock().expect("B-roll preview state poisoned");
+        if jobs
+            .get(&pid)
+            .is_some_and(|job| matches!(job.status.state.as_str(), "running" | "cancelling"))
+        {
+            return Err(AppError::Schema(
+                "this project already has a B-roll preview in progress".into(),
+            ));
+        }
+        jobs.insert(
+            pid.clone(),
+            BrollPreviewJob {
+                status: status.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+    }
+    let initial = status.clone();
+    let initial_path = status_path.clone();
+    if let Err(error) = run_blocking("save B-roll preview status", move || {
+        save_broll_preview_status(&initial_path, &initial)
+    })
+    .await
+    {
+        state
+            .jobs
+            .lock()
+            .expect("B-roll preview state poisoned")
+            .remove(&pid);
+        return Err(error);
+    }
+    trace_pipeline_started("broll-preview", &pid);
+
+    let preview_state = state.inner().clone();
+    let jobs = preview_state.jobs.clone();
+    let task_pid = pid.clone();
+    tauri::async_runtime::spawn(async move {
+        let progress_jobs = jobs.clone();
+        let progress_pid = task_pid.clone();
+        let work = broll_preview_impl(
+            task_pid.clone(),
+            vec![],
+            None,
+            app,
+            preview_state,
+            Some(Arc::new(move |progress| {
+                update_broll_preview_job(&progress_jobs, &progress_pid, progress);
+            })),
+        );
+        let result = crate::proc::with_cancellation(cancel, work).await;
+        let final_status = {
+            let mut guard = jobs.lock().expect("B-roll preview state poisoned");
+            let Some(job) = guard.get_mut(&task_pid) else {
+                return;
+            };
+            match result {
+                Ok(paths) => {
+                    job.status.state = "completed".into();
+                    job.status.phase = "completed".into();
+                    job.status.progress = 100;
+                    job.status.paths = paths;
+                    job.status.error = None;
+                }
+                Err(AppError::Cancelled) => {
+                    job.status.state = "cancelled".into();
+                    job.status.phase = "cancelled".into();
+                    job.status.error = None;
+                }
+                Err(error) => {
+                    job.status.state = "failed".into();
+                    job.status.phase = "failed".into();
+                    job.status.error = Some(error.to_string());
+                }
+            }
+            job.status.clone()
+        };
+        trace_pipeline_finished(
+            "broll-preview",
+            &task_pid,
+            &final_status.state,
+            final_status.error.as_deref(),
+        );
+        let _ = tokio::task::spawn_blocking(move || {
+            save_broll_preview_status(&status_path, &final_status)
+        })
+        .await;
+    });
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn broll_preview_status(
+    pid: String,
+    state: tauri::State<'_, BrollPreviewState>,
+) -> AppResult<BrollPreviewJobStatus> {
+    if let Some(status) = state
+        .jobs
+        .lock()
+        .expect("B-roll preview state poisoned")
+        .get(&pid)
+        .map(|job| job.status.clone())
+    {
+        return Ok(status);
+    }
+    let path = broll_preview_status_path(&pid, None)?;
+    run_blocking("load B-roll preview status", move || {
+        load_recovered_broll_preview_status(&path).map_err(|error| match error {
+            AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                AppError::Schema("no B-roll preview job for this project".into())
+            }
+            other => other,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn broll_preview_cancel(
+    pid: String,
+    state: tauri::State<'_, BrollPreviewState>,
+) -> AppResult<BrollPreviewJobStatus> {
+    let mut jobs = state.jobs.lock().expect("B-roll preview state poisoned");
+    let job = jobs
+        .get_mut(&pid)
+        .ok_or_else(|| AppError::Schema("no B-roll preview job for this project".into()))?;
+    if job.status.state == "running" {
+        job.cancel.store(true, Ordering::Relaxed);
+        job.status.state = "cancelling".into();
+        job.status.phase = "cancelling".into();
+    }
+    Ok(job.status.clone())
 }
 
 #[derive(Debug, Serialize)]
@@ -2432,6 +3139,7 @@ pub struct DiarizeResult {
 
 #[tauri::command]
 pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<DiarizeResult> {
+    let _heavy_work = crate::performance::acquire_heavy("speaker-analysis-cli").await?;
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     let load_dir = dir.clone();
@@ -2546,6 +3254,197 @@ pub async fn diarize_model_download() -> AppResult<crate::asr::RuntimeStatus> {
     crate::asr::download_diarize_model().await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupJobStatus {
+    pub kind: String,
+    pub state: String,
+    pub phase: String,
+    pub error: Option<String>,
+}
+
+struct SetupJob {
+    status: SetupJobStatus,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+pub struct SetupJobState {
+    job: Arc<Mutex<Option<SetupJob>>>,
+}
+
+fn setup_status_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".lumen-cut/setup-job.json")
+}
+
+fn save_setup_status(path: &std::path::Path, status: &SetupJobStatus) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Schema("setup status has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_setup_status(path: &std::path::Path) -> AppResult<SetupJobStatus> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn load_recovered_setup_status(path: &std::path::Path) -> AppResult<SetupJobStatus> {
+    let mut status = load_setup_status(path)?;
+    if matches!(status.state.as_str(), "running" | "cancelling") {
+        status.state = "failed".into();
+        status.phase = "failed".into();
+        status.error = Some(
+            "the previous setup task was interrupted when lumen-cut closed; start it again".into(),
+        );
+        save_setup_status(path, &status)?;
+    }
+    Ok(status)
+}
+
+fn setup_phase(kind: &str) -> Option<&'static str> {
+    match kind {
+        "asr-runtime" | "speaker-runtime" => Some("installing"),
+        "asr-models" | "speaker-model" => Some("downloading"),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub async fn setup_job_start(
+    kind: String,
+    state: tauri::State<'_, SetupJobState>,
+) -> AppResult<SetupJobStatus> {
+    let phase =
+        setup_phase(&kind).ok_or_else(|| AppError::Schema(format!("unknown setup job: {kind}")))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let status = SetupJobStatus {
+        kind: kind.clone(),
+        state: "running".into(),
+        phase: "waiting".into(),
+        error: None,
+    };
+    {
+        let mut active = state.job.lock().expect("setup job state poisoned");
+        if active
+            .as_ref()
+            .is_some_and(|job| matches!(job.status.state.as_str(), "running" | "cancelling"))
+        {
+            return Err(AppError::Schema(
+                "another runtime or model setup task is already running".into(),
+            ));
+        }
+        *active = Some(SetupJob {
+            status: status.clone(),
+            cancel: cancel.clone(),
+        });
+    }
+    let path = setup_status_path();
+    let initial = status.clone();
+    let initial_path = path.clone();
+    if let Err(error) = run_blocking("save setup status", move || {
+        save_setup_status(&initial_path, &initial)
+    })
+    .await
+    {
+        *state.job.lock().expect("setup job state poisoned") = None;
+        return Err(error);
+    }
+    trace_pipeline_started("setup", &kind);
+
+    let job = state.job.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(active) = job.lock().expect("setup job state poisoned").as_mut() {
+            active.status.phase = phase.into();
+        }
+        let work = async {
+            match kind.as_str() {
+                "asr-runtime" => crate::asr::install_asr_runtime().await.map(|_| ()),
+                "asr-models" => crate::asr::download_asr_models().await.map(|_| ()),
+                "speaker-runtime" => crate::asr::install_diarize_runtime().await.map(|_| ()),
+                "speaker-model" => crate::asr::download_diarize_model().await.map(|_| ()),
+                _ => unreachable!("setup kind was validated"),
+            }
+        };
+        let result = crate::proc::with_cancellation(cancel, work).await;
+        let final_status = {
+            let mut guard = job.lock().expect("setup job state poisoned");
+            let Some(active) = guard.as_mut() else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    active.status.state = "completed".into();
+                    active.status.phase = "completed".into();
+                    active.status.error = None;
+                }
+                Err(AppError::Cancelled) => {
+                    active.status.state = "cancelled".into();
+                    active.status.phase = "cancelled".into();
+                    active.status.error = None;
+                }
+                Err(error) => {
+                    active.status.state = "failed".into();
+                    active.status.phase = "failed".into();
+                    active.status.error = Some(error.to_string());
+                }
+            }
+            active.status.clone()
+        };
+        trace_pipeline_finished(
+            "setup",
+            &kind,
+            &final_status.state,
+            final_status.error.as_deref(),
+        );
+        let _ = tokio::task::spawn_blocking(move || save_setup_status(&path, &final_status)).await;
+    });
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn setup_job_status(state: tauri::State<'_, SetupJobState>) -> AppResult<SetupJobStatus> {
+    if let Some(status) = state
+        .job
+        .lock()
+        .expect("setup job state poisoned")
+        .as_ref()
+        .map(|job| job.status.clone())
+    {
+        return Ok(status);
+    }
+    let path = setup_status_path();
+    run_blocking("load setup status", move || {
+        load_recovered_setup_status(&path).map_err(|error| match error {
+            AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                AppError::Schema("no setup job has been started".into())
+            }
+            other => other,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn setup_job_cancel(state: tauri::State<'_, SetupJobState>) -> AppResult<SetupJobStatus> {
+    let mut job = state.job.lock().expect("setup job state poisoned");
+    let active = job
+        .as_mut()
+        .ok_or_else(|| AppError::Schema("no setup job is running".into()))?;
+    if active.status.state == "running" {
+        active.cancel.store(true, Ordering::Relaxed);
+        active.status.state = "cancelling".into();
+        active.status.phase = "cancelling".into();
+    }
+    Ok(active.status.clone())
+}
+
 #[tauri::command]
 pub async fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(String, usize)>> {
     let dir = resolve_project_dir(&pid, root)?.join("ai");
@@ -2565,6 +3464,25 @@ pub async fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(Str
         Ok(out)
     })
     .await
+}
+
+/// Reveal the persistent application log written by the non-blocking tracing
+/// worker. This is deliberately user-triggered; diagnostics never open windows
+/// on their own.
+#[tauri::command]
+pub async fn logs_reveal() -> AppResult<String> {
+    let dir = crate::log_directory();
+    tokio::fs::create_dir_all(&dir).await?;
+    let status = tokio::process::Command::new("open")
+        .arg(&dir)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(AppError::Schema(format!(
+            "could not reveal diagnostics folder ({status})"
+        )));
+    }
+    Ok(dir.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -2725,6 +3643,7 @@ pub async fn recording_start(
         ));
     }
     *slot = Some(session);
+    trace_pipeline_started("recording", &pid);
     Ok(RecordingStarted {
         pid,
         path: wav.to_string_lossy().into_owned(),
@@ -2787,6 +3706,7 @@ pub async fn recording_stop(
     let session = take_recording(&pid, &state)?;
     let wav = finalize_recording(session).await?;
     let info = probe(&wav).await?;
+    trace_pipeline_finished("recording", &pid, "completed", None);
     Ok(RecordingStopped {
         pid,
         path: wav.to_string_lossy().into_owned(),
@@ -2807,6 +3727,7 @@ pub async fn recording_cancel(
     if let Some(dir) = dir {
         let _ = tokio::fs::remove_dir(dir).await;
     }
+    trace_pipeline_finished("recording", &pid, "cancelled", None);
     Ok(true)
 }
 
@@ -2817,8 +3738,108 @@ pub async fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
 }
 
 /// Burn-in export: write export.ass then ffmpeg → export.mp4.
-#[tauri::command]
-pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<String> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoExportJobStatus {
+    pub pid: String,
+    #[serde(default = "default_video_export_mode")]
+    pub mode: String,
+    pub state: String,
+    pub phase: String,
+    pub progress: u8,
+    pub current_seconds: Option<f64>,
+    pub total_seconds: Option<f64>,
+    pub encoder: Option<String>,
+    pub error: Option<String>,
+    pub path: Option<String>,
+}
+
+fn default_video_export_mode() -> String {
+    "fast".into()
+}
+
+struct VideoExportJob {
+    status: VideoExportJobStatus,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+pub struct VideoExportState {
+    jobs: Arc<Mutex<HashMap<String, VideoExportJob>>>,
+}
+
+fn video_export_status_path(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
+    let _ = resolve_project_dir(pid, root.clone())?;
+    Ok(resolve_project_root(root)
+        .join(".jobs")
+        .join(format!("{pid}.video-export.json")))
+}
+
+fn save_video_export_status(
+    path: &std::path::Path,
+    status: &VideoExportJobStatus,
+) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Schema("video export status has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_video_export_status(path: &std::path::Path) -> AppResult<VideoExportJobStatus> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn load_recovered_video_export_status(path: &std::path::Path) -> AppResult<VideoExportJobStatus> {
+    let mut status = load_video_export_status(path)?;
+    if matches!(status.state.as_str(), "running" | "cancelling") {
+        status.state = "failed".into();
+        status.phase = "failed".into();
+        status.error = Some(
+            "the previous video export was interrupted when lumen-cut closed; start it again"
+                .into(),
+        );
+        save_video_export_status(path, &status)?;
+    }
+    Ok(status)
+}
+
+fn update_video_export_job(
+    jobs: &Mutex<HashMap<String, VideoExportJob>>,
+    pid: &str,
+    progress: crate::export::video::VideoRenderProgress,
+) {
+    if let Some(job) = jobs
+        .lock()
+        .expect("video export state poisoned")
+        .get_mut(pid)
+    {
+        if job.status.phase != "encoding" {
+            tracing::info!(
+                pipeline = "video-export",
+                pid,
+                phase = "encoding",
+                "pipeline phase changed"
+            );
+        }
+        job.status.phase = "encoding".into();
+        job.status.progress = progress.progress;
+        job.status.current_seconds = Some(progress.current_seconds);
+        job.status.total_seconds = Some(progress.total_seconds);
+        job.status.encoder = Some(progress.encoder);
+    }
+}
+
+async fn export_video_impl(
+    pid: String,
+    root: Option<PathBuf>,
+    mode: Option<String>,
+    on_progress: Option<crate::export::video::VideoRenderProgressCallback>,
+) -> AppResult<String> {
+    let _heavy_work = crate::performance::acquire_heavy("video-export").await?;
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     let prepare_dir = dir.clone();
@@ -2837,8 +3858,191 @@ pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<Strin
     })
     .await?;
     let mp4 = dir.join("export.mp4");
-    crate::export::render_video_with_broll(&doc, &cuts.cuts, &ass, &mp4, &broll).await?;
+    let in_progress = dir.join("export.in-progress.mp4");
+    let _ = tokio::fs::remove_file(&in_progress).await;
+    let render = crate::export::video::render_video_with_broll_options(
+        &doc,
+        &cuts.cuts,
+        &ass,
+        &in_progress,
+        &broll,
+        crate::export::video::VideoRenderOptions {
+            purpose: crate::export::video::RenderPurpose::Final,
+            mode,
+            on_progress,
+        },
+    )
+    .await;
+    if let Err(error) = render {
+        let _ = tokio::fs::remove_file(&in_progress).await;
+        return Err(error);
+    }
+    tokio::fs::rename(&in_progress, &mp4).await?;
     Ok(mp4.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<String> {
+    export_video_impl(pid, root, None, None).await
+}
+
+#[tauri::command]
+pub async fn video_export_start(
+    pid: String,
+    mode: String,
+    state: tauri::State<'_, VideoExportState>,
+) -> AppResult<VideoExportJobStatus> {
+    crate::export::video::encoder_for_mode(Some(&mode))?;
+    let status_path = video_export_status_path(&pid, None)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let status = VideoExportJobStatus {
+        pid: pid.clone(),
+        mode: mode.clone(),
+        state: "running".into(),
+        phase: "preparing".into(),
+        progress: 0,
+        current_seconds: None,
+        total_seconds: None,
+        encoder: None,
+        error: None,
+        path: None,
+    };
+    {
+        let mut jobs = state.jobs.lock().expect("video export state poisoned");
+        if jobs
+            .get(&pid)
+            .is_some_and(|job| matches!(job.status.state.as_str(), "running" | "cancelling"))
+        {
+            return Err(AppError::Schema(
+                "this project already has a video export in progress".into(),
+            ));
+        }
+        jobs.insert(
+            pid.clone(),
+            VideoExportJob {
+                status: status.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+    }
+    let initial_status = status.clone();
+    let initial_path = status_path.clone();
+    if let Err(error) = run_blocking("save video export status", move || {
+        save_video_export_status(&initial_path, &initial_status)
+    })
+    .await
+    {
+        state
+            .jobs
+            .lock()
+            .expect("video export state poisoned")
+            .remove(&pid);
+        return Err(error);
+    }
+    trace_pipeline_started("video-export", &pid);
+
+    let jobs = state.jobs.clone();
+    let task_pid = pid.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(job) = jobs
+            .lock()
+            .expect("video export state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status.phase = "waiting".into();
+        }
+        let progress_jobs = jobs.clone();
+        let progress_pid = task_pid.clone();
+        let work = export_video_impl(
+            task_pid.clone(),
+            None,
+            Some(mode),
+            Some(Arc::new(move |progress| {
+                update_video_export_job(&progress_jobs, &progress_pid, progress);
+            })),
+        );
+        let result = crate::proc::with_cancellation(cancel, work).await;
+        let final_status = {
+            let mut guard = jobs.lock().expect("video export state poisoned");
+            let Some(job) = guard.get_mut(&task_pid) else {
+                return;
+            };
+            match result {
+                Ok(path) => {
+                    job.status.state = "completed".into();
+                    job.status.phase = "completed".into();
+                    job.status.progress = 100;
+                    job.status.error = None;
+                    job.status.path = Some(path);
+                }
+                Err(AppError::Cancelled) => {
+                    job.status.state = "cancelled".into();
+                    job.status.phase = "cancelled".into();
+                    job.status.error = None;
+                }
+                Err(error) => {
+                    job.status.state = "failed".into();
+                    job.status.phase = "failed".into();
+                    job.status.error = Some(error.to_string());
+                }
+            }
+            job.status.clone()
+        };
+        trace_pipeline_finished(
+            "video-export",
+            &task_pid,
+            &final_status.state,
+            final_status.error.as_deref(),
+        );
+        let _ = tokio::task::spawn_blocking(move || {
+            save_video_export_status(&status_path, &final_status)
+        })
+        .await;
+    });
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn video_export_status(
+    pid: String,
+    state: tauri::State<'_, VideoExportState>,
+) -> AppResult<VideoExportJobStatus> {
+    if let Some(status) = state
+        .jobs
+        .lock()
+        .expect("video export state poisoned")
+        .get(&pid)
+        .map(|job| job.status.clone())
+    {
+        return Ok(status);
+    }
+    let status_path = video_export_status_path(&pid, None)?;
+    run_blocking("load video export status", move || {
+        load_recovered_video_export_status(&status_path).map_err(|error| match error {
+            AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                AppError::Schema("no video export job for this project".into())
+            }
+            other => other,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn video_export_cancel(
+    pid: String,
+    state: tauri::State<'_, VideoExportState>,
+) -> AppResult<VideoExportJobStatus> {
+    let mut jobs = state.jobs.lock().expect("video export state poisoned");
+    let job = jobs
+        .get_mut(&pid)
+        .ok_or_else(|| AppError::Schema("no video export job for this project".into()))?;
+    if job.status.state == "running" {
+        job.cancel.store(true, Ordering::Relaxed);
+        job.status.state = "cancelling".into();
+        job.status.phase = "cancelling".into();
+    }
+    Ok(job.status.clone())
 }
 
 #[tauri::command]
@@ -3107,6 +4311,15 @@ mod transcription_status_tests {
                 state: "running".into(),
                 phase: "transcribing".into(),
                 progress: 52,
+                current: Some(3),
+                total: Some(8),
+                device: Some("mlx-metal".into()),
+                elapsed_seconds: Some(20.0),
+                cpu_percent: Some(78),
+                peak_memory_mb: Some(2800),
+                memory_limit_mb: Some(6144),
+                mlx_active_memory_mb: Some(1900),
+                mlx_cache_memory_mb: Some(240),
                 error: None,
             },
         )
@@ -3120,6 +4333,139 @@ mod transcription_status_tests {
 
         let persisted = load_recovered_transcription_status(&path).unwrap();
         assert_eq!(persisted.state, "failed");
+    }
+}
+
+#[cfg(test)]
+mod speaker_analysis_status_tests {
+    use super::{
+        load_recovered_speaker_analysis_status, save_speaker_analysis_status,
+        SpeakerAnalysisJobStatus,
+    };
+
+    #[test]
+    fn interrupted_speaker_analysis_becomes_a_retryable_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("speaker.json");
+        save_speaker_analysis_status(
+            &path,
+            &SpeakerAnalysisJobStatus {
+                pid: "project-1".into(),
+                state: "running".into(),
+                phase: "embedding".into(),
+                progress: 81,
+                current: Some(3),
+                total: Some(5),
+                device: Some("mps".into()),
+                elapsed_seconds: Some(12.4),
+                cpu_percent: Some(87),
+                peak_memory_mb: Some(2431),
+                memory_limit_mb: Some(6144),
+                error: None,
+                preview: None,
+            },
+        )
+        .unwrap();
+
+        let recovered = load_recovered_speaker_analysis_status(&path).unwrap();
+        assert_eq!(recovered.state, "failed");
+        assert_eq!(recovered.phase, "failed");
+        assert_eq!(recovered.progress, 81);
+        assert!(recovered.error.unwrap().contains("start it again"));
+
+        let persisted = load_recovered_speaker_analysis_status(&path).unwrap();
+        assert_eq!(persisted.state, "failed");
+    }
+}
+
+#[cfg(test)]
+mod video_export_status_tests {
+    use super::{
+        load_recovered_video_export_status, save_video_export_status, VideoExportJobStatus,
+    };
+
+    #[test]
+    fn interrupted_video_export_becomes_a_retryable_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("export.json");
+        save_video_export_status(
+            &path,
+            &VideoExportJobStatus {
+                pid: "project-1".into(),
+                mode: "fast".into(),
+                state: "running".into(),
+                phase: "encoding".into(),
+                progress: 47,
+                current_seconds: Some(14.2),
+                total_seconds: Some(30.0),
+                encoder: Some("h264_videotoolbox".into()),
+                error: None,
+                path: None,
+            },
+        )
+        .unwrap();
+
+        let recovered = load_recovered_video_export_status(&path).unwrap();
+        assert_eq!(recovered.state, "failed");
+        assert_eq!(recovered.phase, "failed");
+        assert_eq!(recovered.progress, 47);
+        assert!(recovered.error.unwrap().contains("start it again"));
+    }
+}
+
+#[cfg(test)]
+mod setup_job_status_tests {
+    use super::{load_recovered_setup_status, save_setup_status, SetupJobStatus};
+
+    #[test]
+    fn interrupted_setup_becomes_a_retryable_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("setup.json");
+        save_setup_status(
+            &path,
+            &SetupJobStatus {
+                kind: "asr-models".into(),
+                state: "running".into(),
+                phase: "downloading".into(),
+                error: None,
+            },
+        )
+        .unwrap();
+        let recovered = load_recovered_setup_status(&path).unwrap();
+        assert_eq!(recovered.state, "failed");
+        assert!(recovered.error.unwrap().contains("start it again"));
+    }
+}
+
+#[cfg(test)]
+mod broll_preview_status_tests {
+    use super::{
+        load_recovered_broll_preview_status, save_broll_preview_status, BrollPreviewJobStatus,
+    };
+
+    #[test]
+    fn interrupted_broll_preview_becomes_a_retryable_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preview.json");
+        save_broll_preview_status(
+            &path,
+            &BrollPreviewJobStatus {
+                pid: "project-1".into(),
+                state: "running".into(),
+                phase: "encoding".into(),
+                progress: 63,
+                current: Some(20.0),
+                total: Some(30.0),
+                encoder: Some("h264_videotoolbox".into()),
+                error: None,
+                paths: vec![],
+            },
+        )
+        .unwrap();
+        let recovered = load_recovered_broll_preview_status(&path).unwrap();
+        assert_eq!(recovered.state, "failed");
+        assert_eq!(recovered.progress, 63);
+        assert!(recovered.error.unwrap().contains("start it again"));
     }
 }
 
