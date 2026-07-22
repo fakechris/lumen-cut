@@ -176,6 +176,7 @@ class DiarizeProgressTests(unittest.TestCase):
         with (
             mock.patch.dict(sys.modules, {"torch": fake_torch}),
             mock.patch.dict(DIARIZE.os.environ, {"LUMEN_CUT_DIARIZE_DEVICE": "cpu"}),
+            mock.patch.object(DIARIZE.os, "cpu_count", return_value=12),
         ):
             self.assertEqual(DIARIZE.configure_compute_backend(_Pipeline()), "cpu")
 
