@@ -399,6 +399,8 @@ beforeEach(() => {
         };
       case "settings_export":
         return "/Users/example/.lumen-cut/settings.json";
+      case "llm_models_list":
+        return ["MiniMax-M3", "MiniMax-M4-preview"];
       case "asr_status":
         return {
           pythonPath: "/Users/example/.lumen-cut/runtime/bin/python3",
@@ -643,6 +645,35 @@ test("unfinished AI tasks resume automatically when a project is reopened", asyn
   expect(await screen.findByText(/已恢复 1 个未完成任务/)).toBeVisible();
 });
 
+test("translation shows completed batches instead of an indefinite running state", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Hello world",
+        words: [{ id: "w1", text: "Hello", start: 0, end: 1 }],
+      }],
+    }],
+  };
+  taskStatusState = {
+    pending: 8,
+    done: 2,
+    kinds: [{ kind: "translate", lang: "zh", calls: 10, pending: 8, done: 2, failed: 0 }],
+    polishQuality: null,
+  };
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "翻译" }));
+
+  expect(await screen.findByText("已完成 2 / 10 批")).toBeVisible();
+  expect(screen.getByRole("progressbar", { name: "翻译进度" })).toHaveAttribute("value", "2");
+  expect(screen.getByRole("progressbar", { name: "翻译进度" })).toHaveAttribute("max", "10");
+});
+
 test("setup blocks transcription until the local runtime and models are ready", async () => {
   asrReady = false;
   render(<App />);
@@ -758,7 +789,7 @@ test("AI settings expose OpenAI-compatible, MiniMax regions, and GLM presets", a
   expect(within(provider).getByRole("option", { name: "GLM Z.AI · 海外" })).toBeVisible();
 
   fireEvent.change(provider, { target: { value: "minimax-cn" } });
-  expect(screen.getByLabelText("模型")).toHaveValue("MiniMax-M2.7");
+  expect(screen.getByLabelText("模型")).toHaveValue("MiniMax-M3");
   fireEvent.click(screen.getByText("高级：查看或覆盖服务地址"));
   expect(screen.getByLabelText("服务地址")).toHaveValue(
     "https://api.minimaxi.com/v1/chat/completions",
@@ -778,6 +809,24 @@ test("AI settings expose OpenAI-compatible, MiniMax regions, and GLM presets", a
   });
   fireEvent.change(screen.getByLabelText("模型"), { target: { value: "my-model" } });
   expect(screen.getByText("必填项已完整；保存后将在首次 AI 任务时连接")).toBeVisible();
+});
+
+test("AI settings refresh the selected provider model catalog", async () => {
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+
+  const provider = await screen.findByRole("combobox", { name: "模型服务商" });
+  fireEvent.change(provider, { target: { value: "minimax-global" } });
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-minimax" } });
+  fireEvent.click(screen.getByRole("button", { name: "获取最新模型" }));
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("llm_models_list", {
+    endpoint: "https://api.minimax.io/v1/chat/completions",
+    apiKey: "sk-minimax",
+  }));
+  expect(await screen.findByText("已从服务商获取 2 个模型")).toBeVisible();
+  fireEvent.change(screen.getByLabelText("模型"), { target: { value: "MiniMax-M4-preview" } });
+  expect(screen.getByLabelText("模型")).toHaveValue("MiniMax-M4-preview");
 });
 
 test("export requires a delivery check and exposes Final Cut output", async () => {

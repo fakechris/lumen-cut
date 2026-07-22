@@ -2,6 +2,10 @@
 
 Translate every entry in `lines` into the requested target `lang`.
 
+`contextBefore` and `contextAfter` contain nearby source lines for pronouns,
+terminology, and tone. Use them as context only; do not include their ids in
+`translations`.
+
 Return one JSON object:
 
 ```json

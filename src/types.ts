@@ -218,6 +218,7 @@ export interface TaskStatus {
   kinds: Array<{
     kind: string;
     lang?: string | null;
+    calls?: number;
     pending: number;
     done: number;
     failed: number;

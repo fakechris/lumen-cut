@@ -1,7 +1,7 @@
 //! Task orchestration: materialise calls, validate submissions, and apply
 //! completed answers back to a project.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{Allocator, PendingCall};
 use crate::data::{ClipCuts, Cut, CutKind, Doc, TranslationGroup};
 use crate::error::{AppError, AppResult};
-use crate::pipeline::{pack_by_chars, SentencePacket};
+use crate::pipeline::{pack_for_requests, SentencePacket, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST};
 
 #[derive(Debug, Clone)]
 pub struct PreparedCall {
@@ -68,10 +68,20 @@ struct TranslateLine {
     rt: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TranslateContextLine {
+    id: String,
+    source: String,
+}
+
 #[derive(Debug, Serialize)]
 struct TranslatePayload {
     lang: String,
     lines: Vec<TranslateLine>,
+    #[serde(rename = "contextBefore")]
+    context_before: Vec<TranslateContextLine>,
+    #[serde(rename = "contextAfter")]
+    context_after: Vec<TranslateContextLine>,
 }
 
 #[derive(Debug, Clone)]
@@ -487,32 +497,67 @@ fn translate_payloads(
     let lang = lang
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Schema("translate requires a target language".into()))?;
-    let packets: Vec<SentencePacket> = doc
+    let all_packets: Vec<SentencePacket> = doc
         .paragraphs
         .iter()
         .flat_map(|paragraph| paragraph.sentences.iter())
-        .filter(|sentence| {
-            !stale_only
-                || doc
-                    .translations
-                    .get(lang)
-                    .and_then(|groups| groups.get(&sentence.id))
-                    .is_none_or(|group| {
-                        group.source_text.as_deref() != Some(sentence.text.as_str())
-                    })
-        })
         .map(|sentence| SentencePacket {
             sentence_id: sentence.id.clone(),
             text: sentence.text.clone(),
             word_count: sentence.words.len(),
         })
         .collect();
+    let packets: Vec<SentencePacket> = all_packets
+        .iter()
+        .filter(|sentence| {
+            !stale_only
+                || doc
+                    .translations
+                    .get(lang)
+                    .and_then(|groups| groups.get(&sentence.sentence_id))
+                    .is_none_or(|group| {
+                        group.source_text.as_deref() != Some(sentence.text.as_str())
+                    })
+        })
+        .cloned()
+        .collect();
     let max_chars = crate::pipeline::translate::hard_chars_for_lang(lang);
-    pack_by_chars(packets, lang)
+    let positions: HashMap<&str, usize> = all_packets
+        .iter()
+        .enumerate()
+        .map(|(index, sentence)| (sentence.sentence_id.as_str(), index))
+        .collect();
+    pack_for_requests(packets, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST, lang)
         .into_iter()
         .map(|batch| {
+            let first = batch
+                .sentences
+                .first()
+                .and_then(|sentence| positions.get(sentence.sentence_id.as_str()))
+                .copied()
+                .unwrap_or_default();
+            let last = batch
+                .sentences
+                .last()
+                .and_then(|sentence| positions.get(sentence.sentence_id.as_str()))
+                .copied()
+                .unwrap_or(first);
+            let context_line = |sentence: &SentencePacket| TranslateContextLine {
+                id: sentence.sentence_id.clone(),
+                source: sentence.text.clone(),
+            };
+            let after_start = last.saturating_add(1);
+            let after_end = after_start.saturating_add(3).min(all_packets.len());
             serde_json::to_value(TranslatePayload {
                 lang: lang.to_string(),
+                context_before: all_packets[first.saturating_sub(3)..first]
+                    .iter()
+                    .map(context_line)
+                    .collect(),
+                context_after: all_packets[after_start..after_end]
+                    .iter()
+                    .map(context_line)
+                    .collect(),
                 lines: batch
                     .sentences
                     .into_iter()
@@ -1535,6 +1580,9 @@ async fn wait_and_apply_inner(
     timeout: Duration,
     project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
 ) -> AppResult<usize> {
+    if task.kind == "translate" {
+        return wait_and_apply_translation(allocator, task, timeout, project_mutation).await;
+    }
     let started = Instant::now();
     loop {
         if task
@@ -1652,6 +1700,124 @@ async fn wait_and_apply_inner(
     Ok(applied)
 }
 
+/// Translation batches are independent and safe to persist incrementally.
+/// Moving each accepted batch from pending → done immediately gives the UI a
+/// truthful progress signal and preserves useful work if a later batch fails
+/// or the app exits.
+async fn wait_and_apply_translation(
+    allocator: Arc<Allocator>,
+    task: PreparedTask,
+    timeout: Duration,
+    project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+) -> AppResult<usize> {
+    let started = Instant::now();
+    let mut remaining: BTreeSet<String> = task
+        .calls
+        .iter()
+        .map(|prepared| prepared.call.id.clone())
+        .collect();
+    let mut applied = 0usize;
+    let mut evidence = Vec::with_capacity(task.calls.len());
+    let mut errors = Vec::new();
+
+    while !remaining.is_empty() {
+        let mut progressed = false;
+        for prepared in &task.calls {
+            if !remaining.contains(&prepared.call.id) {
+                continue;
+            }
+            let Some(submission) = allocator.completed(&prepared.call.id) else {
+                continue;
+            };
+            remaining.remove(&prepared.call.id);
+            progressed = true;
+
+            if let Some(error) = submission.error {
+                record_translation_failure(prepared, &error)?;
+                errors.push(format!("task call {} failed: {error}", prepared.call.id));
+                continue;
+            }
+
+            let Some(answer) = submission.answer else {
+                let error = "submission had neither answer nor error";
+                record_translation_failure(prepared, error)?;
+                errors.push(format!("task call {} failed: {error}", prepared.call.id));
+                continue;
+            };
+            if let Err(issues) = validate_call_answer(&prepared.call, &answer.text) {
+                let error = format!("invalid completed answer: {issues:?}");
+                record_translation_failure(prepared, &error)?;
+                errors.push(format!("task call {} failed: {error}", prepared.call.id));
+                continue;
+            }
+            let request: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&prepared.pending_path)?)?;
+            let parsed_answer = match parse_answer_value(&task.kind, &answer.text) {
+                Ok(answer) => answer,
+                Err(issues) => {
+                    let error = format!("invalid answer: {issues:?}");
+                    record_translation_failure(prepared, &error)?;
+                    errors.push(format!("task call {} failed: {error}", prepared.call.id));
+                    continue;
+                }
+            };
+
+            let _mutation = if let Some(mutation) = project_mutation.clone() {
+                Some(mutation.lock_owned().await)
+            } else {
+                None
+            };
+            applied += apply_answer(&task, &prepared.call, &answer.text)?;
+            crate::data::storage::write_json(
+                &prepared.done_path,
+                &serde_json::json!({
+                    "callId": prepared.call.id,
+                    "request": request,
+                    "answer": answer,
+                }),
+            )?;
+            remove_if_exists(&prepared.pending_path)?;
+            remove_if_exists(&prepared.submitted_path)?;
+            evidence.push((request, parsed_answer));
+        }
+
+        if remaining.is_empty() {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            persist_task_artifacts(&task, &evidence, 0)?;
+            return Err(AppError::Schema(format!(
+                "task {} paused after waiting for incomplete calls; completed batches were saved",
+                task.kind
+            )));
+        }
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    persist_task_artifacts(&task, &evidence, 0)?;
+    if errors.is_empty() {
+        Ok(applied)
+    } else {
+        Err(AppError::Schema(errors.join("; ")))
+    }
+}
+
+fn record_translation_failure(prepared: &PreparedCall, error: &str) -> AppResult<()> {
+    crate::data::storage::write_json(&prepared.failed_path, &serde_json::json!({"error": error}))?;
+    remove_if_exists(&prepared.pending_path)?;
+    remove_if_exists(&prepared.submitted_path)
+}
+
+fn remove_if_exists(path: &Path) -> AppResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Io(error)),
+    }
+}
+
 fn persist_task_artifacts(
     task: &PreparedTask,
     evidence: &[(serde_json::Value, serde_json::Value)],
@@ -1665,7 +1831,11 @@ fn persist_task_artifacts(
     let previous_analysis = std::fs::read_to_string(&analysis_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok());
-    let analysis = merged_analysis(evidence, previous_analysis.as_ref());
+    let analysis = merged_analysis(
+        evidence,
+        previous_analysis.as_ref(),
+        task.kind == "translate",
+    );
     write_json_atomically(&analysis_path, &analysis)?;
 
     if task.kind != "polish" {
@@ -1744,17 +1914,33 @@ fn answer_sentences(value: &serde_json::Value, source_shape: bool) -> Vec<&str> 
 fn merged_analysis(
     evidence: &[(serde_json::Value, serde_json::Value)],
     previous: Option<&serde_json::Value>,
+    preserve_previous: bool,
 ) -> serde_json::Value {
     let mut summaries = Vec::new();
     let mut terms: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
     let mut named_entities = BTreeSet::new();
     if let Some(previous) = previous {
+        if preserve_previous {
+            if let Some(summary) = previous["summary"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+            {
+                summaries.push(summary.to_string());
+            }
+            named_entities.extend(
+                previous["namedEntities"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(str::to_string)),
+            );
+        }
         for term in previous["terms"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|term| term["locked"].as_bool() == Some(true))
+            .filter(|term| preserve_previous || term["locked"].as_bool() == Some(true))
         {
             if let Some(name) = term["term"].as_str() {
                 terms.insert(name.to_string(), term.clone());
@@ -2200,6 +2386,23 @@ mod tests {
         }
     }
 
+    fn doc_with_sentences(count: usize) -> Doc {
+        let mut doc = sample_doc();
+        doc.paragraphs[0].sentences = (0..count)
+            .map(|index| Sentence {
+                id: format!("s{index}"),
+                text: format!("Short subtitle line {index}"),
+                words: vec![Word {
+                    id: format!("w{index}"),
+                    text: "subtitle".into(),
+                    start: index as f64,
+                    end: index as f64 + 0.8,
+                }],
+            })
+            .collect();
+        doc
+    }
+
     fn answer(text: &str) -> BridgeAnswer {
         BridgeAnswer {
             text: text.into(),
@@ -2207,6 +2410,30 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
         }
+    }
+
+    fn translation_answer_for(call: &PreparedCall) -> String {
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&call.pending_path).unwrap()).unwrap();
+        let translations = payload["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| {
+                let id = line["id"].as_str().unwrap();
+                (
+                    id.to_string(),
+                    serde_json::Value::String(format!("译文 {id}")),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::json!({
+            "summary": "context",
+            "terms": [],
+            "namedEntities": [],
+            "translations": translations,
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -2338,6 +2565,131 @@ mod tests {
         assert_eq!(analysis["summary"], "x");
         assert!(tmp.path().join("ai/translate/task.json").is_file());
         assert!(!tmp.path().join("ai/translate/brief.json").is_file());
+    }
+
+    #[test]
+    fn translation_batches_large_projects_in_bounded_context_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        doc_with_sentences(800).save(tmp.path()).unwrap();
+
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+
+        assert_eq!(task.calls.len(), 25);
+        let mut payloads = Vec::new();
+        for call in &task.calls {
+            let payload: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&call.pending_path).unwrap())
+                    .unwrap();
+            assert!(payload["lines"].as_array().unwrap().len() <= 32);
+            payloads.push(payload);
+        }
+        assert_eq!(payloads[0]["contextBefore"].as_array().unwrap().len(), 0);
+        assert_eq!(payloads[0]["contextAfter"].as_array().unwrap().len(), 3);
+        assert_eq!(payloads[1]["contextBefore"].as_array().unwrap().len(), 3);
+        assert_eq!(payloads[24]["contextAfter"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn translation_persists_each_completed_batch_before_the_whole_job_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        doc_with_sentences(40).save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        assert_eq!(task.calls.len(), 2);
+        let first_done = task.calls[0].done_path.clone();
+        let first_ids = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&task.calls[0].pending_path).unwrap(),
+        )
+        .unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let first_answer = translation_answer_for(&task.calls[0]);
+        let second_answer = translation_answer_for(&task.calls[1]);
+        let allocator = Arc::new(Allocator::new(2));
+        restore_or_enqueue(&allocator, &task).unwrap();
+        let wait_allocator = allocator.clone();
+        let wait_task = task.clone();
+        let handle = tokio::spawn(async move {
+            wait_and_apply(wait_allocator, wait_task, Duration::from_secs(3)).await
+        });
+
+        let (_, first_lease) = allocator.allocate().unwrap();
+        allocator
+            .submit(&first_lease.lease_id, Some(answer(&first_answer)), None)
+            .unwrap();
+        for _ in 0..20 {
+            if first_done.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            first_done.exists(),
+            "first batch should become durable immediately"
+        );
+        let partially_saved = Doc::load(tmp.path()).unwrap();
+        assert!(first_ids
+            .iter()
+            .all(|id| partially_saved.translations["zh"].contains_key(id)));
+
+        let (_, second_lease) = allocator.allocate().unwrap();
+        allocator
+            .submit(&second_lease.lease_id, Some(answer(&second_answer)), None)
+            .unwrap();
+        assert_eq!(handle.await.unwrap().unwrap(), 40);
+    }
+
+    #[tokio::test]
+    async fn invalid_translation_batch_becomes_visible_failure_instead_of_staying_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        let pending_path = task.calls[0].pending_path.clone();
+        let failed_path = task.calls[0].failed_path.clone();
+        let allocator = Arc::new(Allocator::new(1));
+        restore_or_enqueue(&allocator, &task).unwrap();
+        let (_, lease) = allocator.allocate().unwrap();
+        allocator
+            .submit(
+                &lease.lease_id,
+                Some(answer(r#"{"translations":{}}"#)),
+                None,
+            )
+            .unwrap();
+
+        let error = wait_and_apply(allocator, task, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed"));
+        assert!(failed_path.exists());
+        assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn progressive_translation_analysis_preserves_previous_batch_context() {
+        let previous = serde_json::json!({
+            "summary": "first batch",
+            "terms": [{"term": "Lumen", "observedVariants": [], "locked": false}],
+            "namedEntities": ["Alice"],
+        });
+        let evidence = vec![(
+            serde_json::json!({}),
+            serde_json::json!({
+                "summary": "second batch",
+                "terms": [{"term": "Subtitles", "observedVariants": [], "locked": false}],
+                "namedEntities": ["Bob"],
+            }),
+        )];
+
+        let merged = merged_analysis(&evidence, Some(&previous), true);
+
+        assert_eq!(merged["summary"], "first batch\n\nsecond batch");
+        assert_eq!(merged["terms"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["namedEntities"], serde_json::json!(["Alice", "Bob"]));
     }
 
     #[test]

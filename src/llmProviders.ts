@@ -38,8 +38,9 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     id: "minimax-cn",
     label: "MiniMax · 中国大陆",
     endpoint: "https://api.minimaxi.com/v1/chat/completions",
-    model: "MiniMax-M2.7",
+    model: "MiniMax-M3",
     models: [
+      "MiniMax-M3",
       "MiniMax-M2.7",
       "MiniMax-M2.7-highspeed",
       "MiniMax-M2.5",
@@ -51,8 +52,9 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     id: "minimax-global",
     label: "MiniMax · 海外",
     endpoint: "https://api.minimax.io/v1/chat/completions",
-    model: "MiniMax-M2.7",
+    model: "MiniMax-M3",
     models: [
+      "MiniMax-M3",
       "MiniMax-M2.7",
       "MiniMax-M2.7-highspeed",
       "MiniMax-M2.5",

@@ -1777,6 +1777,13 @@ input::placeholder {
   margin-top: 4px;
 }
 
+.task-detail progress {
+  accent-color: var(--accent);
+  height: 5px;
+  margin-top: 8px;
+  width: 100%;
+}
+
 .agent-setup-callout {
   border-top: 1px solid var(--border);
   margin-top: 18px;
@@ -3590,6 +3597,31 @@ input::placeholder {
 
 .provider-endpoint-details label {
   padding-top: 8px;
+}
+
+.provider-model-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.provider-model-input .button-quiet {
+  white-space: nowrap;
+}
+
+.model-catalog-message.loaded {
+  color: var(--success);
+}
+
+.model-catalog-message.error {
+  color: var(--danger);
+}
+
+@media (max-width: 620px) {
+  .provider-model-input {
+    grid-template-columns: 1fr;
+  }
 }
 
 .save-confirmation {

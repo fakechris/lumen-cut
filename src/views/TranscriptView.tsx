@@ -483,11 +483,30 @@ export function TranscriptView({
 
   useEffect(() => {
     if (!pid || !taskState || taskState.pending < 1) return;
+    let completedBatches = taskState.done;
     const timer = window.setInterval(() => {
       void taskStatus(pid)
         .then(async (status) => {
           setTaskState(status);
+          if (status.done > completedBatches) {
+            completedBatches = status.done;
+            await reload(pid, false);
+          }
           if (status.pending > 0) await taskResume(pid);
+          else {
+            await reload(pid, false);
+            const failed = status.kinds.reduce((total, task) => total + task.failed, 0);
+            setFeedback({
+              tone: failed > 0 ? "error" : "success",
+              text: failed > 0
+                ? lang === "zh"
+                  ? `翻译已停止：${failed} 个批次失败，已完成的结果已经保存。`
+                  : `Translation stopped: ${failed} batches failed. Completed results were saved.`
+                : lang === "zh"
+                  ? "翻译完成，结果已保存。"
+                  : "Translation complete. Results were saved.",
+            });
+          }
         })
         .catch(() => window.clearInterval(timer));
     }, 2500);

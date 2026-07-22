@@ -20,7 +20,7 @@ pub use cleanup::{apply, cut_from_hit, detect, CleanupHit, CleanupKind};
 pub use polish::apply_polish;
 pub use transcribe::re_transcribe;
 pub use translate::{
-    aim_chars_for_lang, hard_chars_for_lang, pack, pack_by_chars, pack_with_lang,
-    tokens_per_word_for_lang, BriefResult, SentencePacket, TranslateBatch, TranslateStaleness,
-    DEFAULT_BUDGET,
+    aim_chars_for_lang, hard_chars_for_lang, pack, pack_by_chars, pack_for_requests,
+    pack_with_lang, tokens_per_word_for_lang, BriefResult, SentencePacket, TranslateBatch,
+    TranslateStaleness, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST,
 };

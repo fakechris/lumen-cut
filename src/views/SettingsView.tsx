@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   asrStatus,
   configShow,
+  llmModelsList,
   loadSettings,
   saveSettings,
   setupJobCancel,
@@ -73,6 +74,10 @@ const COPY = {
     model: "模型",
     modelPlaceholder: "例如 gpt-4.1-mini",
     modelHint: "可以从常用模型中选择，也可以直接输入服务商支持的其他模型 ID。",
+    refreshModels: "获取最新模型",
+    refreshingModels: "正在获取…",
+    modelsNeedKey: "先填写 API Key，再获取这个账号可用的模型。",
+    modelsLoaded: (count: number) => `已从服务商获取 ${count} 个模型`,
     workers: "并行任务数",
     save: "保存设置",
     saving: "正在保存…",
@@ -133,6 +138,10 @@ const COPY = {
     model: "Model",
     modelPlaceholder: "e.g. gpt-4.1-mini",
     modelHint: "Choose a common model or type any other model ID supported by the provider.",
+    refreshModels: "Fetch latest models",
+    refreshingModels: "Fetching…",
+    modelsNeedKey: "Add the API key to fetch models available to this account.",
+    modelsLoaded: (count: number) => `Fetched ${count} models from the provider`,
     workers: "Concurrent tasks",
     save: "Save settings",
     saving: "Saving…",
@@ -155,6 +164,25 @@ export function SettingsView({ lang, pid }: Props) {
   const [asr, setAsr] = useState<AsrStatus | null>(null);
   const [asrAction, setAsrAction] = useState<"install" | "download" | "install-speakers" | "download-speakers" | "check" | null>("check");
   const [setupJob, setSetupJob] = useState<SetupJobStatus | null>(null);
+  const [remoteModels, setRemoteModels] = useState<string[]>([]);
+  const [modelCatalogState, setModelCatalogState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [modelCatalogMessage, setModelCatalogMessage] = useState<string | null>(null);
+
+  const refreshModels = async (source: Settings = settings) => {
+    if (!source.llmEndpoint.trim()) return;
+    setModelCatalogState("loading");
+    setModelCatalogMessage(null);
+    try {
+      const models = await llmModelsList(source.llmEndpoint.trim(), source.llmApiKey.trim());
+      setRemoteModels(models);
+      setModelCatalogState("loaded");
+      setModelCatalogMessage(c.modelsLoaded(models.length));
+    } catch (error) {
+      setRemoteModels([]);
+      setModelCatalogState("error");
+      setModelCatalogMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -176,6 +204,18 @@ export function SettingsView({ lang, pid }: Props) {
           workerCount: config.workerCount,
         });
         setProviderId(inferLlmProvider(config.llmEndpoint));
+        if (config.llmEndpoint.trim()) {
+          void refreshModels({
+            asrModel: config.asrModel,
+            asrAligner: config.asrAligner,
+            diarizeModel: config.diarizeModel,
+            hfToken: config.hfToken,
+            llmEndpoint: config.llmEndpoint,
+            llmApiKey: config.llmApiKey,
+            llmModel: config.llmModel,
+            workerCount: config.workerCount,
+          });
+        }
         setAsr(status);
         if (setup && (setup.state === "running" || setup.state === "cancelling")) {
           setSetupJob(setup);
@@ -243,6 +283,10 @@ export function SettingsView({ lang, pid }: Props) {
     setSettings((previous) => ({ ...previous, [key]: value }));
 
   const selectedProvider = getLlmProvider(providerId);
+  const modelOptions = Array.from(new Set([
+    ...(selectedProvider?.models ?? []),
+    ...remoteModels,
+  ]));
   const providerConfigured = Boolean(
     settings.llmEndpoint.trim()
       && settings.llmModel.trim()
@@ -254,6 +298,9 @@ export function SettingsView({ lang, pid }: Props) {
     setProviderId(nextId);
     setState("idle");
     setMessage(null);
+    setRemoteModels([]);
+    setModelCatalogState("idle");
+    setModelCatalogMessage(null);
     if (nextId === "none") {
       setSettings((previous) => ({
         ...previous,
@@ -617,21 +664,41 @@ export function SettingsView({ lang, pid }: Props) {
                 </label>
               )}
 
-              <label>
+              <label className="provider-model-field">
                 <span>{c.model}</span>
-                <input
-                  aria-label={c.model}
-                  list={selectedProvider?.models.length ? "llm-model-options" : undefined}
-                  placeholder={c.modelPlaceholder}
-                  value={settings.llmModel}
-                  onChange={(event) => update("llmModel", event.target.value)}
-                />
-                {selectedProvider?.models.length ? (
+                <div className="provider-model-input">
+                  <input
+                    aria-label={c.model}
+                    list={modelOptions.length ? "llm-model-options" : undefined}
+                    placeholder={c.modelPlaceholder}
+                    value={settings.llmModel}
+                    onChange={(event) => update("llmModel", event.target.value)}
+                  />
+                  <button
+                    className="button-quiet"
+                    disabled={modelCatalogState === "loading"
+                      || !settings.llmEndpoint.trim()
+                      || Boolean(selectedProvider?.needsKey && !settings.llmApiKey.trim())}
+                    type="button"
+                    onClick={() => void refreshModels()}
+                  >
+                    {modelCatalogState === "loading" ? c.refreshingModels : c.refreshModels}
+                  </button>
+                </div>
+                {modelOptions.length ? (
                   <datalist id="llm-model-options">
-                    {selectedProvider.models.map((model) => <option key={model} value={model} />)}
+                    {modelOptions.map((model) => <option key={model} value={model} />)}
                   </datalist>
                 ) : null}
                 <small className="field-hint">{c.modelHint}</small>
+                {selectedProvider?.needsKey && !settings.llmApiKey.trim() ? (
+                  <small className="field-hint">{c.modelsNeedKey}</small>
+                ) : null}
+                {modelCatalogMessage ? (
+                  <small className={`field-hint model-catalog-message ${modelCatalogState}`} role={modelCatalogState === "error" ? "alert" : "status"}>
+                    {modelCatalogMessage}
+                  </small>
+                ) : null}
               </label>
 
               {selectedProvider?.custom ? (

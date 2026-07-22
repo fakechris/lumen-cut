@@ -136,6 +136,7 @@ pub fn run() {
             commands::style_get,
             commands::style_set,
             commands::config_show,
+            commands::llm_models_list,
             commands::settings_export,
         ])
         .run(tauri::generate_context!())

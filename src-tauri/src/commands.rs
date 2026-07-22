@@ -1164,6 +1164,7 @@ pub async fn task_resume(
 pub struct TaskKindStatus {
     pub kind: String,
     pub lang: Option<String>,
+    pub calls: usize,
     pub pending: usize,
     pub done: usize,
     pub failed: usize,
@@ -1234,6 +1235,12 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
                 .and_then(|value| value.get("lang"))
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
+            let calls = task_json
+                .as_ref()
+                .and_then(|value| value.get("calls"))
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(pending + done + failed);
             let last_error = std::fs::read_dir(dir.join("failed"))
                 .into_iter()
                 .flatten()
@@ -1256,6 +1263,7 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
             Some(TaskKindStatus {
                 kind,
                 lang,
+                calls,
                 pending,
                 done,
                 failed,
@@ -3476,6 +3484,89 @@ pub async fn model_list() -> Vec<String> {
     })
     .await
     .unwrap_or_default()
+}
+
+fn derive_models_endpoint(endpoint: &str) -> AppResult<String> {
+    let mut url = reqwest::Url::parse(endpoint.trim())
+        .map_err(|_| AppError::Schema("AI service URL is invalid".into()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::Schema(
+            "AI service URL must use http or https".into(),
+        ));
+    }
+    let path = url.path().trim_end_matches('/');
+    let base = [
+        "/chat/completions",
+        "/text/chatcompletion_v2",
+        "/messages",
+        "/responses",
+    ]
+    .iter()
+    .find_map(|suffix| path.strip_suffix(suffix))
+    .ok_or_else(|| {
+        AppError::Schema("cannot infer a model catalog URL from this AI service URL".into())
+    })?;
+    url.set_path(&format!("{base}/models"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
+}
+
+fn parse_llm_models(body: &str) -> AppResult<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(body)?;
+    let data = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Schema("provider returned an invalid model catalog".into()))?;
+    let mut seen = HashSet::new();
+    let models = data
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| seen.insert((*id).to_owned()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err(AppError::Schema(
+            "provider returned an empty model catalog".into(),
+        ));
+    }
+    Ok(models)
+}
+
+/// Fetch the provider's current OpenAI-compatible model catalog. This is a
+/// short asynchronous network request and never runs on the UI thread.
+#[tauri::command]
+pub async fn llm_models_list(endpoint: String, api_key: String) -> AppResult<Vec<String>> {
+    let catalog_url = derive_models_endpoint(&endpoint)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| AppError::Schema(format!("model catalog client: {error}")))?;
+    let mut request = client.get(catalog_url);
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key.trim());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| AppError::Schema(format!("model catalog request failed: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AppError::Schema(format!("model catalog response failed: {error}")))?;
+    if !status.is_success() {
+        let summary = body.chars().take(400).collect::<String>();
+        return Err(AppError::Schema(format!(
+            "model catalog returned {}: {}",
+            status.as_u16(),
+            summary
+        )));
+    }
+    parse_llm_models(&body)
 }
 
 /// Report whether local ASR can really run. This imports the Python package
@@ -5743,6 +5834,7 @@ mod tests {
         assert_eq!(status.kinds.len(), 1);
         assert_eq!(status.kinds[0].kind, "translate");
         assert_eq!(status.kinds[0].lang.as_deref(), Some("ja"));
+        assert_eq!(status.kinds[0].calls, 3);
         assert_eq!(status.kinds[0].done, 1);
         assert_eq!(status.kinds[0].failed, 1);
         assert_eq!(status.kinds[0].pending, 0);
@@ -5751,5 +5843,31 @@ mod tests {
             status.kinds[0].last_error.as_deref(),
             Some("provider rejected the request")
         );
+    }
+
+    #[test]
+    fn llm_model_catalog_uses_the_provider_api_root() {
+        assert_eq!(
+            derive_models_endpoint("https://api.minimax.io/v1/chat/completions").unwrap(),
+            "https://api.minimax.io/v1/models"
+        );
+        assert_eq!(
+            derive_models_endpoint("https://open.bigmodel.cn/api/paas/v4/chat/completions")
+                .unwrap(),
+            "https://open.bigmodel.cn/api/paas/v4/models"
+        );
+        assert_eq!(
+            derive_models_endpoint("http://localhost:11434/v1/chat/completions").unwrap(),
+            "http://localhost:11434/v1/models"
+        );
+    }
+
+    #[test]
+    fn llm_model_catalog_parses_unique_openai_compatible_ids() {
+        let models = parse_llm_models(
+            r#"{"object":"list","data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(models, vec!["MiniMax-M3", "MiniMax-M2.7"]);
     }
 }

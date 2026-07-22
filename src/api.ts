@@ -254,6 +254,10 @@ export async function configShow(): Promise<ModelConfig> {
   return invoke("config_show");
 }
 
+export async function llmModelsList(endpoint: string, apiKey: string): Promise<string[]> {
+  return invoke("llm_models_list", { endpoint, apiKey });
+}
+
 export async function asrStatus(): Promise<AsrStatus> {
   return invoke("asr_status");
 }

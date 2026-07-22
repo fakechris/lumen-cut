@@ -30,6 +30,9 @@ use serde::{Deserialize, Serialize};
 /// Token budget per call. Default is 8192 (compatible with both
 /// `gpt-4o-mini` and `claude-3-5-haiku`).
 pub const DEFAULT_BUDGET: u32 = 8192;
+/// Keep enough neighbouring cues in one request for discourse consistency
+/// without making a single provider call too large or slow to recover.
+pub const MAX_LINES_PER_REQUEST: usize = 32;
 
 /// Sentence packet that the packer consumes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,30 +67,43 @@ pub fn pack_with_lang(
     budget: u32,
     lang: &str,
 ) -> Vec<TranslateBatch> {
+    pack_for_requests(sentences, budget, usize::MAX, lang)
+}
+
+/// Pack translation calls by token budget and a hard line-count ceiling.
+/// Batches are contiguous so nearby cues provide useful context and the
+/// flattened result always preserves document order.
+pub fn pack_for_requests(
+    sentences: Vec<SentencePacket>,
+    budget: u32,
+    max_lines: usize,
+    lang: &str,
+) -> Vec<TranslateBatch> {
     let tokens_per_word = tokens_per_word_for_lang(lang);
     let mut batches: Vec<TranslateBatch> = Vec::new();
-    let mut remainders: Vec<u32> = Vec::new();
+    let mut current = TranslateBatch {
+        sentences: Vec::new(),
+        estimated_tokens: 0,
+    };
+    let max_lines = max_lines.max(1);
 
     for s in sentences {
-        let tokens = ((s.word_count as f64) * tokens_per_word).ceil() as u32;
-        // Find first batch with room.
-        let mut placed = false;
-        for (i, r) in remainders.iter_mut().enumerate() {
-            if *r >= tokens + 8 {
-                batches[i].sentences.push(s.clone());
-                batches[i].estimated_tokens += tokens + 8;
-                *r = r.saturating_sub(tokens + 8);
-                placed = true;
-                break;
-            }
+        let tokens = ((s.word_count as f64) * tokens_per_word).ceil() as u32 + 8;
+        if !current.sentences.is_empty()
+            && (current.sentences.len() >= max_lines
+                || current.estimated_tokens.saturating_add(tokens) > budget)
+        {
+            batches.push(current);
+            current = TranslateBatch {
+                sentences: Vec::new(),
+                estimated_tokens: 0,
+            };
         }
-        if !placed {
-            batches.push(TranslateBatch {
-                sentences: vec![s],
-                estimated_tokens: tokens + 8,
-            });
-            remainders.push(budget.saturating_sub(tokens + 8));
-        }
+        current.sentences.push(s);
+        current.estimated_tokens = current.estimated_tokens.saturating_add(tokens);
+    }
+    if !current.sentences.is_empty() {
+        batches.push(current);
     }
     batches
 }

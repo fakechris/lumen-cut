@@ -31,13 +31,18 @@ export function TranslationWorkspace({
   onStart,
 }: Props) {
   const languages = Object.keys(doc.translations);
-  const [selected, setSelected] = useState(languages[0] || "en");
+  const activeTaskLanguage = status?.kinds.find(
+    (item) => item.kind === "translate" && item.pending > 0 && item.lang,
+  )?.lang;
+  const [selected, setSelected] = useState(languages[0] || activeTaskLanguage || "en");
 
   useEffect(() => {
     if (languages.length > 0 && !languages.includes(selected)) {
       setSelected(languages[0]);
+    } else if (languages.length === 0 && activeTaskLanguage) {
+      setSelected(activeTaskLanguage);
     }
-  }, [languages.join("|")]);
+  }, [languages.join("|"), activeTaskLanguage]);
 
   const sentences = useMemo(
     () => doc.paragraphs.flatMap((paragraph) =>
@@ -53,6 +58,9 @@ export function TranslationWorkspace({
   const translateTask = status?.kinds.find(
     (item) => item.kind === "translate" && (!item.lang || item.lang === selected),
   );
+  const batchTotal = translateTask
+    ? translateTask.calls ?? translateTask.pending + translateTask.done + translateTask.failed
+    : 0;
 
   return (
     <div className="translation-workspace">
@@ -79,10 +87,16 @@ export function TranslationWorkspace({
                 : (lang === "zh" ? "最近翻译完成" : "Latest translation complete")}
             </strong>
             <span>
-              {translateTask.pending} {lang === "zh" ? "待处理" : "pending"} ·{" "}
-              {translateTask.done} {lang === "zh" ? "完成" : "done"}
+              {lang === "zh"
+                ? `已完成 ${translateTask.done} / ${batchTotal} 批`
+                : `${translateTask.done} / ${batchTotal} batches completed`}
               {translateTask.failed > 0 && ` · ${translateTask.failed} ${lang === "zh" ? "失败" : "failed"}`}
             </span>
+            <progress
+              aria-label={lang === "zh" ? "翻译进度" : "Translation progress"}
+              max={Math.max(batchTotal, 1)}
+              value={translateTask.done}
+            />
             {translateTask.lastError && (
               <p className="task-error-detail">{translateTask.lastError}</p>
             )}
