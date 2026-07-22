@@ -132,6 +132,7 @@ export interface TranscriptionJobStatus {
     | "extracting"
     | "analyzing"
     | "transcribing"
+    | "aligning"
     | "saving"
     | "exporting"
     | "completed"

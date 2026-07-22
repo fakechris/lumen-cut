@@ -21,7 +21,7 @@ let transcriptionStatusState: {
   state: string;
   phase: string;
   progress: number;
-  error?: string;
+  error?: string | null;
 };
 let finishCheckItems: Array<{
   code: string;
@@ -399,6 +399,22 @@ test("setup blocks transcription until the local runtime and models are ready", 
 
   expect(await screen.findAllByText(/本地转写尚未准备好/)).not.toHaveLength(0);
   expect(invoke).not.toHaveBeenCalledWith("transcription_start", expect.anything());
+});
+
+test("a long transcription reports the word-alignment phase instead of looking stuck", async () => {
+  transcriptionStatusState = {
+    pid: "project-1",
+    state: "running",
+    phase: "aligning",
+    progress: 81,
+    error: null,
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+
+  expect(await screen.findAllByText("正在生成词级时码")).not.toHaveLength(0);
+  expect(screen.getByText("81%")).toBeVisible();
+  expect(screen.getByRole("progressbar")).toHaveValue(81);
 });
 
 test("an interrupted transcription is explained and can be retried", async () => {

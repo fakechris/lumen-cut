@@ -479,8 +479,8 @@ export function saveSettings(s: Settings) {
 
 function defaultSettings(): Settings {
   return {
-    asrModel: "Qwen/Qwen3-ASR-0.6B",
-    asrAligner: "Qwen/Qwen3-ForcedAligner-0.6B",
+    asrModel: "mlx-community/Qwen3-ASR-0.6B-8bit",
+    asrAligner: "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
     diarizeModel: "pyannote/speaker-diarization-3.1",
     hfToken: "",
     llmEndpoint: "",

@@ -512,8 +512,9 @@ fn ensure_not_cancelled() -> AppResult<()> {
 
 async fn run_auto_impl<F>(args: AutoArgs, report: F) -> AppResult<AutoResult>
 where
-    F: Fn(&str, u8),
+    F: Fn(&str, u8) + Send + Sync + 'static,
 {
+    let report = Arc::new(report);
     report("preparing", 5);
     ensure_not_cancelled()?;
     let out_dir = resolve_project_root(args.out);
@@ -562,11 +563,15 @@ where
         run_blocking("model config load", || Ok(crate::data::modelconfig::load())).await?;
     let model = args.model.as_deref().unwrap_or(&model_config.asr_model);
     report("transcribing", 45);
-    let asr_out = crate::asr::transcribe_file_with_aligner(
+    let progress_report = report.clone();
+    let asr_out = crate::asr::transcribe_file_with_aligner_progress(
         &wav,
         model,
         args.lang.as_deref(),
         Some(&model_config.asr_aligner),
+        Some(Arc::new(move |progress| {
+            progress_report(&progress.phase, progress.progress);
+        })),
     )
     .await?;
     ensure_not_cancelled()?;

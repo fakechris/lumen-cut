@@ -1,5 +1,8 @@
 import importlib.util
+import json
 import pathlib
+import subprocess
+import types
 import unittest
 
 
@@ -52,6 +55,49 @@ class SidecarFormattingTests(unittest.TestCase):
     def test_cjk_uses_a_tighter_width_gate(self) -> None:
         self.assertEqual(ASR.max_cue_chars("Chinese"), 22)
         self.assertEqual(ASR.max_cue_chars("English"), 42)
+
+    def test_timestamp_pipeline_isolates_recognition_and_alignment_workers(self) -> None:
+        recognized = {
+            "language": "English",
+            "chunks": [
+                {
+                    "text": "Hello world.",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "language": "English",
+                }
+            ],
+        }
+        aligned = {
+            "segments": [
+                {"text": "Hello", "start": 0.0, "end": 0.8},
+                {"text": "world.", "start": 0.8, "end": 2.0},
+            ]
+        }
+        calls: list[tuple[list[str], str | None]] = []
+
+        def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            worker_input = kwargs.get("input")
+            calls.append((command, worker_input if isinstance(worker_input, str) else None))
+            stage = command[command.index("--worker") + 1]
+            payload = recognized if stage == "recognize" else aligned
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+        args = types.SimpleNamespace(
+            audio="/tmp/audio.wav",
+            model="asr-model",
+            language="English",
+            align="aligner-model",
+        )
+        result = ASR.run_isolated_pipeline(args, runner=runner, python="/runtime/python")
+
+        self.assertEqual(
+            [command[command.index("--worker") + 1] for command, _ in calls],
+            ["recognize", "align"],
+        )
+        self.assertIsNone(calls[0][1])
+        self.assertEqual(json.loads(calls[1][1] or "{}"), recognized)
+        self.assertEqual(result["segments"], aligned["segments"])
 
 
 if __name__ == "__main__":

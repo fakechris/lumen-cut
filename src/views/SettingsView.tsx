@@ -309,8 +309,10 @@ export function SettingsView({ lang, pid }: Props) {
               value={settings.asrModel}
               onChange={(event) => void selectAsrModel(event.target.value)}
             >
-              <option value="Qwen/Qwen3-ASR-0.6B">Qwen3-ASR 0.6B · {lang === "zh" ? "推荐" : "recommended"}</option>
-              <option value="Qwen/Qwen3-ASR-1.7B">Qwen3-ASR 1.7B · {lang === "zh" ? "更高精度" : "higher accuracy"}</option>
+              <option value="mlx-community/Qwen3-ASR-0.6B-8bit">Qwen3-ASR 0.6B · {lang === "zh" ? "低内存推荐" : "memory-efficient"}</option>
+              <option value="mlx-community/Qwen3-ASR-1.7B-8bit">Qwen3-ASR 1.7B · {lang === "zh" ? "更高精度" : "higher accuracy"}</option>
+              <option value="Qwen/Qwen3-ASR-0.6B">Qwen3-ASR 0.6B FP16 · {lang === "zh" ? "高内存兼容" : "high-memory compatibility"}</option>
+              <option value="Qwen/Qwen3-ASR-1.7B">Qwen3-ASR 1.7B FP16 · {lang === "zh" ? "高内存" : "high memory"}</option>
             </select>
           </label>
           <label>

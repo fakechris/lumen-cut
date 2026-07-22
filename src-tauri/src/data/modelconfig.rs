@@ -7,14 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Conservative defaults for Apple-silicon ASR and portable diarization.
+/// Memory-bounded defaults for Apple-silicon ASR and portable diarization.
 fn defaults() -> ModelConfig {
     ModelConfig {
-        // These ids are the native mlx-qwen3-asr runtime's supported defaults.
-        // Older mlx-audio conversions use a different weight layout and must not
-        // be reported as ready merely because they share the Qwen3-ASR name.
-        asr_model: "Qwen/Qwen3-ASR-0.6B".into(),
-        asr_aligner: "Qwen/Qwen3-ForcedAligner-0.6B".into(),
+        // The pinned mlx-qwen3-asr runtime reads these native MLX quantized
+        // checkpoints directly. Keeping both models quantized matters on unified
+        // memory machines even though the two stages also run in isolation.
+        asr_model: "mlx-community/Qwen3-ASR-0.6B-8bit".into(),
+        asr_aligner: "mlx-community/Qwen3-ForcedAligner-0.6B-4bit".into(),
         diarize_model: "pyannote/speaker-diarization-3.1".into(),
         hf_token: String::new(),
         llm_endpoint: String::new(),
@@ -53,11 +53,7 @@ pub fn load() -> ModelConfig {
         {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(s) = v.get("asrModel").and_then(|x| x.as_str()) {
-                    cfg.asr_model = match s {
-                        "mlx-community/Qwen3-ASR-0.6B-8bit" => "Qwen/Qwen3-ASR-0.6B".into(),
-                        "mlx-community/Qwen3-ASR-1.7B-8bit" => "Qwen/Qwen3-ASR-1.7B".into(),
-                        _ => s.into(),
-                    };
+                    cfg.asr_model = s.into();
                 }
                 if let Some(s) = v.get("diarizeModel").and_then(|x| x.as_str()) {
                     cfg.diarize_model = match s {
@@ -74,13 +70,7 @@ pub fn load() -> ModelConfig {
                     cfg.hf_token = s.into();
                 }
                 if let Some(s) = v.get("asrAligner").and_then(|x| x.as_str()) {
-                    cfg.asr_aligner = match s {
-                        "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
-                        | "mlx-community/Qwen3-ForcedAligner-0.6B-4bit" => {
-                            "Qwen/Qwen3-ForcedAligner-0.6B".into()
-                        }
-                        _ => s.into(),
-                    };
+                    cfg.asr_aligner = s.into();
                 }
                 if let Some(s) = v.get("llmEndpoint").and_then(|x| x.as_str()) {
                     cfg.llm_endpoint = s.into();
@@ -224,8 +214,8 @@ mod tests {
     #[test]
     fn defaults_name_supported_model_families() {
         let c = ModelConfig::default();
-        assert_eq!(c.asr_model, "Qwen/Qwen3-ASR-0.6B");
-        assert_eq!(c.asr_aligner, "Qwen/Qwen3-ForcedAligner-0.6B");
+        assert_eq!(c.asr_model, "mlx-community/Qwen3-ASR-0.6B-8bit");
+        assert_eq!(c.asr_aligner, "mlx-community/Qwen3-ForcedAligner-0.6B-4bit");
         assert_eq!(c.diarize_model, "pyannote/speaker-diarization-3.1");
         assert_eq!(c.worker_count, 4);
     }

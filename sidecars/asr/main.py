@@ -14,14 +14,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from typing import Any
 
 # Defaults supported by the pinned mlx-qwen3-asr runtime.
-DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B"
-DEFAULT_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
+DEFAULT_MODEL = "mlx-community/Qwen3-ASR-0.6B-8bit"
+DEFAULT_ALIGNER = "mlx-community/Qwen3-ForcedAligner-0.6B-4bit"
 MAX_CUE_CHARS_LATIN = 42
 MAX_CUE_CHARS_CJK = 22
+PROGRESS_PREFIX = "LUMEN_CUT_PROGRESS "
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +35,12 @@ def parse_args() -> argparse.Namespace:
                    help="force-align words (Qwen3-ForcedAligner id); "
                         "pass no value for the default aligner")
     p.add_argument("--out", default="-", help="output path or '-' for stdout")
+    p.add_argument(
+        "--worker",
+        choices=("recognize", "align"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     return p.parse_args()
 
 
@@ -129,11 +137,158 @@ def build_paragraphs(
     return [{"speaker": None, "sentences": sentences}]
 
 
+def emit_progress(phase: str, progress: int, **details: Any) -> None:
+    payload = {"phase": phase, "progress": max(0, min(100, int(progress))), **details}
+    sys.stderr.write(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stderr.flush()
+
+
+def recognition_worker(args: argparse.Namespace) -> dict[str, Any]:
+    from mlx_qwen3_asr import transcribe  # type: ignore
+
+    def on_progress(event: dict[str, Any]) -> None:
+        ratio = float(event.get("progress", 0.0) or 0.0)
+        emit_progress(
+            "transcribing",
+            45 + round(ratio * 27),
+            current=event.get("chunk_index"),
+            total=event.get("total_chunks"),
+        )
+
+    result = transcribe(
+        args.audio,
+        model=args.model,
+        language=args.language,
+        return_timestamps=False,
+        return_chunks=True,
+        on_progress=on_progress,
+    )
+    return {
+        "language": result.language or args.language,
+        "text": result.text,
+        "chunks": list(result.chunks or []),
+    }
+
+
+def alignment_worker(args: argparse.Namespace, recognized: dict[str, Any]) -> dict[str, Any]:
+    import mlx.core as mx
+    import numpy as np
+    from mlx_qwen3_asr import ForcedAligner  # type: ignore
+    from mlx_qwen3_asr.audio import SAMPLE_RATE, load_audio_np  # type: ignore
+
+    # Keep reusable buffers small. Model weights remain resident, but this worker
+    # never loads the ASR model, so both 0.6B models cannot occupy unified memory
+    # at the same time.
+    mx.set_cache_limit(256 * 1024 * 1024)
+    audio = np.asarray(load_audio_np(args.audio, sr=SAMPLE_RATE), dtype=np.float32)
+    chunks = list(recognized.get("chunks") or [])
+    aligner = ForcedAligner(args.align)
+    segments: list[dict[str, Any]] = []
+    total = len(chunks)
+    emit_progress("aligning", 72, current=0, total=total)
+
+    for index, chunk in enumerate(chunks, start=1):
+        text = str(chunk.get("text") or "").strip()
+        start = max(0.0, float(chunk.get("start", 0.0) or 0.0))
+        end = max(start, float(chunk.get("end", start) or start))
+        language = str(
+            chunk.get("language") or recognized.get("language") or args.language or ""
+        ).strip()
+        if text:
+            start_sample = min(len(audio), max(0, round(start * SAMPLE_RATE)))
+            end_sample = min(len(audio), max(start_sample, round(end * SAMPLE_RATE)))
+            chunk_audio = audio[start_sample:end_sample]
+            if language and language.lower() != "unknown" and len(chunk_audio):
+                aligned = aligner.align(chunk_audio, text, language)
+                segments.extend(
+                    {
+                        "text": item.text,
+                        "start": item.start_time + start,
+                        "end": item.end_time + start,
+                    }
+                    for item in aligned
+                )
+            else:
+                segments.append({"text": text, "start": start, "end": end})
+        mx.clear_cache()
+        emit_progress(
+            "aligning",
+            72 + round(index / max(total, 1) * 15),
+            current=index,
+            total=total,
+        )
+    return {"segments": segments}
+
+
+def _worker_command(
+    python: str, stage: str, args: argparse.Namespace
+) -> list[str]:
+    command = [
+        python,
+        __file__,
+        "--worker",
+        stage,
+        "--audio",
+        args.audio,
+        "--model",
+        args.model,
+    ]
+    if args.language:
+        command.extend(("--language", args.language))
+    if stage == "align":
+        command.extend(("--align", args.align))
+    return command
+
+
+def run_isolated_pipeline(
+    args: argparse.Namespace,
+    *,
+    runner: Any = subprocess.run,
+    python: str = sys.executable,
+) -> dict[str, Any]:
+    """Run recognition and word alignment in non-overlapping processes."""
+    recognize = runner(
+        _worker_command(python, "recognize", args),
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    recognized = json.loads(recognize.stdout)
+    if not args.align:
+        segments = [
+            {
+                "text": chunk.get("text", ""),
+                "start": chunk.get("start", 0.0),
+                "end": chunk.get("end", chunk.get("start", 0.0)),
+            }
+            for chunk in recognized.get("chunks", [])
+            if str(chunk.get("text") or "").strip()
+        ]
+        return {**recognized, "segments": segments}
+
+    align = runner(
+        _worker_command(python, "align", args),
+        input=json.dumps(recognized, ensure_ascii=False),
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    aligned = json.loads(align.stdout)
+    return {**recognized, "segments": list(aligned.get("segments") or [])}
+
+
 def main() -> int:
     args = parse_args()
 
     try:
-        from mlx_qwen3_asr import transcribe  # type: ignore
+        if args.worker == "recognize":
+            payload = recognition_worker(args)
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            return 0
+        if args.worker == "align":
+            payload = alignment_worker(args, json.load(sys.stdin))
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            return 0
     except ImportError:
         sys.stderr.write(
             "lumen_cut_asr: mlx_qwen3_asr is not installed.\n"
@@ -143,26 +298,18 @@ def main() -> int:
         return 2
 
     try:
-        result = transcribe(
-            args.audio,
-            model=args.model,
-            language=args.language,
-            return_timestamps=True,
-            # mlx-qwen3-asr resolves a model id or local path itself. Passing
-            # the id also keeps compatibility with runtime releases whose
-            # ForcedAligner class has no `from_pretrained` constructor.
-            forced_aligner=args.align,
-        )
+        result = run_isolated_pipeline(args)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"lumen_cut_asr: transcription failed: {e}\n")
         return 3
 
-    segments = list(result.segments or [])
-    paragraphs = build_paragraphs(segments, result.language or args.language)
+    segments = list(result.get("segments") or [])
+    language = result.get("language") or args.language
+    paragraphs = build_paragraphs(segments, language)
     duration = load_audio_duration(args.audio)
     out = {
         "schema_version": 1,
-        "language": result.language or args.language,
+        "language": language,
         "duration_seconds": duration,
         "paragraphs": paragraphs,
     }

@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
 use crate::error::{AppError, AppResult};
@@ -38,6 +38,18 @@ pub async fn run(bin: &str, args: &[&str]) -> AppResult<String> {
     run_with_env(bin, args, &[]).await
 }
 
+pub type ProgressLineCallback = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Run a cancellable subprocess while streaming complete stderr lines to the
+/// caller. Stdout remains reserved for the sidecar's machine-readable result.
+pub async fn run_with_progress(
+    bin: &str,
+    args: &[&str],
+    on_stderr_line: ProgressLineCallback,
+) -> AppResult<String> {
+    run_with_env_and_progress(bin, args, &[], Some(on_stderr_line)).await
+}
+
 /// Run a cancellable subprocess with a small, explicit environment overlay.
 /// This avoids process-global mutation when a local project stores credentials
 /// needed by one sidecar.
@@ -45,6 +57,15 @@ pub async fn run_with_env(
     bin: &str,
     args: &[&str],
     environment: &[(&str, &str)],
+) -> AppResult<String> {
+    run_with_env_and_progress(bin, args, environment, None).await
+}
+
+async fn run_with_env_and_progress(
+    bin: &str,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    on_stderr_line: Option<ProgressLineCallback>,
 ) -> AppResult<String> {
     let mut command = TokioCommand::new(bin);
     command
@@ -73,9 +94,24 @@ pub async fn run_with_env(
         reader.read_to_end(&mut bytes).await.map(|_| bytes)
     });
     let stderr_task = tokio::spawn(async move {
-        let mut reader = stderr;
+        let mut reader = BufReader::new(stderr);
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await.map(|_| bytes)
+        loop {
+            let mut line = Vec::new();
+            let count = reader.read_until(b'\n', &mut line).await?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&line);
+            if let Some(callback) = &on_stderr_line {
+                callback(
+                    String::from_utf8_lossy(&line)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string(),
+                );
+            }
+        }
+        Ok::<Vec<u8>, std::io::Error>(bytes)
     });
 
     let mut was_cancelled = false;
@@ -191,6 +227,27 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out, "scoped");
+    }
+
+    #[tokio::test]
+    async fn run_with_progress_streams_stderr_lines() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let out = run_with_progress(
+            "/bin/sh",
+            &[
+                "-c",
+                "printf 'LUMEN_CUT_PROGRESS {\"progress\":64}\n' >&2; printf done",
+            ],
+            Arc::new(move |line| captured.lock().unwrap().push(line)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "done");
+        assert_eq!(
+            lines.lock().unwrap().as_slice(),
+            ["LUMEN_CUT_PROGRESS {\"progress\":64}"]
+        );
     }
 
     #[tokio::test]

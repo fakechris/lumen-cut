@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -427,6 +428,23 @@ pub struct AsrWord {
     pub end: f64,
 }
 
+const PROGRESS_PREFIX: &str = "LUMEN_CUT_PROGRESS ";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AsrProgress {
+    pub phase: String,
+    pub progress: u8,
+    pub current: Option<u32>,
+    pub total: Option<u32>,
+}
+
+pub type AsrProgressCallback = Arc<dyn Fn(AsrProgress) + Send + Sync>;
+
+fn parse_sidecar_progress(line: &str) -> Option<AsrProgress> {
+    let payload = line.strip_prefix(PROGRESS_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
 impl From<AsrOutV1> for Doc {
     fn from(asr: AsrOutV1) -> Self {
         let mut word_index = 0usize;
@@ -504,6 +522,16 @@ pub async fn transcribe_file_with_aligner(
     language: Option<&str>,
     aligner: Option<&str>,
 ) -> AppResult<AsrOutV1> {
+    transcribe_file_with_aligner_progress(wav, model, language, aligner, None).await
+}
+
+pub async fn transcribe_file_with_aligner_progress(
+    wav: &Path,
+    model: &str,
+    language: Option<&str>,
+    aligner: Option<&str>,
+    on_progress: Option<AsrProgressCallback>,
+) -> AppResult<AsrOutV1> {
     let sidecar = locate_sidecar("sidecars/asr/main.py").ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_asr",
         message: "sidecar script not found — set LUMEN_CUT_ASR_SCRIPT, place it at \
@@ -517,7 +545,20 @@ pub async fn transcribe_file_with_aligner(
     info!(bin = %py.display(), args = ?args, "spawning ASR sidecar");
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let raw = proc::run(&py.to_string_lossy(), &arg_refs).await?;
+    let raw = if let Some(callback) = on_progress {
+        proc::run_with_progress(
+            &py.to_string_lossy(),
+            &arg_refs,
+            Arc::new(move |line| {
+                if let Some(progress) = parse_sidecar_progress(&line) {
+                    callback(progress);
+                }
+            }),
+        )
+        .await?
+    } else {
+        proc::run(&py.to_string_lossy(), &arg_refs).await?
+    };
     let parsed: AsrOutV1 = serde_json::from_str(&raw).map_err(|e| AppError::Sidecar {
         sidecar: "lumen_cut_asr",
         message: format!("json parse: {e}"),
@@ -595,6 +636,19 @@ fn locate_sidecar(rel: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_structured_sidecar_progress_without_accepting_log_noise() {
+        let progress = parse_sidecar_progress(
+            r#"LUMEN_CUT_PROGRESS {"phase":"aligning","progress":81,"current":12,"total":20}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.phase, "aligning");
+        assert_eq!(progress.progress, 81);
+        assert_eq!(progress.current, Some(12));
+        assert_eq!(progress.total, Some(20));
+        assert!(parse_sidecar_progress("Fetching model files").is_none());
+    }
 
     #[test]
     fn legacy_diarization_versions_reject_known_broken_combinations() {
