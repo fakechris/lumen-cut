@@ -100,13 +100,12 @@ pub fn load_hidden(dir: &Path) -> BTreeSet<String> {
 }
 
 pub fn save_hidden(dir: &Path, set: &BTreeSet<String>) -> AppResult<()> {
-    std::fs::write(
-        dir.join("hidden.json"),
-        serde_json::to_string_pretty(&HiddenFile {
+    crate::data::storage::write_json(
+        &dir.join("hidden.json"),
+        &HiddenFile {
             hidden: set.clone(),
-        })?,
-    )?;
-    Ok(())
+        },
+    )
 }
 
 /// Hide a subtitle id. Returns `true` if it was newly hidden.

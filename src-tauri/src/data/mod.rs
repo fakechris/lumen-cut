@@ -9,6 +9,7 @@ pub mod rebind;
 pub mod reindex;
 pub mod soft_cut;
 pub mod speakers;
+pub mod storage;
 pub mod substyle;
 pub mod subtitle;
 pub mod version;

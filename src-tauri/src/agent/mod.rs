@@ -11,7 +11,9 @@ pub mod pool;
 pub mod runtime;
 pub mod task;
 
-pub use allocate::{Allocator, CompletedSubmission, Lease, PendingCall, DEFAULT_CAPACITY};
+pub use allocate::{
+    Allocator, CompletedSubmission, Lease, PendingCall, SubmitError, DEFAULT_CAPACITY,
+};
 pub use bridge::{AgentBridge, BridgeAnswer, BridgeCall, BridgeConfig, BridgeError, Provider};
 pub use contract::contract_for_kind;
 pub use http::{bind, router, ServerState};

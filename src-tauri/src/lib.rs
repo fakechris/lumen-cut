@@ -67,6 +67,7 @@ pub fn run() {
             commands::transcription_status,
             commands::transcription_cancel,
             commands::task_start,
+            commands::task_resume,
             commands::task_status,
             commands::finish_check_pid,
             commands::cut_auto,

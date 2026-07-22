@@ -28,7 +28,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::agent::allocate::{Allocator, PendingCall};
+use crate::agent::allocate::{Allocator, PendingCall, SubmitError};
 use crate::agent::bridge::BridgeAnswer;
 
 #[derive(Clone)]
@@ -99,7 +99,10 @@ pub(crate) struct SubmitBody {
 
 /// Fenced submit: only the current, unexpired lease for a call is
 /// accepted — stale or duplicate workers get 409, a missing lease id 400.
-fn submit_fenced(s: &ServerState, body: SubmitBody) -> Result<String, (StatusCode, String)> {
+fn submit_fenced_blocking(
+    s: &ServerState,
+    body: SubmitBody,
+) -> Result<String, (StatusCode, String)> {
     if body.lease_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "missing lease_id".into()));
     }
@@ -123,14 +126,29 @@ fn submit_fenced(s: &ServerState, body: SubmitBody) -> Result<String, (StatusCod
     }
     s.allocator
         .submit(&body.lease_id, body.answer, body.error)
-        .ok_or((StatusCode::CONFLICT, "unknown or stale lease".into()))
+        .map_err(|error| match error {
+            SubmitError::StaleLease => (StatusCode::CONFLICT, "unknown or stale lease".into()),
+            SubmitError::Persistence(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+        })
+}
+
+async fn submit_fenced(s: &ServerState, body: SubmitBody) -> Result<String, (StatusCode, String)> {
+    let state = s.clone();
+    tokio::task::spawn_blocking(move || submit_fenced_blocking(&state, body))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("submission task failed: {error}"),
+            )
+        })?
 }
 
 pub(crate) async fn agent_submit(
     State(s): State<ServerState>,
     Json(body): Json<SubmitBody>,
 ) -> impl IntoResponse {
-    match submit_fenced(&s, body) {
+    match submit_fenced(&s, body).await {
         Ok(call_id) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "call_id": call_id})),
@@ -144,7 +162,7 @@ pub(crate) async fn agent_submit_next(
     State(s): State<ServerState>,
     Json(body): Json<SubmitBody>,
 ) -> impl IntoResponse {
-    match submit_fenced(&s, body) {
+    match submit_fenced(&s, body).await {
         Err((code, msg)) => (code, Json(serde_json::json!({"error": msg}))).into_response(),
         Ok(_) => {
             s.allocator.reap_expired();
@@ -277,6 +295,7 @@ mod tests {
             word_count: 5,
             char_count: 5,
             payload_ref: "/tmp/x".into(),
+            submission_ref: None,
             problems: vec![],
             contract: None,
         }
@@ -429,6 +448,7 @@ mod tests {
             word_count: 1,
             char_count: 5,
             payload_ref: payload.to_string_lossy().into_owned(),
+            submission_ref: None,
             problems: vec![],
             contract: None,
         });

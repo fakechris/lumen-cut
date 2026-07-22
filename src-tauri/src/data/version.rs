@@ -30,7 +30,7 @@ pub struct Lineage {
     pub nodes: Vec<VersionNode>,
     /// The currently active branch id. `None` means a single-branch working
     /// copy.
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_branch: Option<String>,
 }
 
@@ -59,10 +59,15 @@ impl Lineage {
         }
         let raw = std::fs::read_to_string(&p)?;
         let mut lineage: Self = serde_json::from_str(&raw)?;
-        if let Ok(active) = std::fs::read_to_string(dir.join("active-branch")) {
-            let active = active.trim();
-            if !active.is_empty() {
-                lineage.active_branch = Some(active.into());
+        // `lineage.json` is authoritative. `active-branch` is a legacy
+        // compatibility projection and may lag if the process exits between
+        // the two atomic file replacements.
+        if lineage.active_branch.is_none() {
+            if let Ok(active) = std::fs::read_to_string(dir.join("active-branch")) {
+                let active = active.trim();
+                if !active.is_empty() {
+                    lineage.active_branch = Some(active.into());
+                }
             }
         }
         Ok(lineage)
@@ -71,12 +76,9 @@ impl Lineage {
     /// Persist to `<dir>/lineage.json`.
     pub fn save(&self, dir: &Path) -> AppResult<()> {
         std::fs::create_dir_all(dir)?;
-        std::fs::write(
-            dir.join("lineage.json"),
-            serde_json::to_string_pretty(self)?,
-        )?;
+        crate::data::storage::write_json(&dir.join("lineage.json"), self)?;
         if let Some(active) = &self.active_branch {
-            std::fs::write(dir.join("active-branch"), active)?;
+            crate::data::storage::write(&dir.join("active-branch"), active.as_bytes())?;
         }
         Ok(())
     }
@@ -224,7 +226,7 @@ pub fn commit_snapshot(
             .is_some_and(|value| value.get("cues").is_some() && value.get("paragraphs").is_none());
         if is_flat {
             std::fs::create_dir_all(&snap_dir)?;
-            std::fs::write(snap_dir.join("doc.json"), raw)?;
+            crate::data::storage::write(&snap_dir.join("doc.json"), raw.as_bytes())?;
         }
     }
     doc.save(&snap_dir)?;
@@ -701,7 +703,31 @@ mod tests {
             assert!(value.get(key).is_some(), "missing {key}");
         }
         assert!(value.get("nodes").is_none());
-        assert!(value.get("activeBranch").is_none());
+        assert_eq!(value["activeBranch"], "main");
         assert!(value["versions"][0].get("diffs").is_none());
+    }
+
+    #[test]
+    fn authoritative_lineage_ignores_a_stale_legacy_active_branch_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lineage = Lineage {
+            active_branch: Some("main".into()),
+            ..Lineage::default()
+        };
+        lineage.branches.push(Branch {
+            id: "main".into(),
+            name: "Main".into(),
+            tip: "v1".into(),
+            root: "v1".into(),
+            created_at: chrono::Utc::now(),
+            note: String::new(),
+        });
+        lineage.save(tmp.path()).unwrap();
+        crate::data::storage::write(&tmp.path().join("active-branch"), b"stale").unwrap();
+
+        assert_eq!(
+            Lineage::load(tmp.path()).unwrap().active_branch.as_deref(),
+            Some("main")
+        );
     }
 }

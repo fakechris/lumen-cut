@@ -90,11 +90,36 @@ async fn worker_loop(allocator: Arc<Allocator>, bridge: Arc<AgentBridge>, name: 
                 .await;
             match result {
                 Ok(ans) => {
-                    allocator.submit(&lease.lease_id, Some(ans), None);
+                    let submit_allocator = allocator.clone();
+                    let lease_id = lease.lease_id.clone();
+                    let submitted = tokio::task::spawn_blocking(move || {
+                        submit_allocator.submit(&lease_id, Some(ans), None)
+                    })
+                    .await;
+                    if let Err(error) = submitted.unwrap_or_else(|error| {
+                        Err(crate::agent::SubmitError::Persistence(format!(
+                            "submission task failed: {error}"
+                        )))
+                    }) {
+                        tracing::error!(worker = %name, %error, "could not accept worker result");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(worker = %name, error = %e, "call failed");
-                    allocator.submit(&lease.lease_id, None, Some(e.to_string()));
+                    let submit_allocator = allocator.clone();
+                    let lease_id = lease.lease_id.clone();
+                    let worker_error = e.to_string();
+                    let submitted = tokio::task::spawn_blocking(move || {
+                        submit_allocator.submit(&lease_id, None, Some(worker_error))
+                    })
+                    .await;
+                    if let Err(error) = submitted.unwrap_or_else(|error| {
+                        Err(crate::agent::SubmitError::Persistence(format!(
+                            "submission task failed: {error}"
+                        )))
+                    }) {
+                        tracing::error!(worker = %name, %error, "could not persist worker failure");
+                    }
                 }
             }
         } else {
@@ -170,6 +195,7 @@ mod tests {
             word_count: 1,
             char_count: 5,
             payload_ref: p.to_string_lossy().to_string(),
+            submission_ref: None,
             problems: vec![],
             contract: Some("# Translate contract\n\nanswer shape".into()),
         };
@@ -190,6 +216,7 @@ mod tests {
             word_count: 1,
             char_count: 1,
             payload_ref: p.to_string_lossy().to_string(),
+            submission_ref: None,
             problems: vec![],
             contract: None,
         };

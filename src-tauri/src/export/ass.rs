@@ -94,11 +94,7 @@ pub fn write_ass_with(
     width: u32,
     height: u32,
 ) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, to_ass_with(doc, cuts, width, height))?;
-    Ok(())
+    crate::data::storage::write(path, to_ass_with(doc, cuts, width, height).as_bytes())
 }
 
 #[cfg(test)]

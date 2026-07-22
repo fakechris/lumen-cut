@@ -181,6 +181,14 @@ export async function taskStatus(pid: string): Promise<TaskStatus> {
   return invoke("task_status", { pid, root: null });
 }
 
+export async function taskResume(pid: string): Promise<{
+  resumed: number;
+  recoveredSubmissions: number;
+  agentPort: number | null;
+}> {
+  return invoke("task_resume", { pid, root: null });
+}
+
 export async function subtitleList(pid: string): Promise<SubtitleRow[]> {
   return invoke("subtitle_list", { pid, root: null });
 }

@@ -111,13 +111,7 @@ pub struct ResidualVariant {
 
 impl PolishQualityArtifact {
     pub fn save(&self, path: &std::path::Path) -> AppResult<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(temp, path)?;
-        Ok(())
+        crate::data::storage::write_json(path, self)
     }
 
     pub fn load(path: &std::path::Path) -> AppResult<Self> {

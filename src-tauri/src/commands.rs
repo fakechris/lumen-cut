@@ -51,6 +51,19 @@ where
     result
 }
 
+async fn persist_background_status<T, F>(
+    label: &'static str,
+    path: PathBuf,
+    status: T,
+    save: F,
+) -> AppResult<()>
+where
+    T: Send + 'static,
+    F: FnOnce(&std::path::Path, &T) -> AppResult<()> + Send + 'static,
+{
+    run_blocking(label, move || save(&path, &status)).await
+}
+
 fn trace_pipeline_started(pipeline: &str, pid: &str) {
     tracing::info!(pipeline, pid, "pipeline job started");
 }
@@ -207,11 +220,7 @@ fn load_project_local_state(dir: &std::path::Path) -> ProjectLocalState {
 }
 
 fn save_project_local_state(dir: &std::path::Path, state: &ProjectLocalState) -> AppResult<()> {
-    let target = dir.join("project-state.json");
-    let temporary = dir.join("project-state.json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(state)?)?;
-    std::fs::rename(temporary, target)?;
-    Ok(())
+    crate::data::storage::write_json(&dir.join("project-state.json"), state)
 }
 
 fn project_summary(dir: PathBuf, doc: &Doc) -> ProjectSummary {
@@ -409,18 +418,25 @@ pub async fn project_reveal(pid: String, root: Option<PathBuf>) -> AppResult<Str
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each independent pipeline state.
 pub async fn project_delete(
     pid: String,
     root: Option<PathBuf>,
     transcription: tauri::State<'_, TranscriptionState>,
     recording: tauri::State<'_, RecordingState>,
+    speakers: tauri::State<'_, SpeakerAnalysisState>,
+    broll: tauri::State<'_, BrollPreviewState>,
+    video: tauri::State<'_, VideoExportState>,
+    agents: tauri::State<'_, AgentServerState>,
 ) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let job_running = |state: &str| matches!(state, "running" | "cancelling");
     if transcription
         .jobs
         .lock()
         .expect("transcription state poisoned")
         .get(&pid)
-        .is_some_and(|job| matches!(job.status.state.as_str(), "running" | "cancelling"))
+        .is_some_and(|job| job_running(&job.status.state))
     {
         return Err(AppError::Schema(
             "cannot delete a project while transcription is running".into(),
@@ -437,7 +453,35 @@ pub async fn project_delete(
             "cannot delete a project while recording is running".into(),
         ));
     }
-    let dir = resolve_project_dir(&pid, root)?;
+    if speakers
+        .jobs
+        .lock()
+        .expect("speaker analysis state poisoned")
+        .get(&pid)
+        .is_some_and(|job| job_running(&job.status.state))
+        || broll
+            .jobs
+            .lock()
+            .expect("B-roll preview state poisoned")
+            .get(&pid)
+            .is_some_and(|job| job_running(&job.status.state))
+        || video
+            .jobs
+            .lock()
+            .expect("video export state poisoned")
+            .get(&pid)
+            .is_some_and(|job| job_running(&job.status.state))
+        || agents
+            .active_tasks
+            .lock()
+            .expect("state poisoned")
+            .iter()
+            .any(|key| key.starts_with(&format!("{}::", dir.display())))
+    {
+        return Err(AppError::Schema(
+            "cannot delete a project while a background pipeline is running".into(),
+        ));
+    }
     let _mutation = lock_project_mutation(&dir).await;
     if !tokio::fs::try_exists(&dir).await? {
         return Ok(false);
@@ -709,14 +753,7 @@ fn save_transcription_status(
     path: &std::path::Path,
     status: &TranscriptionJobStatus,
 ) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Schema("transcription status has no parent directory".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    crate::data::storage::write_json(path, status)
 }
 
 fn load_transcription_status(path: &std::path::Path) -> AppResult<TranscriptionJobStatus> {
@@ -855,41 +892,60 @@ pub async fn transcription_start(
         if result.is_err() && remove_incomplete_url_project {
             let _ = std::fs::remove_dir_all(&job_dir);
         }
-        let final_status = {
-            let mut guard = jobs.lock().expect("transcription state poisoned");
-            let Some(job) = guard.get_mut(&task_pid) else {
+        let mut final_status = {
+            let guard = jobs.lock().expect("transcription state poisoned");
+            let Some(job) = guard.get(&task_pid) else {
                 return;
             };
+            let mut status = job.status.clone();
             match result {
                 Ok(_) => {
-                    job.status.state = "completed".into();
-                    job.status.phase = "completed".into();
-                    job.status.progress = 100;
-                    job.status.error = None;
+                    status.state = "completed".into();
+                    status.phase = "completed".into();
+                    status.progress = 100;
+                    status.error = None;
                 }
                 Err(AppError::Cancelled) => {
-                    job.status.state = "cancelled".into();
-                    job.status.phase = "cancelled".into();
-                    job.status.error = None;
+                    status.state = "cancelled".into();
+                    status.phase = "cancelled".into();
+                    status.error = None;
                 }
                 Err(error) => {
-                    job.status.state = "failed".into();
-                    job.status.phase = "failed".into();
-                    job.status.error = Some(error.to_string());
+                    status.state = "failed".into();
+                    status.phase = "failed".into();
+                    status.error = Some(error.to_string());
                 }
             }
-            job.status.clone()
+            status
         };
+        let persisted = final_status.clone();
+        if let Err(error) = persist_background_status(
+            "save final transcription status",
+            status_path,
+            persisted,
+            save_transcription_status,
+        )
+        .await
+        {
+            final_status.state = "failed".into();
+            final_status.phase = "failed".into();
+            final_status.error = Some(format!(
+                "transcription finished but its recovery status could not be saved: {error}"
+            ));
+        }
+        if let Some(job) = jobs
+            .lock()
+            .expect("transcription state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         trace_pipeline_finished(
             "transcription",
             &task_pid,
             &final_status.state,
             final_status.error.as_deref(),
         );
-        let _ = tokio::task::spawn_blocking(move || {
-            save_transcription_status(&status_path, &final_status)
-        })
-        .await;
     });
     Ok(status)
 }
@@ -961,58 +1017,144 @@ pub struct TaskStartResult {
     pub agent_port: u16,
 }
 
+async fn launch_prepared_task(
+    state: &AgentServerState,
+    pid: String,
+    task: crate::agent::task::PreparedTask,
+) -> AppResult<(u16, bool, usize)> {
+    let key = format!("{}::{}", task.project_dir.display(), task.kind);
+    let (agent_port, allocator) = ensure_agent_server(state, None).await?;
+    {
+        let mut active = state.active_tasks.lock().expect("state poisoned");
+        if !active.insert(key.clone()) {
+            return Ok((agent_port, false, 0));
+        }
+    }
+    let restore_allocator = allocator.clone();
+    let restore_task = task.clone();
+    let restored = match run_blocking("task recovery", move || {
+        crate::agent::task::restore_or_enqueue(&restore_allocator, &restore_task)
+    })
+    .await
+    {
+        Ok(restored) => restored,
+        Err(error) => {
+            state
+                .active_tasks
+                .lock()
+                .expect("state poisoned")
+                .remove(&key);
+            return Err(error);
+        }
+    };
+    let project_mutation = project_mutation_mutex(&task.project_dir).await;
+    let task_kind = task.kind.clone();
+    let pending = task.calls.len();
+    let active_tasks = state.active_tasks.clone();
+    tracing::info!(
+        pipeline = "ai-task",
+        pid,
+        kind = task_kind,
+        pending,
+        restored,
+        "pipeline job started"
+    );
+    tokio::spawn(async move {
+        let result = crate::agent::task::wait_and_apply_with_lock(
+            allocator,
+            task,
+            std::time::Duration::from_secs(30 * 60),
+            project_mutation,
+        )
+        .await;
+        active_tasks.lock().expect("state poisoned").remove(&key);
+        match result {
+            Ok(applied) => tracing::info!(
+                pipeline = "ai-task",
+                pid,
+                kind = task_kind,
+                applied,
+                "pipeline job finished"
+            ),
+            Err(error) => tracing::error!(
+                pipeline = "ai-task",
+                pid,
+                kind = task_kind,
+                %error,
+                "pipeline job failed"
+            ),
+        }
+    });
+    Ok((agent_port, true, restored))
+}
+
 #[tauri::command]
 pub async fn task_start(
     state: tauri::State<'_, AgentServerState>,
     args: TaskStartArgs,
 ) -> AppResult<TaskStartResult> {
     let task_pid = args.pid.clone();
-    let task_kind = args.kind.clone();
     let dir = resolve_project_dir(&args.pid, args.root.clone())?;
     let kind = args.kind;
     let lang = args.lang;
     let task = run_blocking("task preparation", move || {
-        crate::agent::task::prepare_task_with_task_options(
-            &dir,
-            &kind,
-            lang.as_deref(),
-            crate::agent::task::TaskOptions {
-                stale_only: args.stale_only,
-                groups: args.groups,
-                align_fit: args.align_fit,
-            },
-        )
+        if let Some(task) = crate::agent::task::load_recoverable_task(&dir, &kind)? {
+            Ok(task)
+        } else {
+            crate::agent::task::prepare_task_with_task_options(
+                &dir,
+                &kind,
+                lang.as_deref(),
+                crate::agent::task::TaskOptions {
+                    stale_only: args.stale_only,
+                    groups: args.groups,
+                    align_fit: args.align_fit,
+                },
+            )
+        }
     })
     .await?;
     let pending = task.calls.len();
     let ai_dir = task.ai_dir.clone();
-    let project_mutation = project_mutation_mutex(&task.project_dir).await;
-    let (agent_port, allocator) = ensure_agent_server(&state, None).await?;
-    for prepared in &task.calls {
-        allocator.enqueue(prepared.call.clone());
-    }
-    tracing::info!(
-        pipeline = "ai-task",
-        pid = task_pid,
-        kind = task_kind,
-        pending,
-        "pipeline job started"
-    );
-    tokio::spawn(async move {
-        if let Err(error) = crate::agent::task::wait_and_apply_with_lock(
-            allocator,
-            task,
-            std::time::Duration::from_secs(30 * 60),
-            project_mutation,
-        )
-        .await
-        {
-            tracing::error!(%error, "task apply failed");
-        }
-    });
+    let (agent_port, _, _) = launch_prepared_task(&state, task_pid, task).await?;
     Ok(TaskStartResult {
         pending,
         ai_dir,
+        agent_port,
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResumeResult {
+    pub resumed: usize,
+    pub recovered_submissions: usize,
+    pub agent_port: Option<u16>,
+}
+
+#[tauri::command]
+pub async fn task_resume(
+    state: tauri::State<'_, AgentServerState>,
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<TaskResumeResult> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let tasks = run_blocking("load recoverable tasks", move || {
+        crate::agent::task::load_recoverable_tasks(&dir)
+    })
+    .await?;
+    let mut resumed = 0;
+    let mut recovered_submissions = 0;
+    let mut agent_port = None;
+    for task in tasks {
+        let (port, started, recovered) = launch_prepared_task(&state, pid.clone(), task).await?;
+        agent_port = Some(port);
+        resumed += usize::from(started);
+        recovered_submissions += recovered;
+    }
+    Ok(TaskResumeResult {
+        resumed,
+        recovered_submissions,
         agent_port,
     })
 }
@@ -1063,11 +1205,21 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
                     .filter_map(Result::ok)
                     .map(|entry| entry.file_name())
                     .collect();
+            let done_names: std::collections::BTreeSet<std::ffi::OsString> =
+                std::fs::read_dir(dir.join("done"))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect();
             let pending = std::fs::read_dir(dir.join("pending"))
                 .map(|entries| {
                     entries
                         .filter_map(Result::ok)
-                        .filter(|entry| !failed_names.contains(&entry.file_name()))
+                        .filter(|entry| {
+                            !failed_names.contains(&entry.file_name())
+                                && !done_names.contains(&entry.file_name())
+                        })
                         .count()
                 })
                 .unwrap_or_default();
@@ -1201,7 +1353,7 @@ pub async fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
             ClipCuts::new()
         };
         let added = crate::pipeline::cleanup::apply(&doc, &mut cuts);
-        std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+        crate::data::storage::write_json(&cuts_path, &cuts)?;
         Ok(added)
     })
     .await
@@ -1220,7 +1372,7 @@ pub async fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> 
         };
         let removed = cuts.restore(&cut_id);
         if removed {
-            std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+            crate::data::storage::write_json(&cuts_path, &cuts)?;
         }
         Ok(removed)
     })
@@ -1340,21 +1492,30 @@ fn write_settings_file(home: &std::path::Path, settings: &SettingsPayload) -> Ap
         uuid::Uuid::new_v4().simple()
     ));
     let body = serde_json::to_string_pretty(&settings)?;
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
+    let result = (|| -> AppResult<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&temporary, body)?;
+        std::fs::rename(&temporary, &path)?;
+        #[cfg(unix)]
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    #[cfg(not(unix))]
-    std::fs::write(&temporary, body)?;
-    std::fs::rename(temporary, &path)?;
+    result?;
     Ok(path)
 }
 
@@ -1466,6 +1627,9 @@ pub struct AgentServerState {
     /// `agent_serve` calls.
     pub worker_count: Mutex<usize>,
     pub built_in_workers_started: Mutex<bool>,
+    /// Project/kind pairs with a live apply loop. Durable task recovery may be
+    /// requested repeatedly as views mount; this prevents duplicate enqueue.
+    pub active_tasks: Arc<Mutex<HashSet<String>>>,
 }
 
 /// One app-wide microphone capture. Recording is intentionally separate from
@@ -1508,6 +1672,7 @@ impl Default for AgentServerState {
             allocator: Mutex::new(None),
             worker_count: Mutex::new(crate::agent::DEFAULT_CAPACITY),
             built_in_workers_started: Mutex::new(false),
+            active_tasks: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -1618,6 +1783,7 @@ pub async fn agent_enqueue(
             word_count,
             char_count,
             payload_ref,
+            submission_ref: None,
             problems: problems.unwrap_or_default(),
             contract,
         },
@@ -1959,14 +2125,7 @@ fn save_speaker_analysis_status(
     path: &std::path::Path,
     status: &SpeakerAnalysisJobStatus,
 ) -> AppResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::Schema("speaker analysis status has no parent directory".into())
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    crate::data::storage::write_json(path, status)
 }
 
 fn load_speaker_analysis_status(path: &std::path::Path) -> AppResult<SpeakerAnalysisJobStatus> {
@@ -2027,6 +2186,30 @@ fn paragraph_bounds(paragraph: &crate::data::Paragraph) -> Option<(f64, f64)> {
     let first = words.next()?;
     let end = words.last().unwrap_or(first).end;
     Some((first.start, end))
+}
+
+fn speaker_preview_matches_doc(doc: &Doc, preview: &SpeakerReidentifyPreview) -> bool {
+    preview.proposals.iter().all(|proposal| {
+        doc.paragraphs
+            .iter()
+            .find(|paragraph| paragraph.id == proposal.paragraph_id)
+            .and_then(|paragraph| {
+                let bounds = paragraph_bounds(paragraph)?;
+                let text = paragraph
+                    .sentences
+                    .iter()
+                    .map(|sentence| sentence.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(
+                    paragraph.speaker == proposal.current
+                        && (bounds.0 - proposal.start).abs() <= 0.001
+                        && (bounds.1 - proposal.end).abs() <= 0.001
+                        && text == proposal.text,
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[tauri::command]
@@ -2227,44 +2410,63 @@ pub async fn speaker_reidentify_start(
             })),
         );
         let result = crate::proc::with_cancellation(cancel, work).await;
-        let final_status = {
-            let mut guard = jobs.lock().expect("speaker analysis state poisoned");
-            let Some(job) = guard.get_mut(&task_pid) else {
+        let mut final_status = {
+            let guard = jobs.lock().expect("speaker analysis state poisoned");
+            let Some(job) = guard.get(&task_pid) else {
                 return;
             };
+            let mut status = job.status.clone();
             match result {
                 Ok(preview) => {
-                    job.status.state = "completed".into();
-                    job.status.phase = "completed".into();
-                    job.status.progress = 100;
-                    job.status.current = None;
-                    job.status.total = None;
-                    job.status.error = None;
-                    job.status.preview = Some(preview);
+                    status.state = "completed".into();
+                    status.phase = "completed".into();
+                    status.progress = 100;
+                    status.current = None;
+                    status.total = None;
+                    status.error = None;
+                    status.preview = Some(preview);
                 }
                 Err(AppError::Cancelled) => {
-                    job.status.state = "cancelled".into();
-                    job.status.phase = "cancelled".into();
-                    job.status.error = None;
+                    status.state = "cancelled".into();
+                    status.phase = "cancelled".into();
+                    status.error = None;
                 }
                 Err(error) => {
-                    job.status.state = "failed".into();
-                    job.status.phase = "failed".into();
-                    job.status.error = Some(error.to_string());
+                    status.state = "failed".into();
+                    status.phase = "failed".into();
+                    status.error = Some(error.to_string());
                 }
             }
-            job.status.clone()
+            status
         };
+        let persisted = final_status.clone();
+        if let Err(error) = persist_background_status(
+            "save final speaker analysis status",
+            status_path,
+            persisted,
+            save_speaker_analysis_status,
+        )
+        .await
+        {
+            final_status.state = "failed".into();
+            final_status.phase = "failed".into();
+            final_status.error = Some(format!(
+                "speaker analysis finished but its proposal could not be saved: {error}"
+            ));
+        }
+        if let Some(job) = jobs
+            .lock()
+            .expect("speaker analysis state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         trace_pipeline_finished(
             "speaker-analysis",
             &task_pid,
             &final_status.state,
             final_status.error.as_deref(),
         );
-        let _ = tokio::task::spawn_blocking(move || {
-            save_speaker_analysis_status(&status_path, &final_status)
-        })
-        .await;
     });
     Ok(status)
 }
@@ -2274,25 +2476,46 @@ pub async fn speaker_reidentify_status(
     pid: String,
     state: tauri::State<'_, SpeakerAnalysisState>,
 ) -> AppResult<SpeakerAnalysisJobStatus> {
-    if let Some(status) = state
+    let memory_status = state
         .jobs
         .lock()
         .expect("speaker analysis state poisoned")
         .get(&pid)
-        .map(|job| job.status.clone())
-    {
-        return Ok(status);
-    }
+        .map(|job| job.status.clone());
+    let project_dir = resolve_project_dir(&pid, None)?;
     let status_path = speaker_analysis_status_path(&pid, None)?;
-    run_blocking("load speaker analysis status", move || {
-        load_recovered_speaker_analysis_status(&status_path).map_err(|error| match error {
-            AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                AppError::Schema("no speaker analysis job for this project".into())
+    let status = run_blocking("load speaker analysis status", move || {
+        let mut status =
+            match memory_status {
+                Some(status) => status,
+                None => load_recovered_speaker_analysis_status(&status_path).map_err(|error| {
+                    match error {
+                        AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                            AppError::Schema("no speaker analysis job for this project".into())
+                        }
+                        other => other,
+                    }
+                })?,
+            };
+        if let Some(preview) = status.preview.as_ref() {
+            let doc = Doc::load(&project_dir)?;
+            if !speaker_preview_matches_doc(&doc, preview) {
+                status.preview = None;
+                save_speaker_analysis_status(&status_path, &status)?;
             }
-            other => other,
-        })
+        }
+        Ok(status)
     })
-    .await
+    .await?;
+    if let Some(job) = state
+        .jobs
+        .lock()
+        .expect("speaker analysis state poisoned")
+        .get_mut(&pid)
+    {
+        job.status = status.clone();
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2461,14 +2684,7 @@ fn save_broll_preview_status(
     path: &std::path::Path,
     status: &BrollPreviewJobStatus,
 ) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Schema("B-roll preview status has no parent directory".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    crate::data::storage::write_json(path, status)
 }
 
 fn load_broll_preview_status(path: &std::path::Path) -> AppResult<BrollPreviewJobStatus> {
@@ -3048,42 +3264,61 @@ pub async fn broll_preview_start(
             })),
         );
         let result = crate::proc::with_cancellation(cancel, work).await;
-        let final_status = {
-            let mut guard = jobs.lock().expect("B-roll preview state poisoned");
-            let Some(job) = guard.get_mut(&task_pid) else {
+        let mut final_status = {
+            let guard = jobs.lock().expect("B-roll preview state poisoned");
+            let Some(job) = guard.get(&task_pid) else {
                 return;
             };
+            let mut status = job.status.clone();
             match result {
                 Ok(paths) => {
-                    job.status.state = "completed".into();
-                    job.status.phase = "completed".into();
-                    job.status.progress = 100;
-                    job.status.paths = paths;
-                    job.status.error = None;
+                    status.state = "completed".into();
+                    status.phase = "completed".into();
+                    status.progress = 100;
+                    status.paths = paths;
+                    status.error = None;
                 }
                 Err(AppError::Cancelled) => {
-                    job.status.state = "cancelled".into();
-                    job.status.phase = "cancelled".into();
-                    job.status.error = None;
+                    status.state = "cancelled".into();
+                    status.phase = "cancelled".into();
+                    status.error = None;
                 }
                 Err(error) => {
-                    job.status.state = "failed".into();
-                    job.status.phase = "failed".into();
-                    job.status.error = Some(error.to_string());
+                    status.state = "failed".into();
+                    status.phase = "failed".into();
+                    status.error = Some(error.to_string());
                 }
             }
-            job.status.clone()
+            status
         };
+        let persisted = final_status.clone();
+        if let Err(error) = persist_background_status(
+            "save final B-roll preview status",
+            status_path,
+            persisted,
+            save_broll_preview_status,
+        )
+        .await
+        {
+            final_status.state = "failed".into();
+            final_status.phase = "failed".into();
+            final_status.error = Some(format!(
+                "B-roll preview finished but its recovery status could not be saved: {error}"
+            ));
+        }
+        if let Some(job) = jobs
+            .lock()
+            .expect("B-roll preview state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         trace_pipeline_finished(
             "broll-preview",
             &task_pid,
             &final_status.state,
             final_status.error.as_deref(),
         );
-        let _ = tokio::task::spawn_blocking(move || {
-            save_broll_preview_status(&status_path, &final_status)
-        })
-        .await;
     });
     Ok(status)
 }
@@ -3158,8 +3393,28 @@ pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<Diariz
     let segments = out.segments;
     let segment_count = segments.len();
     let paragraphs_assigned = run_blocking("diarization save", move || {
+        let original = doc.clone();
         let paragraphs_assigned = crate::diarize::assign_speakers(&mut doc, &segments);
-        doc.save(&dir)?;
+        if paragraphs_assigned > 0 && doc != original {
+            if !working_head_is_committed(&dir, &original)? {
+                let mut lineage = crate::data::version::Lineage::load(&dir)?;
+                let branch = lineage
+                    .active_branch
+                    .clone()
+                    .unwrap_or_else(|| "main".into());
+                crate::data::version::commit_snapshot(
+                    &dir,
+                    &original,
+                    &mut lineage,
+                    &branch,
+                    "Before speaker diarization",
+                    "automatic recovery snapshot",
+                    crate::data::version::VersionKind::Auto,
+                )?;
+            }
+            doc.meta.updated_at = chrono::Utc::now();
+            doc.save(&dir)?;
+        }
         Ok(paragraphs_assigned)
     })
     .await?;
@@ -3281,14 +3536,7 @@ fn setup_status_path() -> PathBuf {
 }
 
 fn save_setup_status(path: &std::path::Path, status: &SetupJobStatus) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Schema("setup status has no parent directory".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    crate::data::storage::write_json(path, status)
 }
 
 fn load_setup_status(path: &std::path::Path) -> AppResult<SetupJobStatus> {
@@ -3373,37 +3621,55 @@ pub async fn setup_job_start(
             }
         };
         let result = crate::proc::with_cancellation(cancel, work).await;
-        let final_status = {
-            let mut guard = job.lock().expect("setup job state poisoned");
-            let Some(active) = guard.as_mut() else {
+        let mut final_status = {
+            let guard = job.lock().expect("setup job state poisoned");
+            let Some(active) = guard.as_ref() else {
                 return;
             };
+            let mut status = active.status.clone();
             match result {
                 Ok(()) => {
-                    active.status.state = "completed".into();
-                    active.status.phase = "completed".into();
-                    active.status.error = None;
+                    status.state = "completed".into();
+                    status.phase = "completed".into();
+                    status.error = None;
                 }
                 Err(AppError::Cancelled) => {
-                    active.status.state = "cancelled".into();
-                    active.status.phase = "cancelled".into();
-                    active.status.error = None;
+                    status.state = "cancelled".into();
+                    status.phase = "cancelled".into();
+                    status.error = None;
                 }
                 Err(error) => {
-                    active.status.state = "failed".into();
-                    active.status.phase = "failed".into();
-                    active.status.error = Some(error.to_string());
+                    status.state = "failed".into();
+                    status.phase = "failed".into();
+                    status.error = Some(error.to_string());
                 }
             }
-            active.status.clone()
+            status
         };
+        let persisted = final_status.clone();
+        if let Err(error) = persist_background_status(
+            "save final setup status",
+            path,
+            persisted,
+            save_setup_status,
+        )
+        .await
+        {
+            final_status.state = "failed".into();
+            final_status.phase = "failed".into();
+            final_status.error = Some(format!(
+                "setup finished but its recovery status could not be saved: {error}"
+            ));
+        }
+        if let Some(active) = job.lock().expect("setup job state poisoned").as_mut() {
+            active.status = final_status.clone();
+        }
         trace_pipeline_finished(
             "setup",
             &kind,
             &final_status.state,
             final_status.error.as_deref(),
         );
-        let _ = tokio::task::spawn_blocking(move || save_setup_status(&path, &final_status)).await;
     });
     Ok(status)
 }
@@ -3779,14 +4045,7 @@ fn save_video_export_status(
     path: &std::path::Path,
     status: &VideoExportJobStatus,
 ) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Schema("video export status has no parent directory".into()))?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(status)?)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    crate::data::storage::write_json(path, status)
 }
 
 fn load_video_export_status(path: &std::path::Path) -> AppResult<VideoExportJobStatus> {
@@ -3877,7 +4136,15 @@ async fn export_video_impl(
         let _ = tokio::fs::remove_file(&in_progress).await;
         return Err(error);
     }
-    tokio::fs::rename(&in_progress, &mp4).await?;
+    let final_path = mp4.clone();
+    run_blocking("finalize video export", move || {
+        std::fs::File::open(&in_progress)?.sync_all()?;
+        std::fs::rename(&in_progress, &final_path)?;
+        #[cfg(unix)]
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })
+    .await?;
     Ok(mp4.to_string_lossy().into_owned())
 }
 
@@ -3962,42 +4229,61 @@ pub async fn video_export_start(
             })),
         );
         let result = crate::proc::with_cancellation(cancel, work).await;
-        let final_status = {
-            let mut guard = jobs.lock().expect("video export state poisoned");
-            let Some(job) = guard.get_mut(&task_pid) else {
+        let mut final_status = {
+            let guard = jobs.lock().expect("video export state poisoned");
+            let Some(job) = guard.get(&task_pid) else {
                 return;
             };
+            let mut status = job.status.clone();
             match result {
                 Ok(path) => {
-                    job.status.state = "completed".into();
-                    job.status.phase = "completed".into();
-                    job.status.progress = 100;
-                    job.status.error = None;
-                    job.status.path = Some(path);
+                    status.state = "completed".into();
+                    status.phase = "completed".into();
+                    status.progress = 100;
+                    status.error = None;
+                    status.path = Some(path);
                 }
                 Err(AppError::Cancelled) => {
-                    job.status.state = "cancelled".into();
-                    job.status.phase = "cancelled".into();
-                    job.status.error = None;
+                    status.state = "cancelled".into();
+                    status.phase = "cancelled".into();
+                    status.error = None;
                 }
                 Err(error) => {
-                    job.status.state = "failed".into();
-                    job.status.phase = "failed".into();
-                    job.status.error = Some(error.to_string());
+                    status.state = "failed".into();
+                    status.phase = "failed".into();
+                    status.error = Some(error.to_string());
                 }
             }
-            job.status.clone()
+            status
         };
+        let persisted = final_status.clone();
+        if let Err(error) = persist_background_status(
+            "save final video export status",
+            status_path,
+            persisted,
+            save_video_export_status,
+        )
+        .await
+        {
+            final_status.state = "failed".into();
+            final_status.phase = "failed".into();
+            final_status.error = Some(format!(
+                "video export finished but its recovery status could not be saved: {error}"
+            ));
+        }
+        if let Some(job) = jobs
+            .lock()
+            .expect("video export state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         trace_pipeline_finished(
             "video-export",
             &task_pid,
             &final_status.state,
             final_status.error.as_deref(),
         );
-        let _ = tokio::task::spawn_blocking(move || {
-            save_video_export_status(&status_path, &final_status)
-        })
-        .await;
     });
     Ok(status)
 }
@@ -4379,6 +4665,27 @@ mod speaker_analysis_status_tests {
 }
 
 #[cfg(test)]
+mod background_status_persistence_tests {
+    use super::persist_background_status;
+    use crate::error::AppError;
+
+    #[tokio::test]
+    async fn a_final_status_write_failure_is_never_reported_as_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = persist_background_status(
+            "persist test status",
+            temp.path().join("status.json"),
+            "completed".to_string(),
+            |_path, _status| Err(AppError::Schema("disk unavailable".into())),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("disk unavailable"));
+    }
+}
+
+#[cfg(test)]
 mod video_export_status_tests {
     use super::{
         load_recovered_video_export_status, save_video_export_status, VideoExportJobStatus,
@@ -4558,12 +4865,7 @@ pub async fn style_set(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle style save", move || {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join("style.json"),
-            serde_json::to_string_pretty(&style)?,
-        )?;
-        Ok(())
+        crate::data::storage::write_json(&dir.join("style.json"), &style)
     })
     .await
 }
@@ -4873,6 +5175,16 @@ mod tests {
             coverage: 0.95,
             margin: 0.9,
         }];
+        let preview = SpeakerReidentifyPreview {
+            segments: 1,
+            changed: 1,
+            unassigned: 0,
+            proposals: proposals.clone(),
+        };
+        assert!(speaker_preview_matches_doc(
+            &Doc::load(&project).unwrap(),
+            &preview
+        ));
         assert_eq!(
             speaker_reidentify_apply(
                 "p1".into(),
@@ -4889,6 +5201,10 @@ mod tests {
                 .as_deref(),
             Some("SPEAKER_00")
         );
+        assert!(!speaker_preview_matches_doc(
+            &Doc::load(&project).unwrap(),
+            &preview
+        ));
         assert_eq!(
             version_list("p1".into(), Some(tmp.path().to_path_buf()))
                 .await
@@ -5342,6 +5658,7 @@ mod tests {
                     word_count: 5,
                     char_count: 5,
                     payload_ref: "/tmp/x".into(),
+                    submission_ref: None,
                     problems: vec![],
                     contract: None,
                 },

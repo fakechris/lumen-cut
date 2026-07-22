@@ -738,7 +738,7 @@ async fn run_cli() -> AppResult<()> {
             };
             if let Some(id) = restore {
                 if cuts.restore(&id) {
-                    std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+                    lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
                     emit!(
                         json,
                         serde_json::json!({"id": id, "restored": true, "total": cuts.cuts.len()}),
@@ -758,7 +758,7 @@ async fn run_cli() -> AppResult<()> {
                 // cut per detected filler word. Stage 4 ships the
                 // minimal `pipeline::cleanup::detect` + apply path.
                 let added = lumen_cut::pipeline::cleanup::apply(&doc, &mut cuts);
-                std::fs::write(&cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+                lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
                 emit!(
                     json,
                     serde_json::json!({"pid": pid, "added": added, "total": cuts.cuts.len()}),
@@ -1576,16 +1576,20 @@ async fn task_start(
     root: &Path,
 ) -> AppResult<usize> {
     let dir = root.join(pid);
-    let task = lumen_cut::agent::task::prepare_task_with_task_options(
-        &dir,
-        kind,
-        lang,
-        lumen_cut::agent::task::TaskOptions {
-            stale_only,
-            groups,
-            align_fit,
-        },
-    )?;
+    let task = if let Some(task) = lumen_cut::agent::task::load_recoverable_task(&dir, kind)? {
+        task
+    } else {
+        lumen_cut::agent::task::prepare_task_with_task_options(
+            &dir,
+            kind,
+            lang,
+            lumen_cut::agent::task::TaskOptions {
+                stale_only,
+                groups,
+                align_fit,
+            },
+        )?
+    };
     let pending = task.calls.len();
     let capacity = lumen_cut::data::modelconfig::load().worker_count.max(1) as usize;
     let allocator = std::sync::Arc::new(lumen_cut::agent::Allocator::new(capacity));
@@ -1608,9 +1612,8 @@ async fn task_start(
             local_addr.port()
         );
     }
-    for prepared in &task.calls {
-        allocator.enqueue(prepared.call.clone());
-    }
+    let recovered = lumen_cut::agent::task::restore_or_enqueue(&allocator, &task)?;
+    info!(kind, pid, recovered, "restored durable task submissions");
     let applied = lumen_cut::agent::task::wait_and_apply(
         allocator,
         task,

@@ -100,6 +100,12 @@ let brollPreviewStatusState: {
   error: string | null;
   paths: string[];
 };
+let taskStatusState: {
+  pending: number;
+  done: number;
+  kinds: Array<Record<string, unknown>>;
+  polishQuality: null;
+};
 
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (path: string) => `asset://${path}`,
@@ -202,6 +208,7 @@ beforeEach(() => {
     error: null,
     paths: [],
   };
+  taskStatusState = { pending: 0, done: 0, kinds: [], polishQuality: null };
   invoke.mockReset();
   projectDoc = structuredClone(serializedProject);
   invoke.mockImplementation(async (command) => {
@@ -341,7 +348,9 @@ beforeEach(() => {
           marginV: 80,
         };
       case "task_status":
-        return { pending: 0, done: 0, kinds: [], polishQuality: null };
+        return taskStatusState;
+      case "task_resume":
+        return { resumed: 1, recoveredSubmissions: 1, agentPort: 3417 };
       case "version_list":
         return { v: 1, head: null, activeBranch: null, branches: [], versions: [] };
       case "broll_list":
@@ -573,6 +582,52 @@ test("speaker analysis exposes its current phase and real progress", async () =>
   expect(screen.getByText("81%")).toBeVisible();
   expect(screen.getByRole("progressbar", { name: "说话人分析进度" })).toHaveValue(81);
   expect(screen.getByText(/处理批次 3 \/ 5/)).toBeVisible();
+});
+
+test("a completed speaker proposal is restored after reopening the app", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Alice",
+      sentences: [{
+        id: "s1",
+        text: "Hello world",
+        words: [
+          { id: "w1", text: "Hello", start: 0, end: 0.5 },
+          { id: "w2", text: "world", start: 0.5, end: 1 },
+        ],
+      }],
+    }],
+  };
+  speakerAnalysisHasExistingJob = true;
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "属性" }));
+
+  expect(await screen.findByText("1 个段落标签将改变")).toBeVisible();
+  expect(screen.getByText("Alice → SPEAKER_00")).toBeVisible();
+});
+
+test("unfinished AI tasks resume automatically when a project is reopened", async () => {
+  taskStatusState = {
+    pending: 1,
+    done: 0,
+    kinds: [{ kind: "translate", pending: 1, done: 0, failed: 0 }],
+    polishQuality: null,
+  };
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+
+  await waitFor(() => {
+    expect(invoke).toHaveBeenCalledWith("task_resume", {
+      pid: "project-1",
+      root: null,
+    });
+  });
+  expect(await screen.findByText(/已恢复 1 个未完成任务/)).toBeVisible();
 });
 
 test("setup blocks transcription until the local runtime and models are ready", async () => {

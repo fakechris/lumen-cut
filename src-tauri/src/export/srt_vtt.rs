@@ -112,11 +112,7 @@ pub fn write_srt(doc: &Doc, path: &Path) -> AppResult<()> {
 
 /// Write SRT with soft-cut projection to disk.
 pub fn write_srt_with(doc: &Doc, cuts: &[Cut], path: &Path) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, to_srt_with(doc, cuts))?;
-    Ok(())
+    crate::data::storage::write(path, to_srt_with(doc, cuts).as_bytes())
 }
 
 /// Write VTT to disk.
@@ -126,11 +122,7 @@ pub fn write_vtt(doc: &Doc, path: &Path) -> AppResult<()> {
 
 /// Write VTT with soft-cut projection to disk.
 pub fn write_vtt_with(doc: &Doc, cuts: &[Cut], path: &Path) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, to_vtt_with(doc, cuts))?;
-    Ok(())
+    crate::data::storage::write(path, to_vtt_with(doc, cuts).as_bytes())
 }
 
 #[cfg(test)]

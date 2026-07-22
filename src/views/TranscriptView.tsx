@@ -40,6 +40,7 @@ import {
   subtitleSet,
   subtitleVisibility,
   taskStart,
+  taskResume,
   taskStatus,
   transcriptionCancel,
   transcriptionStart,
@@ -390,7 +391,20 @@ export function TranscriptView({
     if (!pid) return;
     void Promise.all([
       reload(pid),
-      taskStatus(pid).then(setTaskState),
+      taskStatus(pid).then(async (status) => {
+        setTaskState(status);
+        if (status.pending > 0) {
+          const recovery = await taskResume(pid);
+          if (recovery.resumed > 0 || recovery.recoveredSubmissions > 0) {
+            setFeedback({
+              tone: "info",
+              text: lang === "zh"
+                ? `已恢复 ${recovery.resumed} 个未完成任务，其中 ${recovery.recoveredSubmissions} 个模型结果无需重算。`
+                : `Resumed ${recovery.resumed} unfinished tasks; ${recovery.recoveredSubmissions} model results did not need recomputation.`,
+            });
+          }
+        }
+      }),
       configShow().then((config) =>
         setAgentConfigured(
           Boolean(config.llmEndpoint.trim() && config.llmModel.trim()),
@@ -415,6 +429,14 @@ export function TranscriptView({
           if (status.state === "running" || status.state === "cancelling") {
             setSpeakerAnalysisJob(status);
             setOperation("speakers-preview");
+          } else if (status.state === "completed" && status.preview) {
+            setSpeakerPreview(status.preview);
+            setFeedback({
+              tone: "info",
+              text: lang === "zh"
+                ? `已恢复上次说话人分析提案：${status.preview.changed} 个段落标签待确认。`
+                : `Restored the previous speaker proposal: ${status.preview.changed} paragraph labels await review.`,
+            });
           } else if (status.state === "failed") {
             setFeedback({
               tone: "error",
@@ -427,6 +449,14 @@ export function TranscriptView({
         .then((status) => {
           if (status.state === "running" || status.state === "cancelling") {
             setVideoExportJob(status);
+          } else if (status.state === "completed" && status.path) {
+            setVideoExportJob(status);
+            setFeedback({
+              tone: "success",
+              text: lang === "zh"
+                ? `已恢复上次视频导出记录：${status.path}`
+                : `Restored the previous video export: ${status.path}`,
+            });
           } else if (status.state === "failed") {
             setFeedback({
               tone: "error",
@@ -454,7 +484,10 @@ export function TranscriptView({
     if (!pid || !taskState || taskState.pending < 1) return;
     const timer = window.setInterval(() => {
       void taskStatus(pid)
-        .then(setTaskState)
+        .then(async (status) => {
+          setTaskState(status);
+          if (status.pending > 0) await taskResume(pid);
+        })
         .catch(() => window.clearInterval(timer));
     }, 2500);
     return () => window.clearInterval(timer);

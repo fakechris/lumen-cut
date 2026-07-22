@@ -286,14 +286,8 @@ pub fn write_fcp_with_broll(
     width: u32,
     height: u32,
 ) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        path,
-        to_fcpxml_with_broll(doc, cuts, placements, width, height),
-    )?;
-    Ok(())
+    let xml = to_fcpxml_with_broll(doc, cuts, placements, width, height);
+    crate::data::storage::write(path, xml.as_bytes())
 }
 
 #[cfg(test)]

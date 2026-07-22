@@ -131,11 +131,7 @@ impl TranslateRebindArtifact {
     }
 
     pub fn save(&self, path: &std::path::Path) -> AppResult<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
-        Ok(())
+        crate::data::storage::write_json(path, self)
     }
 
     pub fn load(path: &std::path::Path) -> AppResult<Self> {

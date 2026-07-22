@@ -143,8 +143,7 @@ pub fn load(dir: &Path) -> Vec<Cue> {
 
 /// Save the cue list to `<dir>/cues.json`.
 pub fn save(dir: &Path, cues: &[Cue]) -> crate::error::AppResult<()> {
-    std::fs::write(dir.join("cues.json"), serde_json::to_string_pretty(cues)?)?;
-    Ok(())
+    crate::data::storage::write_json(&dir.join("cues.json"), cues)
 }
 
 #[cfg(test)]

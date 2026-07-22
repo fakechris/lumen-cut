@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{Allocator, PendingCall};
 use crate::data::{ClipCuts, Cut, CutKind, Doc, TranslationGroup};
@@ -17,6 +17,7 @@ use crate::pipeline::{pack_by_chars, SentencePacket};
 pub struct PreparedCall {
     pub call: PendingCall,
     pub pending_path: PathBuf,
+    pub submitted_path: PathBuf,
     pub done_path: PathBuf,
     pub failed_path: PathBuf,
 }
@@ -35,6 +36,27 @@ pub struct TaskOptions {
     pub stale_only: bool,
     pub groups: Vec<String>,
     pub align_fit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredTask {
+    kind: String,
+    lang: Option<String>,
+    #[serde(default = "stored_task_running")]
+    state: String,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    stale_only: bool,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    align_fit: Option<usize>,
+}
+
+fn stored_task_running() -> String {
+    "running".into()
 }
 
 #[derive(Debug, Serialize)]
@@ -137,19 +159,21 @@ pub fn prepare_task_with_task_options(
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
         crate::pipeline::cleanup::apply(&doc, &mut cuts);
-        std::fs::write(cuts_path, serde_json::to_string_pretty(&cuts)?)?;
+        crate::data::storage::write_json(&cuts_path, &cuts)?;
     }
     let ai_dir = project_dir.join("ai").join(kind);
     let pending_dir = ai_dir.join("pending");
     let done_dir = ai_dir.join("done");
     let failed_dir = ai_dir.join("failed");
+    let submitted_dir = ai_dir.join("submitted");
     std::fs::create_dir_all(&pending_dir)?;
     std::fs::create_dir_all(&done_dir)?;
     std::fs::create_dir_all(&failed_dir)?;
+    std::fs::create_dir_all(&submitted_dir)?;
 
     let contract = crate::agent::contract::contract_for_kind(kind).map(str::to_string);
     if let Some(body) = &contract {
-        std::fs::write(ai_dir.join("contract.md"), body)?;
+        crate::data::storage::write(&ai_dir.join("contract.md"), body.as_bytes())?;
     }
 
     let payloads = match kind {
@@ -162,14 +186,29 @@ pub fn prepare_task_with_task_options(
         "cleanup" | "broll" => vec![timeline_payload(&doc)?],
         _ => unreachable!(),
     };
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    crate::data::storage::write_json(
+        &ai_dir.join("task.json"),
+        &serde_json::json!({
+            "kind": kind,
+            "lang": lang,
+            "state": "preparing",
+            "runId": &run_id,
+            "staleOnly": options.stale_only,
+            "groups": &options.groups,
+            "alignFit": options.align_fit,
+            "calls": payloads.len(),
+        }),
+    )?;
     let mut calls = Vec::with_capacity(payloads.len());
     for (index, payload) in payloads.into_iter().enumerate() {
-        let call_id = format!("{kind}-{}-{index:04}", uuid::Uuid::new_v4());
+        let call_id = format!("{kind}-{run_id}-{index:04}");
         let pending_path = pending_dir.join(format!("{call_id}.json"));
+        let submitted_path = submitted_dir.join(format!("{call_id}.json"));
         let done_path = done_dir.join(format!("{call_id}.json"));
         let failed_path = failed_dir.join(format!("{call_id}.json"));
         let body = serde_json::to_string_pretty(&payload)?;
-        std::fs::write(&pending_path, &body)?;
+        crate::data::storage::write(&pending_path, body.as_bytes())?;
         calls.push(PreparedCall {
             call: PendingCall {
                 id: call_id,
@@ -177,23 +216,28 @@ pub fn prepare_task_with_task_options(
                 word_count: payload_word_count(&payload),
                 char_count: body.chars().count(),
                 payload_ref: pending_path.to_string_lossy().into_owned(),
+                submission_ref: Some(submitted_path.to_string_lossy().into_owned()),
                 problems: vec![],
                 contract: contract.clone(),
             },
             pending_path,
+            submitted_path,
             done_path,
             failed_path,
         });
     }
-    std::fs::write(
-        ai_dir.join("task.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
+    crate::data::storage::write_json(
+        &ai_dir.join("task.json"),
+        &serde_json::json!({
             "kind": kind,
             "lang": lang,
-            "groups": options.groups,
+            "state": "running",
+            "runId": &run_id,
+            "staleOnly": options.stale_only,
+            "groups": &options.groups,
             "alignFit": options.align_fit,
             "calls": calls.len(),
-        }))?,
+        }),
     )?;
     Ok(PreparedTask {
         project_dir: project_dir.to_path_buf(),
@@ -202,6 +246,165 @@ pub fn prepare_task_with_task_options(
         ai_dir,
         calls,
     })
+}
+
+/// Rebuild an unfinished task from its durable pending requests and accepted
+/// submissions. Completed/failed call files fence stale pending files left by
+/// a crash between the final rename and cleanup.
+pub fn load_recoverable_task(project_dir: &Path, kind: &str) -> AppResult<Option<PreparedTask>> {
+    let ai_dir = project_dir.join("ai").join(kind);
+    let task_path = ai_dir.join("task.json");
+    if !task_path.exists() {
+        return Ok(None);
+    }
+    let stored: StoredTask = serde_json::from_str(&std::fs::read_to_string(task_path)?)?;
+    if stored.kind != kind {
+        return Err(AppError::Schema(format!(
+            "stored task kind `{}` does not match directory `{kind}`",
+            stored.kind
+        )));
+    }
+    if stored.state == "preparing" {
+        if let Some(run_id) = stored.run_id.as_deref() {
+            remove_task_run_files(&ai_dir, kind, run_id)?;
+        }
+        return prepare_task_with_task_options(
+            project_dir,
+            kind,
+            stored.lang.as_deref(),
+            TaskOptions {
+                stale_only: stored.stale_only,
+                groups: stored.groups,
+                align_fit: stored.align_fit,
+            },
+        )
+        .map(Some);
+    }
+    let pending_dir = ai_dir.join("pending");
+    let submitted_dir = ai_dir.join("submitted");
+    let done_dir = ai_dir.join("done");
+    let failed_dir = ai_dir.join("failed");
+    std::fs::create_dir_all(&submitted_dir)?;
+    let contract = std::fs::read_to_string(ai_dir.join("contract.md")).ok();
+    let mut entries = match std::fs::read_dir(&pending_dir) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut calls = Vec::new();
+    for entry in entries {
+        let pending_path = entry.path();
+        if pending_path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(call_id) = pending_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let done_path = done_dir.join(format!("{call_id}.json"));
+        let failed_path = failed_dir.join(format!("{call_id}.json"));
+        let submitted_path = submitted_dir.join(format!("{call_id}.json"));
+        if done_path.exists() || failed_path.exists() {
+            let _ = std::fs::remove_file(&pending_path);
+            let _ = std::fs::remove_file(&submitted_path);
+            continue;
+        }
+        let body = std::fs::read_to_string(&pending_path)?;
+        let payload: serde_json::Value = serde_json::from_str(&body)?;
+        calls.push(PreparedCall {
+            call: PendingCall {
+                id: call_id,
+                kind: kind.to_string(),
+                word_count: payload_word_count(&payload),
+                char_count: body.chars().count(),
+                payload_ref: pending_path.to_string_lossy().into_owned(),
+                submission_ref: Some(submitted_path.to_string_lossy().into_owned()),
+                problems: vec![],
+                contract: contract.clone(),
+            },
+            pending_path,
+            submitted_path,
+            done_path,
+            failed_path,
+        });
+    }
+    if calls.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PreparedTask {
+        project_dir: project_dir.to_path_buf(),
+        kind: kind.to_string(),
+        lang: stored.lang,
+        ai_dir,
+        calls,
+    }))
+}
+
+fn remove_task_run_files(ai_dir: &Path, kind: &str, run_id: &str) -> AppResult<()> {
+    let prefix = format!("{kind}-{run_id}-");
+    for phase in ["pending", "submitted"] {
+        let dir = ai_dir.join(phase);
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+    let ai_dir = project_dir.join("ai");
+    let entries = match std::fs::read_dir(ai_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error.into()),
+    };
+    let mut kinds = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    kinds.sort();
+    let mut tasks = Vec::new();
+    for kind in kinds {
+        if let Some(task) = load_recoverable_task(project_dir, &kind)? {
+            tasks.push(task);
+        }
+    }
+    Ok(tasks)
+}
+
+/// Restore already-ACKed worker results and enqueue only calls that still need
+/// model work. Returns the number of submissions recovered from disk.
+pub fn restore_or_enqueue(allocator: &Allocator, task: &PreparedTask) -> AppResult<usize> {
+    let mut restored = 0;
+    for prepared in &task.calls {
+        if prepared.submitted_path.exists() {
+            let submission: crate::agent::CompletedSubmission =
+                serde_json::from_str(&std::fs::read_to_string(&prepared.submitted_path)?)?;
+            if submission.call_id != prepared.call.id {
+                return Err(AppError::Schema(format!(
+                    "submission {} belongs to another call",
+                    prepared.submitted_path.display()
+                )));
+            }
+            allocator.restore_completed(submission);
+            restored += 1;
+        } else if !allocator.contains_call(&prepared.call.id) {
+            allocator.enqueue(prepared.call.clone());
+        }
+    }
+    Ok(restored)
 }
 
 /// Count every pending/completed call across task kinds. Status is a project
@@ -229,11 +432,21 @@ pub fn task_counts(project_dir: &Path) -> (usize, usize) {
                 .filter_map(Result::ok)
                 .map(|entry| entry.file_name())
                 .collect();
+        let done_names: std::collections::BTreeSet<std::ffi::OsString> =
+            std::fs::read_dir(kind.path().join("done"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect();
         pending += std::fs::read_dir(kind.path().join("pending"))
             .map(|entries| {
                 entries
                     .filter_map(Result::ok)
-                    .filter(|entry| !failed_names.contains(&entry.file_name()))
+                    .filter(|entry| {
+                        !failed_names.contains(&entry.file_name())
+                            && !done_names.contains(&entry.file_name())
+                    })
                     .count()
             })
             .unwrap_or_default();
@@ -1332,18 +1545,8 @@ async fn wait_and_apply_inner(
             break;
         }
         if started.elapsed() >= timeout {
-            let message = format!("task {} timed out with incomplete calls", task.kind);
-            for prepared in &task.calls {
-                if prepared.pending_path.exists() {
-                    std::fs::write(
-                        &prepared.failed_path,
-                        serde_json::to_string_pretty(&serde_json::json!({"error": &message}))?,
-                    )?;
-                    std::fs::remove_file(&prepared.pending_path)?;
-                }
-            }
             return Err(AppError::Schema(format!(
-                "task {} timed out with incomplete calls",
+                "task {} paused after waiting for incomplete calls; durable requests and accepted results were preserved",
                 task.kind
             )));
         }
@@ -1357,12 +1560,15 @@ async fn wait_and_apply_inner(
             .completed(&prepared.call.id)
             .ok_or_else(|| AppError::Schema("completed call disappeared".into()))?;
         if let Some(error) = &submission.error {
-            std::fs::write(
+            crate::data::storage::write_json(
                 &prepared.failed_path,
-                serde_json::to_string_pretty(&serde_json::json!({"error": error}))?,
+                &serde_json::json!({"error": error}),
             )?;
             if prepared.pending_path.exists() {
                 std::fs::remove_file(&prepared.pending_path)?;
+            }
+            if prepared.submitted_path.exists() {
+                std::fs::remove_file(&prepared.submitted_path)?;
             }
             task_errors.push(format!(
                 "task call {} failed; see {}",
@@ -1383,11 +1589,14 @@ async fn wait_and_apply_inner(
         let aborted = format!("task {} stopped because another batch failed", task.kind);
         for prepared in &task.calls {
             if prepared.pending_path.exists() {
-                std::fs::write(
+                crate::data::storage::write_json(
                     &prepared.failed_path,
-                    serde_json::to_string_pretty(&serde_json::json!({"error": &aborted}))?,
+                    &serde_json::json!({"error": &aborted}),
                 )?;
                 std::fs::remove_file(&prepared.pending_path)?;
+                if prepared.submitted_path.exists() {
+                    std::fs::remove_file(&prepared.submitted_path)?;
+                }
             }
         }
         return Err(AppError::Schema(task_errors.join("; ")));
@@ -1424,16 +1633,19 @@ async fn wait_and_apply_inner(
             .map_err(|errors| AppError::Schema(format!("invalid answer: {errors:?}")))?;
         evidence.push((request.clone(), parsed_answer));
         applied += apply_answer(&task, &prepared.call, &answer.text)?;
-        std::fs::write(
+        crate::data::storage::write_json(
             &prepared.done_path,
-            serde_json::to_string_pretty(&serde_json::json!({
+            &serde_json::json!({
                 "callId": prepared.call.id,
                 "request": request,
                 "answer": answer,
-            }))?,
+            }),
         )?;
         if prepared.pending_path.exists() {
             std::fs::remove_file(&prepared.pending_path)?;
+        }
+        if prepared.submitted_path.exists() {
+            std::fs::remove_file(&prepared.submitted_path)?;
         }
     }
     persist_task_artifacts(&task, &evidence, zero_duration_words_before)?;
@@ -1648,13 +1860,7 @@ fn residual_variants(
 }
 
 fn write_json_atomically(path: &Path, value: &serde_json::Value) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, serde_json::to_string_pretty(value)?)?;
-    std::fs::rename(temp, path)?;
-    Ok(())
+    crate::data::storage::write_json(path, value)
 }
 
 fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppResult<usize> {
@@ -1846,10 +2052,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
             let chapters = answer["chapters"]
                 .as_array()
                 .ok_or_else(|| AppError::Schema("missing chapters".into()))?;
-            std::fs::write(
-                task.project_dir.join("chapters.json"),
-                serde_json::to_string_pretty(chapters)?,
-            )?;
+            crate::data::storage::write_json(&task.project_dir.join("chapters.json"), chapters)?;
             let doc_path = task.project_dir.join("doc.json");
             let mut native: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&doc_path)?)?;
@@ -1860,9 +2063,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                     "chapters".into(),
                     serde_json::Value::Array(chapters.clone()),
                 );
-            let temp = task.project_dir.join("doc.json.chapters.tmp");
-            std::fs::write(&temp, serde_json::to_string_pretty(&native)?)?;
-            std::fs::rename(temp, doc_path)?;
+            crate::data::storage::write_json(&doc_path, &native)?;
             chapters.len()
         }
         "cleanup" => {
@@ -1929,20 +2130,17 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                     },
                 });
             }
-            std::fs::write(
-                task.project_dir.join("cuts.json"),
-                serde_json::to_string_pretty(&cuts)?,
-            )?;
-            std::fs::write(
-                task.project_dir.join("ai").join("cuts.json"),
-                serde_json::to_string_pretty(&answer)?,
+            crate::data::storage::write_json(&task.project_dir.join("cuts.json"), &cuts)?;
+            crate::data::storage::write_json(
+                &task.project_dir.join("ai").join("cuts.json"),
+                &answer,
             )?;
             return Ok(cuts.cuts.len() - before);
         }
         "broll" => {
-            std::fs::write(
-                task.project_dir.join("ai").join("broll-suggestions.json"),
-                serde_json::to_string_pretty(&answer)?,
+            crate::data::storage::write_json(
+                &task.project_dir.join("ai").join("broll-suggestions.json"),
+                &answer,
             )?;
             return Ok(answer["suggestions"]
                 .as_array()
@@ -2012,6 +2210,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_model_result_survives_allocator_reconstruction() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        let first_allocator = Arc::new(Allocator::new(1));
+        assert_eq!(restore_or_enqueue(&first_allocator, &task).unwrap(), 0);
+        let (_, lease) = first_allocator.allocate().unwrap();
+        let raw =
+            r#"{"summary":"x","terms":[],"namedEntities":[],"translations":{"s1":"你好世界"}}"#;
+        first_allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
+        assert!(task.calls[0].submitted_path.exists());
+
+        let recovered_task = load_recoverable_task(tmp.path(), "translate")
+            .unwrap()
+            .unwrap();
+        let recovered_allocator = Arc::new(Allocator::new(1));
+        assert_eq!(
+            restore_or_enqueue(&recovered_allocator, &recovered_task).unwrap(),
+            1
+        );
+        assert_eq!(recovered_allocator.pending_count(), 0);
+        assert!(recovered_allocator
+            .completed(&recovered_task.calls[0].call.id)
+            .is_some());
+
+        wait_and_apply(recovered_allocator, recovered_task, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            Doc::load(tmp.path()).unwrap().translations["zh"]["s1"].text,
+            "你好世界"
+        );
+    }
+
+    #[test]
+    fn interrupted_task_preparation_is_regenerated_from_its_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let ai_dir = tmp.path().join("ai/translate");
+        std::fs::create_dir_all(ai_dir.join("pending")).unwrap();
+        crate::data::storage::write_json(
+            &ai_dir.join("task.json"),
+            &serde_json::json!({
+                "kind": "translate",
+                "lang": "zh",
+                "state": "preparing",
+                "runId": "interrupted",
+                "staleOnly": false,
+                "groups": [],
+                "alignFit": null,
+                "calls": 1,
+            }),
+        )
+        .unwrap();
+        let partial = ai_dir.join("pending/translate-interrupted-0000.json");
+        crate::data::storage::write(&partial, b"{").unwrap();
+
+        let recovered = load_recoverable_task(tmp.path(), "translate")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.calls.len(), 1);
+        assert!(!partial.exists());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(ai_dir.join("task.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["state"], "running");
+        assert_ne!(manifest["runId"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_preserves_durable_work_for_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        let pending = task.calls[0].pending_path.clone();
+        let failed = task.calls[0].failed_path.clone();
+
+        assert!(
+            wait_and_apply(Arc::new(Allocator::new(1)), task, Duration::ZERO,)
+                .await
+                .is_err()
+        );
+        assert!(pending.exists());
+        assert!(!failed.exists());
+
+        let recovered = load_recoverable_task(tmp.path(), "translate")
+            .unwrap()
+            .unwrap();
+        let allocator = Allocator::new(1);
+        restore_or_enqueue(&allocator, &recovered).unwrap();
+        assert_eq!(allocator.pending_count(), 1);
+    }
+
+    #[tokio::test]
     async fn translate_task_validates_and_applies_completed_answer() {
         let tmp = tempfile::tempdir().unwrap();
         sample_doc().save(tmp.path()).unwrap();
@@ -2028,7 +2322,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         let applied = wait_and_apply(allocator, task, Duration::from_secs(1))
             .await
             .unwrap();
@@ -2131,7 +2427,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         wait_and_apply(allocator, task, Duration::from_secs(1))
             .await
             .unwrap();
@@ -2176,7 +2474,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         assert_eq!(
             wait_and_apply(allocator, task, Duration::from_secs(1))
                 .await
@@ -2206,7 +2506,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         wait_and_apply(allocator, task, Duration::from_secs(1))
             .await
             .unwrap();
@@ -2350,7 +2652,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         assert_eq!(
             wait_and_apply(allocator, task, Duration::from_secs(1))
                 .await
@@ -2439,7 +2743,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         assert_eq!(
             wait_and_apply(allocator, task, Duration::from_secs(1))
                 .await
@@ -2489,7 +2795,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         assert_eq!(
             wait_and_apply(allocator, task, Duration::from_secs(1))
                 .await
@@ -2558,7 +2866,9 @@ mod tests {
         let allocator = Arc::new(Allocator::new(1));
         allocator.enqueue(task.calls[0].call.clone());
         let (_, lease) = allocator.allocate().unwrap();
-        allocator.submit(&lease.lease_id, Some(answer(raw)), None);
+        allocator
+            .submit(&lease.lease_id, Some(answer(raw)), None)
+            .unwrap();
         assert_eq!(
             wait_and_apply(allocator, task, Duration::from_secs(1))
                 .await

@@ -118,10 +118,8 @@ impl Doc {
     pub fn save(&self, root: &Path) -> AppResult<()> {
         std::fs::create_dir_all(root)?;
         let target = root.join("doc.json");
-        let tmp = root.join("doc.json.tmp");
         let raw = serialize_preserving_flat_document(self, &target)?;
-        std::fs::write(&tmp, raw)?;
-        std::fs::rename(&tmp, &target)?;
+        crate::data::storage::write(&target, raw.as_bytes())?;
         let lang = self.translations.keys().next().map(String::as_str);
         crate::data::cues::save(root, &crate::data::cues::to_cues(self, lang))?;
         Ok(())

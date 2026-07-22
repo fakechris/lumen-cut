@@ -83,11 +83,7 @@ pub fn write_md(doc: &Doc, path: &Path) -> AppResult<()> {
 
 /// Write Markdown with soft-cut projection to disk.
 pub fn write_md_with(doc: &Doc, cuts: &[Cut], path: &Path) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, to_md_with(doc, cuts))?;
-    Ok(())
+    crate::data::storage::write(path, to_md_with(doc, cuts).as_bytes())
 }
 
 #[derive(serde::Deserialize)]
@@ -141,11 +137,7 @@ pub fn write_md_with_chapters(
         }
         markdown.push('\n');
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, markdown)?;
-    Ok(())
+    crate::data::storage::write(path, markdown.as_bytes())
 }
 
 #[cfg(test)]

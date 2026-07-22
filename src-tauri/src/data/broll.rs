@@ -162,11 +162,7 @@ pub fn save(project_dir: &Path, placements: &[BrollPlacement]) -> AppResult<()> 
         placement.validate()?;
     }
     std::fs::create_dir_all(project_dir)?;
-    let target = project_dir.join("broll.json");
-    let temp = project_dir.join("broll.json.tmp");
-    std::fs::write(&temp, serde_json::to_string_pretty(placements)?)?;
-    std::fs::rename(temp, target)?;
-    Ok(())
+    crate::data::storage::write_json(&project_dir.join("broll.json"), placements)
 }
 
 #[derive(Debug, Clone, Default)]

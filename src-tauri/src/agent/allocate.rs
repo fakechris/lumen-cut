@@ -40,6 +40,11 @@ pub struct PendingCall {
     #[serde(default)]
     pub char_count: usize,
     pub payload_ref: String, // path to the prompt file
+    /// Durable staging path for an accepted worker outcome. It is kept out
+    /// of the worker-facing payload; the allocator uses it before ACKing a
+    /// submission so an app restart cannot discard completed model work.
+    #[serde(default, skip_serializing)]
+    pub submission_ref: Option<String>,
     /// Non-empty for retries: the problems (validator/transport) of the
     /// previous attempt. Calls with problems claim before plain calls.
     #[serde(default)]
@@ -87,6 +92,14 @@ pub struct CompletedSubmission {
     pub error: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitError {
+    #[error("unknown, expired, or already submitted lease")]
+    StaleLease,
+    #[error("could not persist accepted submission: {0}")]
+    Persistence(String),
+}
+
 #[derive(Debug, Default)]
 pub struct Allocator {
     inner: Mutex<Inner>,
@@ -131,6 +144,13 @@ impl Allocator {
         self.inner.lock().expect("allocator poisoned").queue.len()
     }
 
+    pub fn contains_call(&self, call_id: &str) -> bool {
+        let g = self.inner.lock().expect("allocator poisoned");
+        g.queue.iter().any(|call| call.id == call_id)
+            || g.leased.iter().any(|(_, call)| call.id == call_id)
+            || g.completed.contains_key(call_id)
+    }
+
     /// Atomically dequeue the next pending call and produce a fresh lease.
     /// Returns `None` if the queue is empty or `capacity` is saturated.
     /// Claim order: retries with `problems` first (oldest first), then the
@@ -167,29 +187,46 @@ impl Allocator {
     /// Fenced submission: accept only the current, unexpired lease for a
     /// call. On success the lease is consumed, the outcome is stored under
     /// the call id, and the call id is returned. Stale, expired, unknown,
-    /// or duplicate leases are rejected with `None`.
+    /// or duplicate leases are rejected. If the call has a durable staging
+    /// path, the outcome reaches stable storage before the lease is consumed.
     pub fn submit(
         &self,
         lease_id: &str,
         answer: Option<BridgeAnswer>,
         error: Option<String>,
-    ) -> Option<String> {
+    ) -> Result<String, SubmitError> {
         let mut g = self.inner.lock().expect("allocator poisoned");
         let idx = g
             .leased
             .iter()
-            .position(|(l, _)| l.lease_id == lease_id && !l.is_expired())?;
+            .position(|(l, _)| l.lease_id == lease_id && !l.is_expired())
+            .ok_or(SubmitError::StaleLease)?;
+        let call = &g.leased[idx].1;
+        let submission = CompletedSubmission {
+            call_id: call.id.clone(),
+            answer,
+            error,
+        };
+        if let Some(path) = call.submission_ref.as_deref() {
+            crate::data::storage::write_json(std::path::Path::new(path), &submission)
+                .map_err(|error| SubmitError::Persistence(error.to_string()))?;
+        }
         let (_, call) = g.leased.remove(idx);
         let call_id = call.id;
-        g.completed.insert(
-            call_id.clone(),
-            CompletedSubmission {
-                call_id: call_id.clone(),
-                answer,
-                error,
-            },
-        );
-        Some(call_id)
+        g.completed.insert(call_id.clone(), submission);
+        Ok(call_id)
+    }
+
+    /// Restore a submission that was durably accepted before a previous app
+    /// process exited. This is idempotent so project-open recovery is safe to
+    /// retry.
+    pub fn restore_completed(&self, submission: CompletedSubmission) {
+        self.inner
+            .lock()
+            .expect("allocator poisoned")
+            .completed
+            .entry(submission.call_id.clone())
+            .or_insert(submission);
     }
 
     /// The stored submission for a call, if any.
@@ -264,6 +301,7 @@ mod tests {
             word_count: words,
             char_count: words,
             payload_ref: "/tmp/x".into(),
+            submission_ref: None,
             problems: vec![],
             contract: None,
         }
@@ -400,7 +438,7 @@ mod tests {
         assert_eq!(
             a.submit(&lease.lease_id, Some(answer.clone()), None)
                 .as_deref(),
-            Some("c1")
+            Ok("c1")
         );
         let stored = a.completed("c1").unwrap();
         assert_eq!(stored.call_id, "c1");
@@ -416,10 +454,10 @@ mod tests {
         let a = Allocator::new(1);
         a.enqueue(call("c1", 10));
         let (_, lease) = a.allocate().unwrap();
-        assert!(a.submit("bogus-lease", None, None).is_none());
-        assert!(a.submit(&lease.lease_id, None, None).is_some());
+        assert!(a.submit("bogus-lease", None, None).is_err());
+        assert!(a.submit(&lease.lease_id, None, None).is_ok());
         // Duplicate submission of the same lease is rejected.
-        assert!(a.submit(&lease.lease_id, None, None).is_none());
+        assert!(a.submit(&lease.lease_id, None, None).is_err());
     }
 
     #[test]
@@ -428,7 +466,7 @@ mod tests {
         a.enqueue(call("c1", 10));
         let (_, lease) = a.allocate().unwrap();
         expire_all(&a);
-        assert!(a.submit(&lease.lease_id, None, None).is_none());
+        assert!(a.submit(&lease.lease_id, None, None).is_err());
         assert!(a.completed("c1").is_none());
     }
 
@@ -437,11 +475,54 @@ mod tests {
         let a = Allocator::new(1);
         a.enqueue(call("c1", 10));
         let (_, lease) = a.allocate().unwrap();
-        assert!(a
-            .submit(&lease.lease_id, None, Some("boom".into()))
-            .is_some());
+        assert!(a.submit(&lease.lease_id, None, Some("boom".into())).is_ok());
         let stored = a.completed("c1").unwrap();
         assert_eq!(stored.answer, None);
         assert_eq!(stored.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn submit_is_durable_before_the_lease_is_acknowledged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("submitted/c1.json");
+        let a = Allocator::new(1);
+        let mut durable_call = call("c1", 10);
+        durable_call.submission_ref = Some(path.to_string_lossy().into_owned());
+        a.enqueue(durable_call);
+        let (_, lease) = a.allocate().unwrap();
+        let answer = BridgeAnswer {
+            text: "done".into(),
+            reasoning: String::new(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        };
+
+        assert_eq!(
+            a.submit(&lease.lease_id, Some(answer.clone()), None)
+                .unwrap(),
+            "c1"
+        );
+        let saved: CompletedSubmission =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved.answer, Some(answer));
+    }
+
+    #[test]
+    fn a_submission_write_failure_does_not_consume_the_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("blocked.json");
+        std::fs::create_dir(&target).unwrap();
+        let a = Allocator::new(1);
+        let mut durable_call = call("c1", 10);
+        durable_call.submission_ref = Some(target.to_string_lossy().into_owned());
+        a.enqueue(durable_call);
+        let (_, lease) = a.allocate().unwrap();
+
+        assert!(matches!(
+            a.submit(&lease.lease_id, None, Some("failed".into())),
+            Err(SubmitError::Persistence(_))
+        ));
+        assert!(a.leased_call(&lease.lease_id).is_some());
+        assert!(a.completed("c1").is_none());
     }
 }
