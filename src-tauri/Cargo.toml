@@ -1,6 +1,6 @@
 [package]
 name = "lumen-cut"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Transcript-first desktop editor for spoken audio and video"

@@ -10,6 +10,11 @@ import {
   settingsExport,
 } from "../api";
 import type { Lang } from "../i18n";
+import {
+  getLlmProvider,
+  inferLlmProvider,
+  LLM_PROVIDER_PRESETS,
+} from "../llmProviders";
 import type { AsrStatus, Settings, SetupJobStatus } from "../types";
 import { PipelineView } from "./PipelineView";
 
@@ -50,11 +55,24 @@ const COPY = {
     agentTitle: "AI 功能",
     agentDescription: "用于翻译、润色、章节和 B-roll 建议。基础转写与字幕导出不需要配置。",
     automatic: "无需手动启动 Pipeline 或服务器。保存服务地址和模型后，使用相关功能时会自动启动后台任务。",
+    provider: "模型服务商",
+    providerNone: "暂不启用 AI 功能",
+    providerCustom: "OpenAI Compatible · 自定义服务",
+    providerRemote: "云端服务",
+    providerLocal: "本机服务",
+    providerPrompt: "选择服务商会自动填写地址和常用模型；其他兼容服务请选择 OpenAI Compatible。",
+    providerReady: "必填项已完整；保存后将在首次 AI 任务时连接",
+    providerDisabled: "AI 功能未启用；转写、说话人和导出仍可正常使用",
+    providerIncomplete: "还需要补全下方必填项",
+    directConnection: "请求会从这台 Mac 直接发送到所选服务，lumen-cut 不会中转。Key 只写入本机配置文件。",
     endpoint: "服务地址",
     endpointPlaceholder: "例如 https://api.openai.com/v1/chat/completions",
-    apiKey: "API Key（本地服务可留空）",
+    endpointAdvanced: "高级：查看或覆盖服务地址",
+    apiKey: "API Key",
+    apiKeyOptional: "API Key（可选）",
     model: "模型",
     modelPlaceholder: "例如 gpt-4.1-mini",
+    modelHint: "可以从常用模型中选择，也可以直接输入服务商支持的其他模型 ID。",
     workers: "并行任务数",
     save: "保存设置",
     saving: "正在保存…",
@@ -63,6 +81,7 @@ const COPY = {
     advancedHint: "面向开发和故障排查，普通剪辑流程无需进入这里。",
     error: "设置没有保存",
     incomplete: "若要启用 AI 功能，请同时填写服务地址和模型；也可以全部留空。",
+    missingApiKey: "这个服务商需要 API Key。请填写后再保存。",
     invalidEndpoint: "服务地址需要是完整的 http:// 或 https:// URL。",
   },
   en: {
@@ -96,11 +115,24 @@ const COPY = {
     agentTitle: "AI features",
     agentDescription: "Used for translation, polish, chapters, and B-roll suggestions. Basic transcription and subtitle export need no configuration.",
     automatic: "You never need to start a Pipeline or server manually. Save an endpoint and model; the background worker starts when a feature needs it.",
+    provider: "Model provider",
+    providerNone: "Do not enable AI features yet",
+    providerCustom: "OpenAI Compatible · custom service",
+    providerRemote: "Cloud providers",
+    providerLocal: "Local providers",
+    providerPrompt: "Provider presets fill in the endpoint and a common model. Choose OpenAI Compatible for any other service.",
+    providerReady: "Required fields complete; the first AI task will connect after saving",
+    providerDisabled: "AI features are off; transcription, speakers, and export still work",
+    providerIncomplete: "Complete the required fields below",
+    directConnection: "Requests go directly from this Mac to the selected provider; lumen-cut does not proxy them. The key is stored only in the local config file.",
     endpoint: "Endpoint",
     endpointPlaceholder: "e.g. https://api.openai.com/v1/chat/completions",
-    apiKey: "API key (optional for local services)",
+    endpointAdvanced: "Advanced: view or override endpoint",
+    apiKey: "API key",
+    apiKeyOptional: "API key (optional)",
     model: "Model",
     modelPlaceholder: "e.g. gpt-4.1-mini",
+    modelHint: "Choose a common model or type any other model ID supported by the provider.",
     workers: "Concurrent tasks",
     save: "Save settings",
     saving: "Saving…",
@@ -109,6 +141,7 @@ const COPY = {
     advancedHint: "For development and troubleshooting. Normal editing does not require this area.",
     error: "Settings were not saved",
     incomplete: "To enable AI features, provide both an endpoint and model, or leave both empty.",
+    missingApiKey: "This provider requires an API key. Add it before saving.",
     invalidEndpoint: "The endpoint must be a complete http:// or https:// URL.",
   },
 } as const;
@@ -116,6 +149,7 @@ const COPY = {
 export function SettingsView({ lang, pid }: Props) {
   const c = COPY[lang];
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
+  const [providerId, setProviderId] = useState(() => inferLlmProvider(settings.llmEndpoint));
   const [state, setState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [asr, setAsr] = useState<AsrStatus | null>(null);
@@ -141,6 +175,7 @@ export function SettingsView({ lang, pid }: Props) {
           llmModel: config.llmModel,
           workerCount: config.workerCount,
         });
+        setProviderId(inferLlmProvider(config.llmEndpoint));
         setAsr(status);
         if (setup && (setup.state === "running" || setup.state === "cancelling")) {
           setSetupJob(setup);
@@ -207,6 +242,42 @@ export function SettingsView({ lang, pid }: Props) {
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setSettings((previous) => ({ ...previous, [key]: value }));
 
+  const selectedProvider = getLlmProvider(providerId);
+  const providerConfigured = Boolean(
+    settings.llmEndpoint.trim()
+      && settings.llmModel.trim()
+      && (!selectedProvider?.needsKey || settings.llmApiKey.trim()),
+  );
+
+  const selectProvider = (nextId: string) => {
+    const changedProvider = nextId !== providerId;
+    setProviderId(nextId);
+    setState("idle");
+    setMessage(null);
+    if (nextId === "none") {
+      setSettings((previous) => ({
+        ...previous,
+        llmApiKey: "",
+        llmEndpoint: "",
+        llmModel: "",
+      }));
+      return;
+    }
+    const provider = getLlmProvider(nextId);
+    if (!provider) {
+      if (changedProvider) {
+        setSettings((previous) => ({ ...previous, llmApiKey: "" }));
+      }
+      return;
+    }
+    setSettings((previous) => ({
+      ...previous,
+      llmApiKey: changedProvider ? "" : previous.llmApiKey,
+      llmEndpoint: provider.endpoint,
+      llmModel: provider.model,
+    }));
+  };
+
   const save = async () => {
     setState("saving");
     setMessage(null);
@@ -221,6 +292,9 @@ export function SettingsView({ lang, pid }: Props) {
       };
       if (normalized.llmEndpoint && !normalized.llmModel) {
         throw new Error(c.incomplete);
+      }
+      if (selectedProvider?.needsKey && !normalized.llmApiKey) {
+        throw new Error(c.missingApiKey);
       }
       if (normalized.llmEndpoint) {
         let protocol = "";
@@ -488,44 +562,116 @@ export function SettingsView({ lang, pid }: Props) {
           <p>{c.agentDescription}</p>
           <p className="settings-automation-note">{c.automatic}</p>
         </div>
-        <div className="settings-form">
+        <div className="settings-form ai-provider-settings">
           <label>
-            <span>{c.endpoint}</span>
-            <input
-              placeholder={c.endpointPlaceholder}
-              value={settings.llmEndpoint}
-              onChange={(event) => update("llmEndpoint", event.target.value)}
-            />
+            <span>{c.provider}</span>
+            <select
+              aria-label={c.provider}
+              value={providerId}
+              onChange={(event) => selectProvider(event.target.value)}
+            >
+              <option value="none">{c.providerNone}</option>
+              <option value="custom">{c.providerCustom}</option>
+              <optgroup label={c.providerRemote}>
+                {LLM_PROVIDER_PRESETS.filter((provider) => !provider.local && !provider.custom).map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                ))}
+              </optgroup>
+              <optgroup label={c.providerLocal}>
+                {LLM_PROVIDER_PRESETS.filter((provider) => provider.local).map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                ))}
+              </optgroup>
+            </select>
+            <small className="field-hint">{c.providerPrompt}</small>
           </label>
-          <label>
-            <span>{c.apiKey}</span>
-            <input
-              autoComplete="off"
-              type="password"
-              value={settings.llmApiKey}
-              onChange={(event) => update("llmApiKey", event.target.value)}
-            />
-          </label>
-          <div className="settings-split">
-            <label>
-              <span>{c.model}</span>
-              <input
-                placeholder={c.modelPlaceholder}
-                value={settings.llmModel}
-                onChange={(event) => update("llmModel", event.target.value)}
-              />
-            </label>
-            <label>
-              <span>{c.workers}</span>
-              <input
-                max={8}
-                min={1}
-                type="number"
-                value={settings.workerCount}
-                onChange={(event) => update("workerCount", Number(event.target.value))}
-              />
-            </label>
+
+          <div className={`provider-configuration-state${providerConfigured ? " ready" : ""}`} role="status">
+            <span className={providerConfigured ? "status-dot ready" : providerId === "none" ? "status-dot muted" : "status-dot"} />
+            <div>
+              <strong>
+                {providerId === "none"
+                  ? c.providerDisabled
+                  : providerConfigured
+                    ? c.providerReady
+                    : c.providerIncomplete}
+              </strong>
+              {providerId !== "none" && <small>{c.directConnection}</small>}
+            </div>
           </div>
+
+          {providerId !== "none" && (
+            <>
+              {!selectedProvider?.local && (
+                <label>
+                  <span>{selectedProvider?.needsKey ? c.apiKey : c.apiKeyOptional}</span>
+                  <input
+                    aria-label={selectedProvider?.needsKey ? c.apiKey : c.apiKeyOptional}
+                    aria-required={selectedProvider?.needsKey || undefined}
+                    autoComplete="off"
+                    placeholder={selectedProvider?.needsKey ? "sk-…" : undefined}
+                    type="password"
+                    value={settings.llmApiKey}
+                    onChange={(event) => update("llmApiKey", event.target.value)}
+                  />
+                </label>
+              )}
+
+              <label>
+                <span>{c.model}</span>
+                <input
+                  aria-label={c.model}
+                  list={selectedProvider?.models.length ? "llm-model-options" : undefined}
+                  placeholder={c.modelPlaceholder}
+                  value={settings.llmModel}
+                  onChange={(event) => update("llmModel", event.target.value)}
+                />
+                {selectedProvider?.models.length ? (
+                  <datalist id="llm-model-options">
+                    {selectedProvider.models.map((model) => <option key={model} value={model} />)}
+                  </datalist>
+                ) : null}
+                <small className="field-hint">{c.modelHint}</small>
+              </label>
+
+              {selectedProvider?.custom ? (
+                <label>
+                  <span>{c.endpoint}</span>
+                  <input
+                    aria-label={c.endpoint}
+                    placeholder={c.endpointPlaceholder}
+                    value={settings.llmEndpoint}
+                    onChange={(event) => update("llmEndpoint", event.target.value)}
+                  />
+                </label>
+              ) : (
+                <details className="provider-endpoint-details">
+                  <summary>{c.endpointAdvanced}</summary>
+                  <label>
+                    <span>{c.endpoint}</span>
+                    <input
+                      aria-label={c.endpoint}
+                      placeholder={c.endpointPlaceholder}
+                      value={settings.llmEndpoint}
+                      onChange={(event) => update("llmEndpoint", event.target.value)}
+                    />
+                  </label>
+                </details>
+              )}
+
+              <label>
+                <span>{c.workers}</span>
+                <input
+                  aria-label={c.workers}
+                  max={8}
+                  min={1}
+                  type="number"
+                  value={settings.workerCount}
+                  onChange={(event) => update("workerCount", Number(event.target.value))}
+                />
+              </label>
+            </>
+          )}
           <div className="settings-save">
             <button
               className="button-primary"

@@ -1730,9 +1730,9 @@ async fn maybe_spawn_builtin_workers(
     state: &AgentServerState,
     allocator: std::sync::Arc<Allocator>,
 ) {
-    let Some(config) = crate::agent::runtime::load_bridge_config() else {
+    if crate::agent::runtime::load_bridge_config().is_none() {
         return;
-    };
+    }
     let should_start = {
         let mut started = state
             .built_in_workers_started
@@ -1747,7 +1747,7 @@ async fn maybe_spawn_builtin_workers(
     };
     if should_start {
         let count = *state.worker_count.lock().expect("state poisoned");
-        crate::agent::runtime::spawn_workers(allocator, config, count).await;
+        crate::agent::runtime::spawn_workers(allocator, count).await;
     }
 }
 

@@ -100,6 +100,7 @@ interface Props {
 type Tab =
   | "setup"
   | "transcript"
+  | "speakers"
   | "translate"
   | "style"
   | "properties"
@@ -679,7 +680,7 @@ export function TranscriptView({
         if (status.state === "completed") {
           if (!status.preview) throw new Error("Speaker analysis completed without a preview");
           setSpeakerPreview(status.preview);
-          setActiveTab("properties");
+          setActiveTab("speakers");
           setFeedback({
             tone: "info",
             text: lang === "zh"
@@ -956,7 +957,7 @@ export function TranscriptView({
     setOperation("speakers-preview");
     setFeedback(null);
     setSpeakerPreview(null);
-    setActiveTab("properties");
+    setActiveTab("speakers");
     try {
       setSpeakerAnalysisJob(await speakerReidentifyStart(pid));
     } catch (error) {
@@ -1264,6 +1265,7 @@ export function TranscriptView({
   const tabs: Array<{ id: Tab; label: string; disabled?: boolean }> = [
     { id: "setup", label: c.setup },
     { id: "transcript", label: c.transcript, disabled: !hasTranscript },
+    { id: "speakers", label: lang === "zh" ? "说话人" : "Speakers", disabled: !hasTranscript },
     { id: "translate", label: c.translate, disabled: !hasTranscript },
     { id: "style", label: c.style, disabled: !hasTranscript },
     { id: "properties", label: c.properties },
@@ -1442,15 +1444,22 @@ export function TranscriptView({
             <section>
               <h2>{lang === "zh" ? "增强转写" : "Enhance transcript"}</h2>
               <button
-                disabled={operation !== null}
-                onClick={() => {
-                  if (asrReadiness?.diarizeReady) void previewSpeakers();
-                  else setActiveTab("properties");
-                }}
+                onClick={() => setActiveTab("speakers")}
               >
                 {operation === "speakers-preview" ? <span className="spinner" /> : null}
-                {c.speaker}
+                {operation === "speakers-preview"
+                  ? lang === "zh" ? "查看识别进度" : "View identification progress"
+                  : speakerEvidenceState.identified || speakers.length > 0
+                    ? lang === "zh" ? "管理说话人" : "Manage speakers"
+                    : c.speaker}
               </button>
+              <p className="editor-action-status">
+                {operation === "speakers-preview"
+                  ? lang === "zh" ? "识别正在后台运行" : "Identification is running in the background"
+                  : speakerEvidenceState.identified
+                    ? lang === "zh" ? `${speakers.length} 位说话人 · 结果已保存` : `${speakers.length} speakers · result saved`
+                    : lang === "zh" ? "打开工作区后再决定是否开始识别" : "Open the workspace before starting identification"}
+              </p>
             </section>
             <section className="editor-help">
               <h2>{lang === "zh" ? "编辑提示" : "Editing tip"}</h2>
@@ -1497,7 +1506,7 @@ export function TranscriptView({
         />
       )}
 
-      {activeTab === "properties" && (
+      {(activeTab === "speakers" || activeTab === "properties") && (
         <PropertiesWorkspace
           analysis={speakerAnalysisJob}
           busy={operation !== null}
@@ -1506,6 +1515,7 @@ export function TranscriptView({
           evidence={speakerEvidenceState}
           lang={lang}
           preview={speakerPreview}
+          section={activeTab === "speakers" ? "speakers" : "project"}
           speakers={speakers}
           onApplyPreview={applySpeakerPreview}
           onAssign={assignSpeaker}

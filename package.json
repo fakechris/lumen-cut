@@ -1,7 +1,7 @@
 {
   "name": "lumen-cut",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Open-source transcript-first editor for spoken audio and video",
   "license": "AGPL-3.0-or-later",
   "repository": "https://github.com/fakechris/lumen-cut",

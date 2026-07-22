@@ -1604,8 +1604,8 @@ async fn task_start(
             tracing::error!(%error, "agent server stopped");
         }
     });
-    if let Some(config) = lumen_cut::agent::runtime::load_bridge_config() {
-        lumen_cut::agent::runtime::spawn_workers(allocator.clone(), config, capacity).await;
+    if lumen_cut::agent::runtime::load_bridge_config().is_some() {
+        lumen_cut::agent::runtime::spawn_workers(allocator.clone(), capacity).await;
     } else {
         eprintln!(
             "agent waiting on http://127.0.0.1:{} (configure llmEndpoint for built-in workers)",

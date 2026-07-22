@@ -397,6 +397,8 @@ beforeEach(() => {
           llmModel: "gpt-4o-mini",
           workerCount: 3,
         };
+      case "settings_export":
+        return "/Users/example/.lumen-cut/settings.json";
       case "asr_status":
         return {
           pythonPath: "/Users/example/.lumen-cut/runtime/bin/python3",
@@ -478,7 +480,7 @@ test("a serialized transcript project can open every editor surface", async () =
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
 
   const tabs = await screen.findByRole("navigation", { name: "编辑步骤" });
-  for (const label of ["转写稿", "翻译", "样式", "属性", "版本", "时间线", "补充画面", "审查与修复", "导出"]) {
+  for (const label of ["转写稿", "说话人", "翻译", "样式", "属性", "版本", "时间线", "补充画面", "审查与修复", "导出"]) {
     const tab = within(tabs).getByRole("button", { name: label });
     fireEvent.click(tab);
     expect(tab).toHaveAttribute("aria-current", "page");
@@ -518,11 +520,22 @@ test("speaker re-identification is previewed before it can change labels", async
 
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "属性" }));
+
+  const editorTabs = await screen.findByRole("navigation", { name: "编辑步骤" });
+  const tabLabels = within(editorTabs).getAllByRole("button").map((button) => button.textContent);
+  expect(tabLabels.indexOf("说话人")).toBe(tabLabels.indexOf("转写稿") + 1);
+  expect(screen.getByText("1 位说话人 · 结果已保存")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "管理说话人" }));
+  expect(within(editorTabs).getByRole("button", { name: "说话人" })).toHaveAttribute("aria-current", "page");
+  expect(invoke).not.toHaveBeenCalledWith("speaker_reidentify_start", expect.anything());
 
   expect(await screen.findByText("逐段证据")).toBeVisible();
   expect(screen.getByText("Hello world")).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "预览重新识别" }));
+  expect(screen.getByText("结果已保存")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "重新识别说话人" }));
+  expect(screen.getByText("确认重新识别？")).toBeVisible();
+  expect(invoke).not.toHaveBeenCalledWith("speaker_reidentify_start", expect.anything());
+  fireEvent.click(screen.getByRole("button", { name: "确认重新识别" }));
 
   expect(await screen.findByText("1 个段落标签将改变")).toBeVisible();
   expect(screen.getByText("Alice → SPEAKER_00")).toBeVisible();
@@ -575,7 +588,7 @@ test("speaker analysis exposes its current phase and real progress", async () =>
 
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "属性" }));
+  fireEvent.click(await screen.findByRole("button", { name: "说话人" }));
   fireEvent.click(screen.getByRole("button", { name: "分析说话人" }));
 
   expect(await screen.findByText("正在提取声纹特征")).toBeVisible();
@@ -604,7 +617,7 @@ test("a completed speaker proposal is restored after reopening the app", async (
 
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "属性" }));
+  fireEvent.click(await screen.findByRole("button", { name: "说话人" }));
 
   expect(await screen.findByText("1 个段落标签将改变")).toBeVisible();
   expect(screen.getByText("Alice → SPEAKER_00")).toBeVisible();
@@ -700,6 +713,71 @@ test("settings exposes the real local transcription status", async () => {
   expect(screen.getAllByText("模型已下载")).toHaveLength(3);
   expect(screen.getByText(/pyannote\.audio 3\.4\.0/)).toBeVisible();
   expect(screen.queryByRole("button", { name: /start server/i })).not.toBeInTheDocument();
+});
+
+test("AI settings configure a provider without requiring a pipeline server", async () => {
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+
+  const provider = await screen.findByRole("combobox", { name: "模型服务商" });
+  expect(provider).toHaveValue("none");
+  expect(screen.getByText(/AI 功能未启用/)).toBeVisible();
+
+  fireEvent.change(provider, { target: { value: "deepseek" } });
+  expect(screen.getByLabelText("模型")).toHaveValue("deepseek-chat");
+  expect(screen.getByText("还需要补全下方必填项")).toBeVisible();
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test" } });
+  expect(screen.getByText("必填项已完整；保存后将在首次 AI 任务时连接")).toBeVisible();
+
+  fireEvent.click(screen.getByText("高级：查看或覆盖服务地址"));
+  expect(screen.getByLabelText("服务地址")).toHaveValue(
+    "https://api.deepseek.com/v1/chat/completions",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("settings_export", {
+    settings: expect.objectContaining({
+      llm_endpoint: "https://api.deepseek.com/v1/chat/completions",
+      llm_api_key: "sk-test",
+      llm_model: "deepseek-chat",
+      worker_count: 3,
+    }),
+  }));
+  expect(screen.queryByRole("button", { name: /start server/i })).not.toBeInTheDocument();
+});
+
+test("AI settings expose OpenAI-compatible, MiniMax regions, and GLM presets", async () => {
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+
+  const provider = await screen.findByRole("combobox", { name: "模型服务商" });
+  expect(within(provider).getByRole("option", { name: "OpenAI Compatible · 自定义服务" })).toBeVisible();
+  expect(within(provider).getByRole("option", { name: "MiniMax · 中国大陆" })).toBeVisible();
+  expect(within(provider).getByRole("option", { name: "MiniMax · 海外" })).toBeVisible();
+  expect(within(provider).getByRole("option", { name: "GLM 智谱 · 中国大陆" })).toBeVisible();
+  expect(within(provider).getByRole("option", { name: "GLM Z.AI · 海外" })).toBeVisible();
+
+  fireEvent.change(provider, { target: { value: "minimax-cn" } });
+  expect(screen.getByLabelText("模型")).toHaveValue("MiniMax-M2.7");
+  fireEvent.click(screen.getByText("高级：查看或覆盖服务地址"));
+  expect(screen.getByLabelText("服务地址")).toHaveValue(
+    "https://api.minimaxi.com/v1/chat/completions",
+  );
+
+  fireEvent.change(provider, { target: { value: "glm-global" } });
+  expect(screen.getByLabelText("模型")).toHaveValue("glm-5.1");
+  expect(screen.getByLabelText("服务地址")).toHaveValue(
+    "https://api.z.ai/api/paas/v4/chat/completions",
+  );
+
+  fireEvent.change(provider, { target: { value: "custom" } });
+  expect(screen.getByLabelText("服务地址")).toBeVisible();
+  expect(screen.getByLabelText("API Key（可选）")).toBeVisible();
+  fireEvent.change(screen.getByLabelText("服务地址"), {
+    target: { value: "https://llm.example.com/v1/chat/completions" },
+  });
+  fireEvent.change(screen.getByLabelText("模型"), { target: { value: "my-model" } });
+  expect(screen.getByText("必填项已完整；保存后将在首次 AI 任务时连接")).toBeVisible();
 });
 
 test("export requires a delivery check and exposes Final Cut output", async () => {
@@ -862,6 +940,66 @@ test("timeline edit decisions can be restored in place", async () => {
     cutId: "cut-1",
     root: null,
   }));
+});
+
+test("timeline keeps the video visible and follows the active subtitle cue", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [
+        {
+          id: "s1",
+          text: "Opening line",
+          words: [{ id: "w1", text: "Opening", start: 0, end: 2 }],
+        },
+        {
+          id: "s2",
+          text: "Current line",
+          words: [{ id: "w2", text: "Current", start: 3, end: 5 }],
+        },
+        {
+          id: "s3",
+          text: "Closing line",
+          words: [{ id: "w3", text: "Closing", start: 6, end: 9 }],
+        },
+      ],
+    }],
+  };
+  const scrollTo = vi.fn();
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+    configurable: true,
+    value: scrollTo,
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "时间线" }));
+
+  await screen.findByText("播放预览");
+  const video = document.querySelector("video");
+  if (!video) throw new Error("timeline video preview was not rendered");
+  expect(video.closest(".timeline-media-column")).not.toBeNull();
+  expect(screen.getByText("字幕轨道").closest(".timeline-edit-column")).not.toBeNull();
+  expect(screen.getByRole("button", { name: "跟随播放" })).toHaveAttribute("aria-pressed", "true");
+
+  scrollTo.mockClear();
+  Object.defineProperty(video, "currentTime", { configurable: true, value: 4 });
+  fireEvent.timeUpdate(video as HTMLVideoElement);
+  await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({
+    behavior: "smooth",
+  })));
+  expect(screen.getByText("Current line").closest("article")).toHaveClass("active");
+  expect(screen.getByText("2 / 3")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "跟随播放" }));
+  expect(screen.getByRole("button", { name: "跟随播放" })).toHaveAttribute("aria-pressed", "false");
+  scrollTo.mockClear();
+  Object.defineProperty(video, "currentTime", { configurable: true, value: 7 });
+  fireEvent.timeUpdate(video as HTMLVideoElement);
+  await waitFor(() => expect(screen.getByText("Closing line").closest("article")).toHaveClass("active"));
+  expect(scrollTo).not.toHaveBeenCalled();
 });
 
 test("project library can search transcript content, star, and repair a project", async () => {

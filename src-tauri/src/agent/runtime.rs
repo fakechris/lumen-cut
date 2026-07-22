@@ -56,22 +56,21 @@ pub fn build_prompt(call: &PendingCall) -> String {
     }
 }
 
-/// Spawn `n` built-in workers. Each loops: claim a pending call, drive it
-/// through the LLM bridge, submit the answer or error. The tasks are
-/// detached and live for the process lifetime. Returns immediately.
-pub async fn spawn_workers(allocator: Arc<Allocator>, cfg: BridgeConfig, n: usize) {
-    let bridge = Arc::new(AgentBridge::new(cfg));
+/// Spawn `n` built-in workers. Each loops: claim a pending call, load the
+/// latest provider settings, drive it through the LLM bridge, then submit the
+/// answer or error. Loading per call makes provider changes effective without
+/// restarting the app while leaving an in-flight request undisturbed.
+pub async fn spawn_workers(allocator: Arc<Allocator>, n: usize) {
     for i in 0..n.max(1) {
         let alloc = allocator.clone();
-        let br = bridge.clone();
         let name = format!("worker-{i}");
         tokio::spawn(async move {
-            worker_loop(alloc, br, name).await;
+            worker_loop(alloc, name).await;
         });
     }
 }
 
-async fn worker_loop(allocator: Arc<Allocator>, bridge: Arc<AgentBridge>, name: String) {
+async fn worker_loop(allocator: Arc<Allocator>, name: String) {
     loop {
         allocator.reap_expired();
         if let Some((call, lease)) = allocator.allocate() {
@@ -83,11 +82,22 @@ async fn worker_loop(allocator: Arc<Allocator>, bridge: Arc<AgentBridge>, name: 
                 max_tokens: 4096,
                 validator_feedback: vec![],
             };
-            let result = bridge
-                .call(bc, |ans| {
-                    crate::agent::task::validate_call_answer(&call, ans)
-                })
-                .await;
+            let latest_config = tokio::task::spawn_blocking(load_bridge_config)
+                .await
+                .ok()
+                .flatten();
+            let result = match latest_config {
+                Some(config) => {
+                    AgentBridge::new(config)
+                        .call(bc, |ans| {
+                            crate::agent::task::validate_call_answer(&call, ans)
+                        })
+                        .await
+                }
+                None => Err(crate::agent::bridge::BridgeError::Transport(
+                    "AI provider is not configured; open Settings → AI features".into(),
+                )),
+            };
             match result {
                 Ok(ans) => {
                     let submit_allocator = allocator.clone();

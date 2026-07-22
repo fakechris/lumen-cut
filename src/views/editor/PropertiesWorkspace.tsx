@@ -19,6 +19,7 @@ interface Props {
   evidence: SpeakerEvidence;
   lang: Lang;
   preview: SpeakerReidentifyPreview | null;
+  section: "project" | "speakers";
   speakers: SpeakerInfo[];
   onApplyPreview: (proposals: SpeakerReidentifyProposal[]) => Promise<void>;
   onAssign: (paragraphId: number, speaker: string | null) => Promise<void>;
@@ -52,6 +53,7 @@ export function PropertiesWorkspace({
   evidence,
   lang,
   preview,
+  section,
   speakers,
   onApplyPreview,
   onAssign,
@@ -72,6 +74,7 @@ export function PropertiesWorkspace({
   const [mediaSource, setMediaSource] = useState<string | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
+  const [confirmReanalysis, setConfirmReanalysis] = useState(false);
   const [selectedProposalIds, setSelectedProposalIds] = useState<Set<number>>(new Set());
   const [proposalLimit, setProposalLimit] = useState(80);
   const [turnLimit, setTurnLimit] = useState(100);
@@ -99,6 +102,7 @@ export function PropertiesWorkspace({
   }, [speakers]);
 
   useEffect(() => {
+    if (section !== "speakers") return;
     let cancelled = false;
     setMediaSource(null);
     setMediaError(null);
@@ -114,7 +118,7 @@ export function PropertiesWorkspace({
       playerRef.current?.pause();
       playbackEndRef.current = null;
     };
-  }, [doc.id]);
+  }, [doc.id, section]);
 
   useEffect(() => {
     setSelectedProposalIds(new Set());
@@ -150,6 +154,7 @@ export function PropertiesWorkspace({
   const visibleTurns = filteredTurns.slice(0, turnLimit);
   const isAnalyzing = analysis !== null
     && (analysis.state === "running" || analysis.state === "cancelling");
+  const hasSpeakerResult = evidence.identified || speakers.length > 0;
   const analysisPhase = analysis
       ? ({
         waiting: ["正在等待计算资源", "Waiting for compute capacity"],
@@ -234,9 +239,19 @@ export function PropertiesWorkspace({
     }
   };
 
+  const startSpeakerPreview = async () => {
+    setConfirmReanalysis(false);
+    setWorking("preview");
+    try {
+      await onPreview();
+    } finally {
+      setWorking(null);
+    }
+  };
+
   return (
     <div className="properties-workspace">
-      <section className="property-section project-properties">
+      {section === "project" && <section className="property-section project-properties">
         <header>
           <div>
             <p className="eyebrow">{lang === "zh" ? "项目信息" : "Project information"}</p>
@@ -290,37 +305,36 @@ export function PropertiesWorkspace({
             />
           </label>
         </div>
-      </section>
+      </section>}
 
-      <section className="property-section speaker-properties">
+      {section === "speakers" && <section className="property-section speaker-properties">
         <header>
           <div>
             <p className="eyebrow">{lang === "zh" ? "说话人" : "Speakers"}</p>
-            <h2>
+            <h2 className="speaker-heading">
               {isAnalyzing
                 ? lang === "zh" ? "正在识别说话人" : "Identifying speakers"
                 : <>{speakers.length} {lang === "zh" ? "位说话人" : speakers.length === 1 ? "speaker" : "speakers"}</>}
+              {!isAnalyzing && hasSpeakerResult && (
+                <span>{lang === "zh" ? "结果已保存" : "Result saved"}</span>
+              )}
             </h2>
           </div>
           <div className="speaker-analysis-actions">
             <button
-              className={speakers.length ? "button-quiet" : "button-primary"}
+              className={hasSpeakerResult ? "button-quiet" : "button-primary"}
               disabled={busy || working !== null || doc.paragraphs.length === 0 || !diarizeReady}
-              onClick={async () => {
-                setWorking("preview");
-                try {
-                  await onPreview();
-                } finally {
-                  setWorking(null);
-                }
+              onClick={() => {
+                if (hasSpeakerResult) setConfirmReanalysis(true);
+                else void startSpeakerPreview();
               }}
             >
               {isAnalyzing
                 ? `${analysisPhase} ${analysis?.progress ?? 0}%`
                 : working === "preview"
                   ? lang === "zh" ? "正在启动分析…" : "Starting analysis…"
-                  : speakers.length
-                    ? lang === "zh" ? "预览重新识别" : "Preview identification"
+                  : hasSpeakerResult
+                    ? lang === "zh" ? "重新识别说话人" : "Identify speakers again"
                     : lang === "zh" ? "分析说话人" : "Analyze speakers"}
             </button>
             {isAnalyzing && (
@@ -336,6 +350,27 @@ export function PropertiesWorkspace({
             )}
           </div>
         </header>
+
+        {confirmReanalysis && !isAnalyzing && (
+          <div className="speaker-reanalysis-confirm" role="alert">
+            <div>
+              <strong>{lang === "zh" ? "确认重新识别？" : "Identify speakers again?"}</strong>
+              <p>
+                {lang === "zh"
+                  ? "这会再次加载本地模型并重新分析整段媒体。当前已保存的标签不会被覆盖，新结果会先作为提案供你确认。"
+                  : "This reloads the local model and analyzes the full media again. Saved labels remain unchanged; the new result is shown as a proposal first."}
+              </p>
+            </div>
+            <div>
+              <button className="button-quiet" onClick={() => setConfirmReanalysis(false)}>
+                {lang === "zh" ? "取消" : "Cancel"}
+              </button>
+              <button className="button-primary" onClick={() => void startSpeakerPreview()}>
+                {lang === "zh" ? "确认重新识别" : "Confirm re-identification"}
+              </button>
+            </div>
+          </div>
+        )}
 
         {isAnalyzing && analysis && (
           <div className="speaker-analysis-progress" role="status" aria-live="polite">
@@ -375,9 +410,13 @@ export function PropertiesWorkspace({
         )}
 
         <p className="speaker-safety-note">
-          {lang === "zh"
-            ? "分析只生成提案，不会改动项目。长视频可能需要数分钟，任务在后台运行，期间仍可切换页面；检查逐段证据后再决定是否应用。"
-            : "Analysis creates a proposal without changing the project. Long media can take several minutes in the background; you can keep navigating, then review turn evidence before applying."}
+          {hasSpeakerResult
+            ? lang === "zh"
+              ? "当前识别结果已经保存。浏览、改名和分配说话人都不会触发重新计算；只有明确确认“重新识别”才会再次运行模型。"
+              : "The current result is saved. Browsing, renaming, and assigning speakers do not rerun analysis; only confirming re-identification starts the model again."
+            : lang === "zh"
+              ? "分析只生成提案，不会改动项目。长视频可能需要数分钟，任务在后台运行，期间仍可切换页面；检查逐段证据后再决定是否应用。"
+              : "Analysis creates a proposal without changing the project. Long media can take several minutes in the background; you can keep navigating, then review turn evidence before applying."}
         </p>
 
         {!diarizeReady && (
@@ -690,7 +729,7 @@ export function PropertiesWorkspace({
             </button>
           )}
         </section>
-      </section>
+      </section>}
     </div>
   );
 }
