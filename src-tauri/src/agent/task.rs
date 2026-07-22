@@ -388,7 +388,7 @@ fn remove_task_run_files(ai_dir: &Path, kind: &str, run_id: &str) -> AppResult<(
 
 pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
     let ai_dir = project_dir.join("ai");
-    let entries = match std::fs::read_dir(ai_dir) {
+    let entries = match std::fs::read_dir(&ai_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(error) => return Err(error.into()),
@@ -401,6 +401,13 @@ pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>
     kinds.sort();
     let mut tasks = Vec::new();
     for kind in kinds {
+        let task_path = ai_dir.join(&kind).join("task.json");
+        if let Ok(raw) = std::fs::read_to_string(&task_path) {
+            let stored: StoredTask = serde_json::from_str(&raw)?;
+            if matches!(stored.state.as_str(), "paused" | "failed" | "completed") {
+                continue;
+            }
+        }
         if let Some(task) = load_recoverable_task(project_dir, &kind)? {
             tasks.push(task);
         }
@@ -564,7 +571,7 @@ fn translate_payloads(
                 .unwrap_or(first);
             let context_line = |sentence: &SentencePacket| TranslateContextLine {
                 id: sentence.sentence_id.clone(),
-                source: sentence.text.chars().take(500).collect(),
+                source: sentence.text.chars().take(100).collect(),
             };
             let after_start = last.saturating_add(1);
             let after_end = after_start.saturating_add(3).min(all_packets.len());
@@ -596,6 +603,8 @@ fn translate_payloads(
                                     })
                             })
                             .map(|term| term.canonical.clone())
+                            .take(2)
+                            .map(|term| term.chars().take(32).collect())
                             .collect(),
                         source: sentence.text,
                         max_chars,
@@ -2591,6 +2600,19 @@ mod tests {
         let allocator = Allocator::new(1);
         restore_or_enqueue(&allocator, &recovered).unwrap();
         assert_eq!(allocator.pending_count(), 1);
+    }
+
+    #[test]
+    fn automatic_recovery_skips_paused_tasks_but_explicit_resume_can_load_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        set_task_state(&task, "paused", Some("provider timeout")).unwrap();
+
+        assert!(load_recoverable_tasks(tmp.path()).unwrap().is_empty());
+        assert!(load_recoverable_task(tmp.path(), "translate")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

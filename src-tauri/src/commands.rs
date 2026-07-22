@@ -1324,8 +1324,9 @@ fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
 pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> {
     let project_dir = resolve_project_dir(&pid, root)?;
     run_blocking("task status", move || {
-        let (pending, done) = crate::agent::task::task_counts(&project_dir);
         let kinds = task_kind_statuses(&project_dir);
+        let pending = kinds.iter().map(|status| status.pending).sum();
+        let done = kinds.iter().map(|status| status.done).sum();
         let polish_quality = crate::pipeline::polish::PolishQualityArtifact::load(
             &project_dir.join("ai/polish-quality.json"),
         )
@@ -5928,6 +5929,8 @@ mod tests {
             status.kinds[0].last_error.as_deref(),
             Some("provider timeout")
         );
+        assert_eq!(status.done, 1);
+        assert_eq!(status.pending, 1);
     }
 
     #[test]

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_BUDGET: u32 = 8192;
 /// Room reserved for the task contract, JSON, neighbouring context, locked
 /// terms, and the model response.
-pub const REQUEST_OVERHEAD_BUDGET: u32 = 2048;
+pub const REQUEST_OVERHEAD_BUDGET: u32 = 6144;
 /// Keep enough neighbouring cues in one request for discourse consistency
 /// without making a single provider call too large or slow to recover.
 pub const MAX_LINES_PER_REQUEST: usize = 32;

@@ -498,6 +498,7 @@ export function TranscriptView({
     ) return;
     let disposed = false;
     let timer: number | undefined;
+    let keepPolling = true;
     let completedBatches = taskState.done;
     const watchedTasks = new Set(
       taskState.kinds
@@ -520,6 +521,7 @@ export function TranscriptView({
         if (running) {
           await taskResume(pid);
         } else if (status.pending === 0) {
+          keepPolling = false;
           await reload(pid, false);
           if (disposed || activeProject.current !== pid) return;
           const translate = status.kinds.find(
@@ -537,9 +539,23 @@ export function TranscriptView({
                   : "Translation complete. Results were saved.",
             });
           }
+        } else {
+          keepPolling = false;
+          const stopped = status.kinds.find(
+            (task) => watchedTasks.has(`${task.kind}:${task.lang || ""}`)
+              && (task.state === "paused" || task.state === "failed"),
+          );
+          if (stopped) {
+            setFeedback({
+              tone: "error",
+              text: lang === "zh"
+                ? `${taskLabel(stopped.kind, lang)}已暂停：${stopped.lastError || "请在对应页面确认后继续。"}`
+                : `${taskLabel(stopped.kind, lang)} paused: ${stopped.lastError || "Review it before resuming."}`,
+            });
+          }
         }
       } catch (error) {
-        if (!disposed && activeProject.current === pid) {
+        if (keepPolling && !disposed && activeProject.current === pid) {
           setFeedback({
             tone: "error",
             text: lang === "zh"
@@ -558,7 +574,7 @@ export function TranscriptView({
       disposed = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [pid, taskState?.pending]);
+  }, [pid, taskState?.pending, taskState?.kinds.map((task) => task.state).join("|")]);
 
   useEffect(() => {
     if (
