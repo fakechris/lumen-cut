@@ -1,16 +1,16 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CutSummary } from "../../api";
-import { allowProjectMedia } from "../../api";
 import type { Lang } from "../../i18n";
 import type { Doc } from "../../types";
 
 interface Props {
   busy: boolean;
+  currentTime: number;
   cuts: CutSummary[];
   doc: Doc;
   lang: Lang;
   onRestoreCut: (cutId: string) => Promise<void>;
+  onSeek: (seconds: number, autoplay?: boolean) => void;
 }
 
 function clock(seconds: number) {
@@ -19,13 +19,17 @@ function clock(seconds: number) {
   return `${minutes}:${rest.toFixed(1).padStart(4, "0")}`;
 }
 
-export function TimelineWorkspace({ busy, cuts, doc, lang, onRestoreCut }: Props) {
-  const playerRef = useRef<HTMLMediaElement | null>(null);
+export function TimelineWorkspace({
+  busy,
+  currentTime,
+  cuts,
+  doc,
+  lang,
+  onRestoreCut,
+  onSeek,
+}: Props) {
   const cueListRef = useRef<HTMLDivElement | null>(null);
   const cueRefs = useRef(new Map<string, HTMLElement>());
-  const [mediaSource, setMediaSource] = useState<string | null>(null);
-  const [mediaError, setMediaError] = useState<string | null>(null);
-  const [currentTime, setCurrentTime] = useState(0);
   const [followPlayback, setFollowPlayback] = useState(true);
   const duration = Math.max(doc.media.durationSeconds, 0.001);
   const words = useMemo(() => doc.paragraphs.flatMap((paragraph) =>
@@ -57,7 +61,6 @@ export function TimelineWorkspace({ busy, cuts, doc, lang, onRestoreCut }: Props
     () => Array.from({ length: 6 }, (_, index) => (duration * index) / 5),
     [duration],
   );
-  const isAudio = /\.(aac|aif|aiff|flac|m4a|mp3|ogg|opus|wav)$/i.test(doc.media.path);
   const activeSentenceIndex = useMemo(() => {
     let low = 0;
     let high = sentences.length - 1;
@@ -74,30 +77,6 @@ export function TimelineWorkspace({ busy, cuts, doc, lang, onRestoreCut }: Props
     return candidate >= 0 && currentTime < sentences[candidate].end ? candidate : -1;
   }, [currentTime, sentences]);
   const activeSentence = activeSentenceIndex >= 0 ? sentences[activeSentenceIndex] : undefined;
-
-  useEffect(() => {
-    let cancelled = false;
-    setMediaSource(null);
-    setMediaError(null);
-    setCurrentTime(0);
-    void allowProjectMedia(doc.id)
-      .then((path) => {
-        if (!cancelled) setMediaSource(convertFileSrc(path));
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setMediaError(
-            lang === "zh"
-              ? `无法打开项目媒体：${String(error).replace(/^Error:\s*/i, "")}`
-              : `Could not open project media: ${String(error).replace(/^Error:\s*/i, "")}`,
-          );
-        }
-      });
-    return () => {
-      cancelled = true;
-      playerRef.current?.pause();
-    };
-  }, [doc.id, lang]);
 
   useEffect(() => {
     if (!followPlayback || !activeSentence) return;
@@ -119,59 +98,12 @@ export function TimelineWorkspace({ busy, cuts, doc, lang, onRestoreCut }: Props
   }, [activeSentence?.id, followPlayback]);
 
   const seekTo = (seconds: number, play = true) => {
-    const player = playerRef.current;
-    if (!player) return;
-    player.currentTime = Math.max(0, Math.min(seconds, duration));
-    setCurrentTime(player.currentTime);
-    if (play) void player.play().catch(() => undefined);
+    onSeek(Math.max(0, Math.min(seconds, duration)), play);
   };
 
   return (
     <div className="timeline-workspace">
       <div className="timeline-stage">
-        <aside className="timeline-media-column">
-          <header className="media-preview-header">
-            <strong>{lang === "zh" ? "播放预览" : "Playback preview"}</strong>
-            <span>{clock(currentTime)} / {clock(duration)}</span>
-          </header>
-          <section className={`media-preview${isAudio ? " audio-preview" : ""}`}>
-            {mediaSource ? (
-              isAudio ? (
-                <audio
-                  controls
-                  ref={(element) => {
-                    playerRef.current = element;
-                  }}
-                  src={mediaSource}
-                  onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-                />
-              ) : (
-                <video
-                  controls
-                  playsInline
-                  ref={(element) => {
-                    playerRef.current = element;
-                  }}
-                  src={mediaSource}
-                  onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-                />
-              )
-            ) : mediaError ? (
-              <div className="media-preview-error" role="alert">{mediaError}</div>
-            ) : (
-              <div className="media-preview-loading" role="status">
-                <span className="spinner" aria-hidden="true" />
-                {lang === "zh" ? "正在打开媒体…" : "Opening media…"}
-              </div>
-            )}
-          </section>
-          <p className="media-preview-hint">
-            {lang === "zh"
-              ? "预览会保持在视野内；点击右侧字幕可立即跳转。"
-              : "The preview stays in view; select a cue to jump to it."}
-          </p>
-        </aside>
-
         <div className="timeline-edit-column">
           <header className="timeline-summary">
             <div>

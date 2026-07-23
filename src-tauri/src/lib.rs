@@ -81,6 +81,7 @@ pub fn run() {
             commands::audit_codes,
             commands::subtitle_list,
             commands::subtitle_set,
+            commands::translation_set,
             commands::subtitle_visibility,
             commands::subtitle_replace,
             commands::speakers_list,

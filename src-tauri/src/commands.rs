@@ -1925,6 +1925,27 @@ pub async fn subtitle_set(
 }
 
 #[tauri::command]
+pub async fn translation_set(
+    pid: String,
+    lang: String,
+    id: String,
+    text: String,
+    root: Option<PathBuf>,
+) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("translation update", move || {
+        let mut doc = Doc::load(&dir)?;
+        let changed = crate::data::subtitle::set_translation(&mut doc, &lang, &id, &text);
+        if changed {
+            doc.save(&dir)?;
+        }
+        Ok(changed)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn subtitle_visibility(
     pid: String,
     id: String,

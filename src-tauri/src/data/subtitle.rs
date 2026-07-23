@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::doc::Doc;
+use crate::data::doc::{Doc, TranslationGroup};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +67,38 @@ pub fn set(doc: &mut Doc, id: &str, text: &str) -> bool {
         }
     }
     false
+}
+
+/// Set one translated cue while recording the source snapshot used by stale
+/// translation detection. Returns `false` when the source cue does not exist.
+pub fn set_translation(doc: &mut Doc, lang: &str, id: &str, text: &str) -> bool {
+    let source = doc
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.sentences.iter())
+        .find(|sentence| sentence.id == id)
+        .map(|sentence| {
+            (
+                sentence.text.clone(),
+                sentence.words.iter().map(|word| word.id.clone()).collect(),
+            )
+        });
+    let Some((source_text, source_words)) = source else {
+        return false;
+    };
+    doc.translations
+        .entry(lang.to_string())
+        .or_default()
+        .insert(
+            id.to_string(),
+            TranslationGroup {
+                id: id.to_string(),
+                text: text.to_string(),
+                source_words,
+                source_text: Some(source_text),
+            },
+        );
+    true
 }
 
 /// Find subtitles whose text matches `query` (substring, case-insensitive;
@@ -189,6 +221,17 @@ mod tests {
             (0.0, 1.0)
         );
         assert!(!set(&mut d, "ghost", "x"));
+    }
+
+    #[test]
+    fn set_translation_records_source_snapshot() {
+        let mut d = doc_with(vec![("s1", "hello")]);
+        assert!(set_translation(&mut d, "zh", "s1", "你好"));
+        let saved = &d.translations["zh"]["s1"];
+        assert_eq!(saved.text, "你好");
+        assert_eq!(saved.source_text.as_deref(), Some("hello"));
+        assert_eq!(saved.source_words, vec!["s1-w0"]);
+        assert!(!set_translation(&mut d, "zh", "ghost", "不存在"));
     }
 
     #[test]

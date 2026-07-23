@@ -2,6 +2,7 @@
 name = "lumen-cut"
 version = "0.2.6"
 edition = "2021"
+default-run = "lumen-cut"
 license = "AGPL-3.0-or-later"
 description = "Transcript-first desktop editor for spoken audio and video"
 repository = "https://github.com/fakechris/lumen-cut"
