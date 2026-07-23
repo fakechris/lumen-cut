@@ -1,12 +1,13 @@
-//! Version control on top of `doc.json`.
+//! Version control for every authoritative editor file in a project.
 //!
 //! The on-disk lineage contains branches and version nodes. Snapshot paths are
-//! conventional (`versions/<id>/doc.json`) rather than stored in each node.
+//! conventional (`versions/<id>/`) rather than stored in each node.
 //!
-//! Each commit writes a full `doc.json` snapshot under `versions/<id>/`
-//! (git-like, no diff encoding), and `restore` copies that snapshot back
-//! to the working `doc.json`. The 3-way cue merge (kept below) is the
-//! agent-driven reconciliation step.
+//! Each commit writes a full bundle under `versions/<id>/` (git-like, no diff
+//! encoding), and `restore` copies that bundle back to the working project.
+//! A small recovery journal makes a multi-file restore all-or-nothing across
+//! process restarts. The 3-way cue merge (kept below) is the agent-driven
+//! reconciliation step.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::doc::Doc;
 use crate::error::{AppError, AppResult};
+
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_MANIFEST: &str = "snapshot.json";
+const RESTORE_JOURNAL: &str = "restore-pending.json";
+const VERSIONED_FILES: &[&str] = &[
+    "doc.json",
+    "cues.json",
+    "hidden.json",
+    "cuts.json",
+    "broll.json",
+    "style.json",
+    "titles.json",
+    "audio-mix.json",
+    "chapters.json",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotManifest {
+    version: u32,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreJournal {
+    backup: String,
+}
 
 /// Per-document version graph: the branches plus every committed node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -191,7 +220,183 @@ pub fn snapshot_path(dir: &Path, id: &str) -> PathBuf {
     dir.join("versions").join(id).join("doc.json")
 }
 
-/// Commit a full `doc.json` snapshot under `versions/<id>/` and append a
+fn snapshot_dir(dir: &Path, id: &str) -> PathBuf {
+    dir.join("versions").join(id)
+}
+
+fn snapshot_manifest(dir: &Path) -> AppResult<Option<SnapshotManifest>> {
+    let path = dir.join(SNAPSHOT_MANIFEST);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let manifest: SnapshotManifest = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    if manifest.version != SNAPSHOT_FORMAT_VERSION {
+        return Err(AppError::Schema(format!(
+            "unsupported project snapshot version {}",
+            manifest.version
+        )));
+    }
+    if !manifest.files.iter().any(|name| name == "doc.json") {
+        return Err(AppError::Schema(
+            "project snapshot does not contain doc.json".into(),
+        ));
+    }
+    if manifest
+        .files
+        .iter()
+        .any(|name| !VERSIONED_FILES.contains(&name.as_str()))
+    {
+        return Err(AppError::Schema(
+            "project snapshot contains an unsupported file".into(),
+        ));
+    }
+    Ok(Some(manifest))
+}
+
+fn capture_bundle(source: &Path, target: &Path) -> AppResult<SnapshotManifest> {
+    std::fs::create_dir_all(target)?;
+    let mut files = Vec::new();
+    for name in VERSIONED_FILES {
+        let path = source.join(name);
+        if path.is_file() {
+            crate::data::storage::clone_or_copy(&path, &target.join(name))?;
+            files.push((*name).to_string());
+        }
+    }
+    if !files.iter().any(|name| name == "doc.json") {
+        return Err(AppError::ProjectNotFound(source.join("doc.json")));
+    }
+    let manifest = SnapshotManifest {
+        version: SNAPSHOT_FORMAT_VERSION,
+        files,
+    };
+    crate::data::storage::write_json(&target.join(SNAPSHOT_MANIFEST), &manifest)?;
+    Ok(manifest)
+}
+
+fn sync_remove(path: &Path) -> AppResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn apply_bundle(target: &Path, source: &Path, manifest: &SnapshotManifest) -> AppResult<()> {
+    // Validate the document before changing any working file.
+    Doc::load(source)?;
+    for name in VERSIONED_FILES {
+        let target_file = target.join(name);
+        if manifest.files.iter().any(|present| present == name) {
+            let source_file = source.join(name);
+            if !source_file.is_file() {
+                return Err(AppError::ProjectNotFound(source_file));
+            }
+            crate::data::storage::copy(&source_file, &target_file)?;
+        } else {
+            sync_remove(&target_file)?;
+        }
+    }
+    // Refuse to leave a syntactically invalid working document behind.
+    Doc::load(target)?;
+    Ok(())
+}
+
+fn recovery_root(dir: &Path) -> PathBuf {
+    dir.join(".lumen-cut").join("recovery")
+}
+
+fn restore_journal_path(dir: &Path) -> PathBuf {
+    recovery_root(dir).join(RESTORE_JOURNAL)
+}
+
+/// Roll back a restore that was interrupted between authoritative file swaps.
+/// This is intentionally safe to call whenever a project is opened.
+pub fn recover_interrupted_restore(dir: &Path) -> AppResult<bool> {
+    let journal_path = restore_journal_path(dir);
+    if !journal_path.exists() {
+        return Ok(false);
+    }
+    let journal: RestoreJournal = serde_json::from_str(&std::fs::read_to_string(&journal_path)?)?;
+    let backup = recovery_root(dir).join(&journal.backup);
+    let manifest = snapshot_manifest(&backup)?.ok_or_else(|| {
+        AppError::Schema("interrupted restore backup has no snapshot manifest".into())
+    })?;
+    apply_bundle(dir, &backup, &manifest)?;
+    sync_remove(&journal_path)?;
+    std::fs::remove_dir_all(backup)?;
+    Ok(true)
+}
+
+fn restore_bundle(dir: &Path, source: &Path) -> AppResult<()> {
+    recover_interrupted_restore(dir)?;
+    let Some(manifest) = snapshot_manifest(source)? else {
+        // Snapshots created by lumen-cut <= 0.2.6 only carried doc.json.
+        // Preserve their historical behaviour instead of guessing whether
+        // sidecar files that did not exist in the format should be removed.
+        let doc = Doc::load(source)?;
+        return doc.save(dir);
+    };
+    if !dir.join("doc.json").is_file() {
+        return apply_bundle(dir, source, &manifest);
+    }
+
+    let backup_name = format!("restore-{}", uuid::Uuid::new_v4());
+    let backup = recovery_root(dir).join(&backup_name);
+    capture_bundle(dir, &backup)?;
+    let journal_path = restore_journal_path(dir);
+    crate::data::storage::write_json(
+        &journal_path,
+        &RestoreJournal {
+            backup: backup_name,
+        },
+    )?;
+
+    if let Err(error) = apply_bundle(dir, source, &manifest) {
+        // Preserve the original failure while making a best effort to put the
+        // working tree back immediately. If rollback itself is interrupted,
+        // the journal remains and project open will retry it.
+        if recover_interrupted_restore(dir).is_ok() {
+            return Err(error);
+        }
+        return Err(AppError::Schema(format!(
+            "{error}; automatic rollback is pending and will retry when the project opens"
+        )));
+    }
+    sync_remove(&journal_path)?;
+    std::fs::remove_dir_all(backup)?;
+    Ok(())
+}
+
+fn bundle_matches_working(dir: &Path, snapshot: &Path) -> AppResult<bool> {
+    let Some(manifest) = snapshot_manifest(snapshot)? else {
+        return Ok(false);
+    };
+    for name in VERSIONED_FILES
+        .iter()
+        .copied()
+        .filter(|name| *name != "doc.json")
+    {
+        let working = dir.join(name);
+        let saved = snapshot.join(name);
+        let expected = manifest.files.iter().any(|present| present == name);
+        if working.is_file() != expected || saved.is_file() != expected {
+            return Ok(false);
+        }
+        if expected && !crate::data::storage::files_equal(&working, &saved)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Commit a full project-state snapshot under `versions/<id>/` and append a
 /// `VersionNode` to the lineage. Returns the new version id.
 pub fn commit_snapshot(
     dir: &Path,
@@ -230,6 +435,34 @@ pub fn commit_snapshot(
         }
     }
     doc.save(&snap_dir)?;
+    // `Doc::save` materializes doc.json and a cues projection. The working
+    // project's actual sidecar presence is authoritative, so replace or
+    // remove every generated sidecar accordingly. This also records absence,
+    // allowing restore to remove files created after the snapshot.
+    for name in VERSIONED_FILES
+        .iter()
+        .copied()
+        .filter(|name| *name != "doc.json")
+    {
+        let source = dir.join(name);
+        if source.is_file() {
+            crate::data::storage::clone_or_copy(&source, &snap_dir.join(name))?;
+        } else {
+            sync_remove(&snap_dir.join(name))?;
+        }
+    }
+    let files = VERSIONED_FILES
+        .iter()
+        .filter(|name| snap_dir.join(name).is_file())
+        .map(|name| (*name).to_string())
+        .collect();
+    crate::data::storage::write_json(
+        &snap_dir.join(SNAPSHOT_MANIFEST),
+        &SnapshotManifest {
+            version: SNAPSHOT_FORMAT_VERSION,
+            files,
+        },
+    )?;
     lineage.nodes.push(VersionNode {
         id: id.clone(),
         parent,
@@ -264,16 +497,15 @@ pub fn commit_snapshot(
     Ok(id)
 }
 
-/// Restore a version: copy its `versions/<id>/doc.json` snapshot back to
-/// the working `doc.json`. The restore itself is recorded as a new node of
-/// kind `Restore`.
+/// Restore a version's complete project bundle. The restore itself is recorded
+/// as a new node of kind `Restore`.
 pub fn restore_snapshot(dir: &Path, lineage: &mut Lineage, id: &str) -> AppResult<()> {
-    let snap = snapshot_path(dir, id);
-    if !snap.exists() {
-        return Err(AppError::ProjectNotFound(snap));
+    let snap_dir = snapshot_dir(dir, id);
+    if !snap_dir.join("doc.json").exists() {
+        return Err(AppError::ProjectNotFound(snap_dir.join("doc.json")));
     }
-    let doc = Doc::load(snap.parent().unwrap())?;
-    doc.save(dir)?;
+    restore_bundle(dir, &snap_dir)?;
+    let doc = Doc::load(dir)?;
     let branch = lineage
         .active_branch
         .clone()
@@ -343,23 +575,19 @@ pub fn switch_branch(dir: &Path, lineage: &mut Lineage, id: &str) -> AppResult<(
         .find(|branch| branch.id == id)
         .map(|branch| branch.tip.clone())
         .ok_or_else(|| AppError::Schema(format!("branch {id} not found")))?;
-    let snap = snapshot_path(dir, &tip);
-    if !snap.exists() {
-        return Err(AppError::ProjectNotFound(snap));
+    let snap_dir = snapshot_dir(dir, &tip);
+    if !snap_dir.join("doc.json").exists() {
+        return Err(AppError::ProjectNotFound(snap_dir.join("doc.json")));
     }
-    let doc = Doc::load(
-        snap.parent()
-            .ok_or_else(|| AppError::Schema(format!("invalid snapshot path for {tip}")))?,
-    )?;
-    doc.save(dir)?;
+    restore_bundle(dir, &snap_dir)?;
     lineage.active_branch = Some(id.into());
     lineage.head = Some(tip);
     lineage.save(dir)
 }
 
-/// A project is committed when the working `doc.json` exactly matches the
-/// active branch tip snapshot. Missing lineage or a missing snapshot is not
-/// treated as committed.
+/// A project is committed when every authoritative working file exactly
+/// matches the active branch tip snapshot. Missing lineage or a legacy
+/// doc-only snapshot is not treated as committed.
 pub fn working_head_is_committed(dir: &Path, doc: &Doc) -> AppResult<bool> {
     let lineage = Lineage::load(dir)?;
     let Some(head) = lineage.head() else {
@@ -369,16 +597,23 @@ pub fn working_head_is_committed(dir: &Path, doc: &Doc) -> AppResult<bool> {
     if !snap.exists() {
         return Ok(false);
     }
-    let mut snapshot = Doc::load(
+    let mut snapshot_doc = Doc::load(
         snap.parent()
             .ok_or_else(|| AppError::Schema("invalid version snapshot path".into()))?,
     )?;
     // Flat native documents do not necessarily persist these compatibility
     // timestamps; importing them synthesizes `now`, so they are not evidence
     // of an uncommitted content change.
-    snapshot.meta.created_at = doc.meta.created_at;
-    snapshot.meta.updated_at = doc.meta.updated_at;
-    Ok(&snapshot == doc)
+    snapshot_doc.meta.created_at = doc.meta.created_at;
+    snapshot_doc.meta.updated_at = doc.meta.updated_at;
+    if &snapshot_doc != doc {
+        return Ok(false);
+    }
+    bundle_matches_working(
+        dir,
+        snap.parent()
+            .ok_or_else(|| AppError::Schema("invalid version snapshot path".into()))?,
+    )
 }
 
 /// 3-way cue-level merge. Inputs are **base**, **ours**, **theirs** cue→text
@@ -533,6 +768,94 @@ mod tests {
         assert_eq!(restored.meta.title, "first");
         // restore recorded as a Restore node.
         assert_eq!(lineage.head().unwrap().kind, VersionKind::Restore);
+    }
+
+    #[test]
+    fn version_restore_round_trips_all_editor_sidecars_and_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut lineage = Lineage::default();
+        let mut doc = sample_doc();
+        doc.save(dir).unwrap();
+        crate::data::storage::write(dir.join("broll.json").as_path(), br#"[{"id":"old"}]"#)
+            .unwrap();
+        crate::data::storage::write(dir.join("titles.json").as_path(), br#"[{"id":"title"}]"#)
+            .unwrap();
+        crate::data::storage::write(
+            dir.join("chapters.json").as_path(),
+            br#"[{"title":"Opening"}]"#,
+        )
+        .unwrap();
+        let first = commit_snapshot(
+            dir,
+            &doc,
+            &mut lineage,
+            "main",
+            "complete state",
+            "",
+            VersionKind::Manual,
+        )
+        .unwrap();
+
+        doc.meta.title = "changed".into();
+        doc.save(dir).unwrap();
+        crate::data::storage::write(dir.join("broll.json").as_path(), br#"[{"id":"new"}]"#)
+            .unwrap();
+        std::fs::remove_file(dir.join("titles.json")).unwrap();
+        std::fs::remove_file(dir.join("chapters.json")).unwrap();
+        crate::data::storage::write(dir.join("cuts.json").as_path(), br#"[{"id":"later"}]"#)
+            .unwrap();
+
+        restore_snapshot(dir, &mut lineage, &first).unwrap();
+        assert_eq!(Doc::load(dir).unwrap().meta.title, "t");
+        assert_eq!(
+            std::fs::read(dir.join("broll.json")).unwrap(),
+            br#"[{"id":"old"}]"#
+        );
+        assert_eq!(
+            std::fs::read(dir.join("titles.json")).unwrap(),
+            br#"[{"id":"title"}]"#
+        );
+        assert_eq!(
+            std::fs::read(dir.join("chapters.json")).unwrap(),
+            br#"[{"title":"Opening"}]"#
+        );
+        assert!(!dir.join("cuts.json").exists());
+        assert!(!restore_journal_path(dir).exists());
+    }
+
+    #[test]
+    fn interrupted_bundle_restore_rolls_back_on_next_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut original = sample_doc();
+        original.meta.title = "safe".into();
+        original.save(dir).unwrap();
+        crate::data::storage::write(&dir.join("style.json"), br#"{"font":"safe"}"#).unwrap();
+
+        let backup_name = "restore-test";
+        let backup = recovery_root(dir).join(backup_name);
+        capture_bundle(dir, &backup).unwrap();
+        crate::data::storage::write_json(
+            &restore_journal_path(dir),
+            &RestoreJournal {
+                backup: backup_name.into(),
+            },
+        )
+        .unwrap();
+
+        let mut partial = original;
+        partial.meta.title = "partial".into();
+        partial.save(dir).unwrap();
+        std::fs::remove_file(dir.join("style.json")).unwrap();
+
+        assert!(recover_interrupted_restore(dir).unwrap());
+        assert_eq!(Doc::load(dir).unwrap().meta.title, "safe");
+        assert_eq!(
+            std::fs::read(dir.join("style.json")).unwrap(),
+            br#"{"font":"safe"}"#
+        );
+        assert!(!restore_journal_path(dir).exists());
     }
 
     #[test]

@@ -185,7 +185,10 @@ def build_paragraphs(
     flush()
     if not sentences:
         return []
-    return [{"speaker": None, "sentences": sentences}]
+    # Speaker diarization is assigned at paragraph granularity in doc.json.
+    # Keep that granularity aligned with subtitle cues so a long ASR result
+    # cannot collapse every detected speaker into one dominant label.
+    return [{"speaker": None, "sentences": [sentence]} for sentence in sentences]
 
 
 def emit_progress(

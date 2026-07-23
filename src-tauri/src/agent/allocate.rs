@@ -17,7 +17,7 @@
 //! a real concurrent port can swap in a `tokio::sync::Mutex` without
 //! changing the public API.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -149,6 +149,43 @@ impl Allocator {
         g.queue.iter().any(|call| call.id == call_id)
             || g.leased.iter().any(|(_, call)| call.id == call_id)
             || g.completed.contains_key(call_id)
+    }
+
+    /// Stop unclaimed work for one durable task without discarding it.
+    /// Already-leased calls are allowed to finish and persist their answers;
+    /// a later resume restores those answers and re-enqueues only the
+    /// remaining pending calls.
+    pub fn pause_calls(&self, call_ids: &HashSet<String>) -> (usize, usize) {
+        let mut inner = self.inner.lock().expect("allocator poisoned");
+        let before = inner.queue.len();
+        inner.queue.retain(|call| !call_ids.contains(&call.id));
+        let removed = before - inner.queue.len();
+        let in_flight = inner
+            .leased
+            .iter()
+            .filter(|(_, call)| call_ids.contains(&call.id))
+            .count();
+        (removed, in_flight)
+    }
+
+    /// Move one task's unclaimed calls ahead of other normal work while
+    /// preserving order within both groups. Validation retries remain the
+    /// allocator's highest priority.
+    pub fn prioritize_calls(&self, call_ids: &HashSet<String>) -> usize {
+        let mut inner = self.inner.lock().expect("allocator poisoned");
+        let mut prioritized = VecDeque::new();
+        let mut remaining = VecDeque::new();
+        while let Some(call) = inner.queue.pop_front() {
+            if call_ids.contains(&call.id) {
+                prioritized.push_back(call);
+            } else {
+                remaining.push_back(call);
+            }
+        }
+        let moved = prioritized.len();
+        prioritized.append(&mut remaining);
+        inner.queue = prioritized;
+        moved
     }
 
     /// Atomically dequeue the next pending call and produce a fresh lease.
@@ -331,6 +368,37 @@ mod tests {
         assert!(a.allocate().is_some());
         assert!(a.allocate().is_some());
         assert!(a.allocate().is_none());
+    }
+
+    #[test]
+    fn pause_removes_queued_calls_but_preserves_in_flight_work() {
+        let allocator = Allocator::new(2);
+        allocator.enqueue(call("task-a-1", 10));
+        allocator.enqueue(call("task-a-2", 10));
+        allocator.enqueue(call("task-b-1", 10));
+        let (claimed, _) = allocator.allocate().unwrap();
+        assert_eq!(claimed.id, "task-a-1");
+
+        let ids = HashSet::from(["task-a-1".to_string(), "task-a-2".to_string()]);
+        assert_eq!(allocator.pause_calls(&ids), (1, 1));
+        assert_eq!(allocator.allocate().unwrap().0.id, "task-b-1");
+        assert!(!allocator.contains_call("task-a-2"));
+        assert!(allocator.contains_call("task-a-1"));
+    }
+
+    #[test]
+    fn prioritize_moves_a_task_as_one_stable_group() {
+        let allocator = Allocator::new(4);
+        allocator.enqueue(call("other-1", 10));
+        allocator.enqueue(call("chosen-1", 10));
+        allocator.enqueue(call("other-2", 10));
+        allocator.enqueue(call("chosen-2", 10));
+        let ids = HashSet::from(["chosen-1".to_string(), "chosen-2".to_string()]);
+
+        assert_eq!(allocator.prioritize_calls(&ids), 2);
+        assert_eq!(allocator.allocate().unwrap().0.id, "chosen-1");
+        assert_eq!(allocator.allocate().unwrap().0.id, "chosen-2");
+        assert_eq!(allocator.allocate().unwrap().0.id, "other-1");
     }
 
     #[test]

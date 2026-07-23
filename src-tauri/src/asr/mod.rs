@@ -4,6 +4,8 @@
 //! module spawns it via `crate::proc::run` and parses its JSON output
 //! (`asr_out.v1`) into our `Doc` shape.
 
+pub mod cloud;
+
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -24,6 +26,9 @@ const HUGGING_FACE_HUB_PACKAGE: &str = "huggingface-hub==0.36.2";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
+    pub engine: crate::data::modelconfig::AsrEngine,
+    pub selected_ready: bool,
+    pub cloud_configured: bool,
     pub python_path: Option<String>,
     pub runtime_ready: bool,
     pub runtime_detail: String,
@@ -172,7 +177,17 @@ pub fn runtime_status() -> RuntimeStatus {
         || ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
             .into_iter()
             .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    let cloud_configured = crate::data::modelconfig::cloud_asr_configured(&config);
+    let selected_ready = match config.asr_engine {
+        crate::data::modelconfig::AsrEngine::Local => {
+            runtime_ready && model_cached && aligner_cached
+        }
+        crate::data::modelconfig::AsrEngine::OpenaiCompatible => cloud_configured,
+    };
     RuntimeStatus {
+        engine: config.asr_engine,
+        selected_ready,
+        cloud_configured,
         python_path: runtime
             .as_ref()
             .map(|(path, _)| path.to_string_lossy().into_owned()),

@@ -4,7 +4,7 @@
 //! a sibling `hidden.json` so visibility changes do not alter the transcript
 //! model.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,106 @@ pub fn set(doc: &mut Doc, id: &str, text: &str) -> bool {
     false
 }
 
+/// Apply a batch of text edits in one document traversal.
+///
+/// The command layer validates ids before calling this function. A map makes
+/// large "save all" operations O(cues + updates) instead of scanning every cue
+/// once for every update.
+pub fn set_many(doc: &mut Doc, updates: &HashMap<&str, &str>) -> usize {
+    let mut changed = 0;
+    for paragraph in &mut doc.paragraphs {
+        for sentence in &mut paragraph.sentences {
+            let Some(text) = updates.get(sentence.id.as_str()) else {
+                continue;
+            };
+            if sentence.text == *text {
+                continue;
+            }
+            sentence.text = (*text).into();
+            sentence.words = crate::data::rebind::rebind_corrected(&sentence.words, text);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Retimes one cue while preserving every real word boundary proportionally.
+/// The neighboring cue window is authoritative: timing edits may use silence
+/// around a cue but can never overlap another cue or leave the media range.
+pub fn set_timing(doc: &mut Doc, id: &str, start: f64, end: f64) -> AppResult<bool> {
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end - start < 0.1 {
+        return Err(AppError::Schema(
+            "subtitle timing must be finite, nonnegative, and at least 0.1s long".into(),
+        ));
+    }
+    if end > doc.media.duration_seconds + 0.001 {
+        return Err(AppError::Schema(format!(
+            "subtitle ends after the media ({end:.3}s > {:.3}s)",
+            doc.media.duration_seconds
+        )));
+    }
+
+    let cues = doc
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.sentences.iter())
+        .filter_map(|sentence| {
+            sentence
+                .words
+                .first()
+                .zip(sentence.words.last())
+                .map(|(first, last)| (sentence.id.as_str(), first.start, last.end))
+        })
+        .collect::<Vec<_>>();
+    let index = cues
+        .iter()
+        .position(|(cue_id, _, _)| *cue_id == id)
+        .ok_or_else(|| AppError::Schema(format!("subtitle cue `{id}` was not found")))?;
+    let earliest = index
+        .checked_sub(1)
+        .and_then(|previous| cues.get(previous))
+        .map(|(_, _, previous_end)| *previous_end)
+        .unwrap_or(0.0);
+    let latest = cues
+        .get(index + 1)
+        .map(|(_, next_start, _)| *next_start)
+        .unwrap_or(doc.media.duration_seconds);
+    if start + 0.001 < earliest || end > latest + 0.001 {
+        return Err(AppError::Schema(format!(
+            "subtitle timing must stay inside the available {:.3}s–{:.3}s window",
+            earliest, latest
+        )));
+    }
+
+    let sentence = doc
+        .paragraphs
+        .iter_mut()
+        .flat_map(|paragraph| paragraph.sentences.iter_mut())
+        .find(|sentence| sentence.id == id)
+        .ok_or_else(|| AppError::Schema(format!("subtitle cue `{id}` was not found")))?;
+    let (old_start, old_end) = sentence
+        .words
+        .first()
+        .zip(sentence.words.last())
+        .map(|(first, last)| (first.start, last.end))
+        .ok_or_else(|| AppError::Schema(format!("subtitle cue `{id}` has no word timing")))?;
+    if old_end - old_start <= f64::EPSILON {
+        return Err(AppError::Schema(format!(
+            "subtitle cue `{id}` has invalid source timing"
+        )));
+    }
+    if (old_start - start).abs() <= 0.000_001 && (old_end - end).abs() <= 0.000_001 {
+        return Ok(false);
+    }
+
+    let scale = (end - start) / (old_end - old_start);
+    for word in &mut sentence.words {
+        word.start = start + (word.start - old_start) * scale;
+        word.end = start + (word.end - old_start) * scale;
+    }
+    Ok(true)
+}
+
 /// Set one translated cue while recording the source snapshot used by stale
 /// translation detection. Returns `false` when the source cue does not exist.
 pub fn set_translation(doc: &mut Doc, lang: &str, id: &str, text: &str) -> bool {
@@ -123,12 +223,16 @@ pub struct HiddenFile {
     pub hidden: BTreeSet<String>,
 }
 
+pub fn load_hidden_checked(dir: &Path) -> AppResult<BTreeSet<String>> {
+    let path = dir.join("hidden.json");
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(serde_json::from_str::<HiddenFile>(&std::fs::read_to_string(path)?)?.hidden)
+}
+
 pub fn load_hidden(dir: &Path) -> BTreeSet<String> {
-    std::fs::read_to_string(dir.join("hidden.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<HiddenFile>(&s).ok())
-        .map(|h| h.hidden)
-        .unwrap_or_default()
+    load_hidden_checked(dir).unwrap_or_default()
 }
 
 pub fn save_hidden(dir: &Path, set: &BTreeSet<String>) -> AppResult<()> {
@@ -142,7 +246,7 @@ pub fn save_hidden(dir: &Path, set: &BTreeSet<String>) -> AppResult<()> {
 
 /// Hide a subtitle id. Returns `true` if it was newly hidden.
 pub fn hide(dir: &Path, id: &str) -> AppResult<bool> {
-    let mut s = load_hidden(dir);
+    let mut s = load_hidden_checked(dir)?;
     let new = s.insert(id.to_string());
     save_hidden(dir, &s)?;
     Ok(new)
@@ -150,7 +254,7 @@ pub fn hide(dir: &Path, id: &str) -> AppResult<bool> {
 
 /// Restore a hidden subtitle id. Returns `true` if it was hidden.
 pub fn restore(dir: &Path, id: &str) -> AppResult<bool> {
-    let mut s = load_hidden(dir);
+    let mut s = load_hidden_checked(dir)?;
     let removed = s.remove(id);
     save_hidden(dir, &s)?;
     Ok(removed)
@@ -224,6 +328,52 @@ mod tests {
     }
 
     #[test]
+    fn set_many_updates_each_matching_cue_once() {
+        let mut d = doc_with(vec![("s1", "hello"), ("s2", "world"), ("s3", "same")]);
+        let updates = HashMap::from([("s1", "hello there"), ("s2", "world again"), ("s3", "same")]);
+
+        assert_eq!(set_many(&mut d, &updates), 2);
+        assert_eq!(d.paragraphs[0].sentences[0].text, "hello there");
+        assert_eq!(
+            d.paragraphs[0].sentences[1]
+                .words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["world", "again"],
+        );
+        assert_eq!(d.paragraphs[0].sentences[2].text, "same");
+    }
+
+    #[test]
+    fn timing_edit_preserves_word_boundaries_and_rejects_neighbor_overlap() {
+        let mut doc = doc_with(vec![("s1", "hello"), ("s2", "world")]);
+        doc.paragraphs[0].sentences[0].words = vec![
+            Word {
+                id: "w1".into(),
+                text: "hello".into(),
+                start: 0.5,
+                end: 1.0,
+            },
+            Word {
+                id: "w2".into(),
+                text: "there".into(),
+                start: 1.0,
+                end: 1.5,
+            },
+        ];
+        doc.paragraphs[0].sentences[1].words[0].start = 3.0;
+        doc.paragraphs[0].sentences[1].words[0].end = 4.0;
+
+        assert!(set_timing(&mut doc, "s1", 1.0, 3.0).unwrap());
+        let words = &doc.paragraphs[0].sentences[0].words;
+        assert_eq!((words[0].start, words[0].end), (1.0, 2.0));
+        assert_eq!((words[1].start, words[1].end), (2.0, 3.0));
+        assert!(set_timing(&mut doc, "s1", 1.0, 3.1).is_err());
+        assert!(set_timing(&mut doc, "s2", 2.9, 4.0).is_err());
+    }
+
+    #[test]
     fn set_translation_records_source_snapshot() {
         let mut d = doc_with(vec![("s1", "hello")]);
         assert!(set_translation(&mut d, "zh", "s1", "你好"));
@@ -251,5 +401,17 @@ mod tests {
         assert!(h.contains("s1"));
         assert!(restore(tmp.path(), "s1").unwrap());
         assert!(!restore(tmp.path(), "s1").unwrap());
+    }
+
+    #[test]
+    fn corrupt_visibility_state_is_never_treated_as_an_empty_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hidden.json"), "{").unwrap();
+        assert!(load_hidden_checked(dir.path()).is_err());
+        assert!(hide(dir.path(), "s1").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hidden.json")).unwrap(),
+            "{"
+        );
     }
 }

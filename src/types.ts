@@ -15,6 +15,14 @@ export interface ProjectSummary {
   paragraph_count: number;
   updated_at: string;
   starred: boolean;
+  media_available: boolean;
+  last_opened_at: string | null;
+}
+
+export interface ProjectThumbnail {
+  path: string | null;
+  mediaAvailable: boolean;
+  deferred: boolean;
 }
 
 export interface SpeakerInfo {
@@ -109,8 +117,26 @@ export interface Doc {
   translations: Record<string, Record<string, DocTranslation>>;
 }
 
+export interface ChapterInput {
+  title: string;
+  startSeg: string;
+}
+
+export interface ChapterRow extends ChapterInput {
+  start: number;
+  end: number;
+  preview: string;
+}
+
+export interface SubtitleUpdateResult {
+  changed: number;
+  sentences: DocSentence[];
+}
+
 export interface DocTranslation {
   text: string;
+  sourceText?: string | null;
+  sourceWords?: string[];
 }
 
 export interface AutoResult {
@@ -143,13 +169,15 @@ export interface TranscriptionJobStatus {
   progress: number;
   current: number | null;
   total: number | null;
-  device: "mlx-metal" | null;
+  device: "mlx-metal" | "cloud" | null;
   elapsedSeconds: number | null;
   cpuPercent: number | null;
   peakMemoryMb: number | null;
   memoryLimitMb: number | null;
   mlxActiveMemoryMb: number | null;
   mlxCacheMemoryMb: number | null;
+  startedAt?: number | null;
+  updatedAt?: number | null;
   error?: string | null;
 }
 
@@ -176,6 +204,8 @@ export interface SpeakerAnalysisJobStatus {
   cpuPercent: number | null;
   peakMemoryMb: number | null;
   memoryLimitMb: number | null;
+  startedAt?: number | null;
+  updatedAt?: number | null;
   error: string | null;
   preview: SpeakerReidentifyPreview | null;
 }
@@ -183,20 +213,44 @@ export interface SpeakerAnalysisJobStatus {
 export interface VideoExportJobStatus {
   pid: string;
   mode: "fast" | "quality";
+  settings: VideoExportSettings;
   state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
   phase: "waiting" | "preparing" | "encoding" | "completed" | "cancelling" | "cancelled" | "failed";
   progress: number;
   currentSeconds: number | null;
   totalSeconds: number | null;
-  encoder: "h264_videotoolbox" | "libx264" | null;
+  encoder:
+    | "h264_videotoolbox"
+    | "hevc_videotoolbox"
+    | "libx264"
+    | "libx265"
+    | "prores_ks"
+    | null;
+  startedAt?: number | null;
+  updatedAt?: number | null;
   error: string | null;
   path: string | null;
+}
+
+export interface VideoExportSettings {
+  container: "mp4" | "mov";
+  videoCodec: "h264" | "hevc" | "prores";
+  resolution: "source" | "720p" | "1080p" | "4k";
+  aspectRatio: "source" | "16:9" | "9:16" | "1:1" | "4:5";
+  canvasFit: "contain" | "cover";
+  subtitleMode: "burn" | "soft" | "none";
+  subtitleLanguage: string | null;
+  bilingualSubtitles: boolean;
+  audioCodec: "aac" | "pcm";
+  encodingSpeed: "fast" | "quality";
 }
 
 export interface SetupJobStatus {
   kind: "asr-runtime" | "asr-models" | "speaker-runtime" | "speaker-model";
   state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
   phase: "waiting" | "installing" | "downloading" | "completed" | "cancelling" | "cancelled" | "failed";
+  startedAt?: number | null;
+  updatedAt?: number | null;
   error: string | null;
 }
 
@@ -208,8 +262,15 @@ export interface BrollPreviewJobStatus {
   current: number | null;
   total: number | null;
   encoder: "h264_videotoolbox" | "libx264" | null;
+  startedAt?: number | null;
+  updatedAt?: number | null;
   error: string | null;
   paths: string[];
+}
+
+export interface PerformanceStatus {
+  activePipeline: string | null;
+  waitingPipelines: number;
 }
 
 export interface TaskStatus {
@@ -224,6 +285,7 @@ export interface TaskStatus {
     done: number;
     failed: number;
     lastError?: string | null;
+    startedAt?: number | null;
     updatedAt?: number | null;
   }>;
   polishQuality?: {
@@ -275,17 +337,27 @@ export interface SubtitleStyle {
 }
 
 export interface ModelConfig {
+  asrEngine: "local" | "openai-compatible";
   asrModel: string;
   asrAligner: string;
+  asrCloudEndpoint: string;
+  asrCloudApiKey: string;
+  asrCloudModel: string;
   diarizeModel: string;
   hfToken: string;
   llmEndpoint: string;
   llmApiKey: string;
   llmModel: string;
   workerCount: number;
+  hfTokenSet: boolean;
+  llmApiKeySet: boolean;
+  asrCloudApiKeySet: boolean;
 }
 
 export interface AsrStatus {
+  engine: "local" | "openai-compatible";
+  selectedReady: boolean;
+  cloudConfigured: boolean;
   pythonPath: string | null;
   runtimeReady: boolean;
   runtimeDetail: string;
@@ -314,6 +386,27 @@ export interface FinishCheckItem {
   ordinal: number;
   pass: boolean;
   blockers: string[];
+}
+
+export interface ExportPreflightItem {
+  code: string;
+  level: "pass" | "warning" | "blocker";
+  message: string;
+}
+
+export interface ExportPreflightReport {
+  ready: boolean;
+  items: ExportPreflightItem[];
+  summary: {
+    durationSeconds: number;
+    visibleCaptions: number;
+    hiddenCaptions: number;
+    brollItems: number;
+    titleItems: number;
+    encoder: string;
+    estimatedMinMb: number;
+    estimatedMaxMb: number;
+  };
 }
 
 export interface FindingSummary {
@@ -361,6 +454,15 @@ export interface ProjectBranch {
   note: string;
 }
 
+export interface ProjectMediaStatus {
+  path: string;
+  available: boolean;
+  fileSize: number | null;
+  expectedDurationSeconds: number;
+  issue: string | null;
+  suggestedPath: string | null;
+}
+
 export interface VersionHistory {
   v: number;
   head?: string | null;
@@ -402,6 +504,7 @@ export interface BrollPlacementInput {
   mode: BrollMode;
   fit: BrollFit;
   background: BrollBackground;
+  rect?: { x: number; y: number; width: number; height: number } | null;
   sourceStart: number;
   radius: number;
   name: string | null;
@@ -413,9 +516,52 @@ export interface BrollOverview {
   errors: string[];
 }
 
+export interface TitleClip {
+  id: string;
+  text: string;
+  start: number;
+  end: number;
+  x: number;
+  y: number;
+  fontSize: number;
+  color: string;
+  background: string;
+  fadeIn: number;
+  fadeOut: number;
+}
+
+export type TitleClipInput = Omit<TitleClip, "id">;
+
+export interface AudioMix {
+  volume: number;
+  muted: boolean;
+  fadeIn: number;
+  fadeOut: number;
+  voiceEnhance: boolean;
+  normalizeLoudness: boolean;
+  loudnessTarget: number;
+  music: MusicTrack[];
+}
+
+export interface MusicTrack {
+  id: string;
+  path: string;
+  start: number;
+  end: number;
+  sourceStart: number;
+  volume: number;
+  fadeIn: number;
+  fadeOut: number;
+  ducking: boolean;
+}
+
 export interface Settings {
+  asrEngine: "local" | "openai-compatible";
   asrModel: string;
   asrAligner: string;
+  asrCloudEndpoint: string;
+  asrCloudApiKey: string;
+  asrCloudModel: string;
   diarizeModel: string;
   hfToken: string;
   llmEndpoint: string;

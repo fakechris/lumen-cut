@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::error::AppResult;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubStyle {
     pub name: String,
@@ -76,12 +78,18 @@ impl SubStyle {
         )
     }
 
-    /// Load `<dir>/style.json` if present, else the default.
+    /// Load `<dir>/style.json` if present. Only an absent file uses defaults;
+    /// a corrupt persisted style must remain visible to the caller.
+    pub fn load(dir: &std::path::Path) -> AppResult<Self> {
+        let path = dir.join("style.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    }
+
     pub fn load_or_default(dir: &std::path::Path) -> Self {
-        std::fs::read_to_string(dir.join("style.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        Self::load(dir).unwrap_or_default()
     }
 }
 
@@ -116,5 +124,13 @@ mod tests {
         let back: SubStyle = serde_json::from_str(&json).unwrap();
         assert_eq!(back.fontsize, 52);
         assert!(json.contains("\"fontsize\""));
+    }
+
+    #[test]
+    fn corrupt_persisted_style_is_distinct_from_an_absent_style() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(SubStyle::load(dir.path()).unwrap(), SubStyle::default());
+        std::fs::write(dir.path().join("style.json"), "{").unwrap();
+        assert!(SubStyle::load(dir.path()).is_err());
     }
 }

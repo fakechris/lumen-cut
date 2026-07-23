@@ -51,6 +51,71 @@ jobs:
             exit 1
           fi
 
+      - name: Require Apple signing and notarization credentials for a release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          missing=()
+          for name in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID \
+            KEYCHAIN_PASSWORD
+          do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Release tags require Apple signing/notarization secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Import Apple Developer ID certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          certificate="$RUNNER_TEMP/lumen-cut-certificate.p12"
+          keychain="$RUNNER_TEMP/lumen-cut-signing.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$keychain"
+          identity="$(
+            security find-identity -v -p codesigning "$keychain" \
+              | awk -F'"' '/Developer ID Application/{print $2; exit}'
+          )"
+          if [[ -z "$identity" ]]; then
+            echo "The imported certificate has no Developer ID Application identity." >&2
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "LUMEN_CUT_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          rm -f "$certificate"
+
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
@@ -66,7 +131,33 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
       - name: Build and package desktop release
+        env:
+          APPLE_ID: ${{ startsWith(github.ref, 'refs/tags/') && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/') && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(github.ref, 'refs/tags/') && secrets.APPLE_TEAM_ID || '' }}
         run: pnpm release:local
+
+      - name: Verify signed and notarized tag artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          codesign --verify --deep --strict \
+            src-tauri/target/release/bundle/macos/lumen-cut.app
+          spctl --assess --type execute --verbose=2 \
+            src-tauri/target/release/bundle/macos/lumen-cut.app
+          xcrun stapler validate \
+            src-tauri/target/release/bundle/macos/lumen-cut.app
+          xcrun stapler validate \
+            src-tauri/target/release/bundle/dmg/lumen-cut_*.dmg
+
+      - name: Remove temporary signing keychain
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          security default-keychain -s login.keychain-db || true
+          if [[ -n "${LUMEN_CUT_SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$LUMEN_CUT_SIGNING_KEYCHAIN" || true
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7

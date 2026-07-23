@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { greet, projectList } from "./api";
+import { useCallback, useEffect, useState } from "react";
+import { greet, projectList, projectMarkOpened } from "./api";
 import {
   FolderIcon,
   MoonIcon,
@@ -8,11 +8,15 @@ import {
   TranscriptIcon,
 } from "./components/Icons";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
+import { ProjectCover } from "./components/ProjectCover";
 import lumenCutMark from "./assets/lumen-cut.svg";
 import { t, type Lang } from "./i18n";
 import { ProjectsView } from "./views/ProjectsView";
 import { SettingsView } from "./views/SettingsView";
 import { TranscriptView } from "./views/TranscriptView";
+import type { TranscriptDraft } from "./views/editor/TranscriptEditor";
+import type { TranslationDraft } from "./views/editor/TranslationWorkspace";
+import type { ChapterDraft } from "./views/editor/ChapterWorkspace";
 import type { ProjectSummary } from "./types";
 import { TaskCenterView } from "./views/TaskCenterView";
 
@@ -20,6 +24,80 @@ type View = "projects" | "transcript" | "tasks" | "settings";
 type Theme = "dark" | "light";
 
 const LAST_PROJECT_KEY = "lumen-cut.lastProject";
+const TRANSCRIPT_DRAFTS_KEY = "lumen-cut.transcriptDrafts";
+const TRANSLATION_DRAFTS_KEY = "lumen-cut.translationDrafts";
+const CHAPTER_DRAFTS_KEY = "lumen-cut.chapterDrafts";
+
+type ProjectTranscriptDrafts = Record<string, Record<string, TranscriptDraft>>;
+type ProjectTranslationDrafts = Record<
+  string,
+  Record<string, Record<string, TranslationDraft>>
+>;
+type ProjectChapterDrafts = Record<string, Record<string, ChapterDraft>>;
+
+function initialTranscriptDrafts(): ProjectTranscriptDrafts {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TRANSCRIPT_DRAFTS_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([pid, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const drafts = Object.fromEntries(Object.entries(value).flatMap(([id, draft]) => {
+        if (!draft || typeof draft !== "object" || Array.isArray(draft)) return [];
+        const candidate = draft as Record<string, unknown>;
+        return typeof candidate.text === "string" && typeof candidate.sourceText === "string"
+          ? [[id, { text: candidate.text, sourceText: candidate.sourceText }]]
+          : [];
+      }));
+      return Object.keys(drafts).length > 0 ? [[pid, drafts]] : [];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function initialTranslationDrafts(): ProjectTranslationDrafts {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TRANSLATION_DRAFTS_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([pid, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const languages = Object.fromEntries(Object.entries(value).flatMap(([language, rows]) => {
+        if (!rows || typeof rows !== "object" || Array.isArray(rows)) return [];
+        const drafts = Object.fromEntries(Object.entries(rows).flatMap(([id, draft]) => {
+          if (!draft || typeof draft !== "object" || Array.isArray(draft)) return [];
+          const candidate = draft as Record<string, unknown>;
+          return typeof candidate.text === "string" && typeof candidate.savedText === "string"
+            ? [[id, { text: candidate.text, savedText: candidate.savedText }]]
+            : [];
+        }));
+        return Object.keys(drafts).length > 0 ? [[language, drafts]] : [];
+      }));
+      return Object.keys(languages).length > 0 ? [[pid, languages]] : [];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function initialChapterDrafts(): ProjectChapterDrafts {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CHAPTER_DRAFTS_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([pid, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const drafts = Object.fromEntries(Object.entries(value).flatMap(([id, draft]) => {
+        if (!draft || typeof draft !== "object" || Array.isArray(draft)) return [];
+        const candidate = draft as Record<string, unknown>;
+        return typeof candidate.title === "string" && typeof candidate.sourceTitle === "string"
+          ? [[id, { title: candidate.title, sourceTitle: candidate.sourceTitle }]]
+          : [];
+      }));
+      return Object.keys(drafts).length > 0 ? [[pid, drafts]] : [];
+    }));
+  } catch {
+    return {};
+  }
+}
 
 function initialTheme(): Theme {
   const stored = localStorage.getItem("lumen-cut.theme");
@@ -30,8 +108,15 @@ function initialTheme(): Theme {
 function App() {
   const [view, setView] = useState<View>("projects");
   const [pid, setPid] = useState<string | null>(null);
+  const [editorMounted, setEditorMounted] = useState(false);
   const [version, setVersion] = useState<string>("—");
   const [recentProjects, setRecentProjects] = useState<ProjectSummary[]>([]);
+  const [transcriptDrafts, setTranscriptDrafts] =
+    useState<ProjectTranscriptDrafts>(initialTranscriptDrafts);
+  const [translationDrafts, setTranslationDrafts] =
+    useState<ProjectTranslationDrafts>(initialTranslationDrafts);
+  const [chapterDrafts, setChapterDrafts] =
+    useState<ProjectChapterDrafts>(initialChapterDrafts);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [lang, setLang] = useState<Lang>(
     () => (localStorage.getItem("lumen-cut.lang") as Lang) || "zh",
@@ -65,17 +150,151 @@ function App() {
     localStorage.setItem("lumen-cut.lang", lang);
   }, [lang]);
 
+  useEffect(() => {
+    try {
+      if (Object.keys(transcriptDrafts).length === 0) {
+        localStorage.removeItem(TRANSCRIPT_DRAFTS_KEY);
+      } else {
+        localStorage.setItem(TRANSCRIPT_DRAFTS_KEY, JSON.stringify(transcriptDrafts));
+      }
+    } catch {
+      // Drafts remain available for this session if browser storage is full.
+    }
+  }, [transcriptDrafts]);
+
+  useEffect(() => {
+    try {
+      if (Object.keys(translationDrafts).length === 0) {
+        localStorage.removeItem(TRANSLATION_DRAFTS_KEY);
+      } else {
+        localStorage.setItem(TRANSLATION_DRAFTS_KEY, JSON.stringify(translationDrafts));
+      }
+    } catch {
+      // Drafts remain available for this session if browser storage is full.
+    }
+  }, [translationDrafts]);
+
+  useEffect(() => {
+    try {
+      if (Object.keys(chapterDrafts).length === 0) {
+        localStorage.removeItem(CHAPTER_DRAFTS_KEY);
+      } else {
+        localStorage.setItem(CHAPTER_DRAFTS_KEY, JSON.stringify(chapterDrafts));
+      }
+    } catch {
+      // Drafts remain available for this session if browser storage is full.
+    }
+  }, [chapterDrafts]);
+
+  useEffect(() => {
+    const hasTranscriptDrafts = Object.values(transcriptDrafts)
+      .some((drafts) => Object.keys(drafts).length > 0);
+    const hasTranslationDrafts = Object.values(translationDrafts)
+      .some((languages) => Object.values(languages)
+        .some((drafts) => Object.keys(drafts).length > 0));
+    const hasChapterDrafts = Object.values(chapterDrafts)
+      .some((drafts) => Object.keys(drafts).length > 0);
+    if (!hasTranscriptDrafts && !hasTranslationDrafts && !hasChapterDrafts) {
+      return;
+    }
+    const warnOnClose = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnOnClose);
+    return () => window.removeEventListener("beforeunload", warnOnClose);
+  }, [chapterDrafts, transcriptDrafts, translationDrafts]);
+
+  const updateTranscriptDrafts = useCallback((update: (
+    current: Record<string, TranscriptDraft>,
+  ) => Record<string, TranscriptDraft>) => {
+    if (!pid) return;
+    setTranscriptDrafts((current) => {
+      const nextProject = update(current[pid] || {});
+      if (Object.keys(nextProject).length === 0) {
+        const { [pid]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [pid]: nextProject };
+    });
+  }, [pid]);
+
+  const updateTranslationDrafts = useCallback((
+    language: string,
+    update: (
+      current: Record<string, TranslationDraft>,
+    ) => Record<string, TranslationDraft>,
+  ) => {
+    if (!pid) return;
+    setTranslationDrafts((current) => {
+      const nextLanguage = update(current[pid]?.[language] || {});
+      const nextProject = { ...(current[pid] || {}) };
+      if (Object.keys(nextLanguage).length === 0) {
+        delete nextProject[language];
+      } else {
+        nextProject[language] = nextLanguage;
+      }
+      if (Object.keys(nextProject).length === 0) {
+        const { [pid]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [pid]: nextProject };
+    });
+  }, [pid]);
+
+  const updateChapterDrafts = useCallback((update: (
+    current: Record<string, ChapterDraft>,
+  ) => Record<string, ChapterDraft>) => {
+    if (!pid) return;
+    setChapterDrafts((current) => {
+      const nextProject = update(current[pid] || {});
+      if (Object.keys(nextProject).length === 0) {
+        const { [pid]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [pid]: nextProject };
+    });
+  }, [pid]);
+
   const openProject = (id: string) => {
     setPid(id);
+    setEditorMounted(true);
     localStorage.setItem(LAST_PROJECT_KEY, id);
     setView("transcript");
-    void projectList().then(setRecentProjects).catch(() => undefined);
+    const openedAt = new Date().toISOString();
+    setRecentProjects((projects) => projects
+      .map((project) => project.pid === id
+        ? { ...project, last_opened_at: openedAt }
+        : project)
+      .sort((left, right) =>
+        Date.parse(right.last_opened_at || right.updated_at)
+        - Date.parse(left.last_opened_at || left.updated_at)));
+    void projectMarkOpened(id)
+      .then(() => projectList())
+      .then(setRecentProjects)
+      .catch(() => undefined);
   };
 
   const projectDeleted = (id: string) => {
     setRecentProjects((projects) => projects.filter((project) => project.pid !== id));
+    localStorage.removeItem(`lumen-cut.brollDrafts.${id}`);
+    localStorage.removeItem(`lumen-cut.styleDrafts.${id}`);
+    localStorage.removeItem(`lumen-cut.timelineDrafts.${id}`);
+    setTranscriptDrafts((current) => {
+      const { [id]: _removed, ...rest } = current;
+      return rest;
+    });
+    setTranslationDrafts((current) => {
+      const { [id]: _removed, ...rest } = current;
+      return rest;
+    });
+    setChapterDrafts((current) => {
+      const { [id]: _removed, ...rest } = current;
+      return rest;
+    });
     if (pid !== id) return;
     setPid(null);
+    setEditorMounted(false);
     localStorage.removeItem(LAST_PROJECT_KEY);
   };
 
@@ -89,7 +308,6 @@ function App() {
   const navigation = [
     { id: "projects" as const, label: t("projects", lang), icon: FolderIcon },
     { id: "transcript" as const, label: t("editor", lang), icon: TranscriptIcon },
-    { id: "settings" as const, label: t("settings", lang), icon: SettingsIcon },
   ];
 
   return (
@@ -119,7 +337,10 @@ function App() {
                 disabled={disabled}
                 key={item.id}
                 title={disabled ? t("chooseProjectFirst", lang) : undefined}
-                onClick={() => setView(item.id)}
+                onClick={() => {
+                  if (item.id === "transcript") setEditorMounted(true);
+                  setView(item.id);
+                }}
               >
                 <Icon />
                 <span>{item.label}</span>
@@ -136,9 +357,12 @@ function App() {
             <span className="sidebar-utility-icon" aria-hidden="true">◷</span>
             {lang === "zh" ? "后台任务" : "Background tasks"}
           </button>
-          <button onClick={() => setView("settings")}>
-            <span className="sidebar-utility-icon" aria-hidden="true">⌘</span>
-            {lang === "zh" ? "自动化接口" : "Automation"}
+          <button
+            className={view === "settings" ? "active" : ""}
+            onClick={() => setView("settings")}
+          >
+            <SettingsIcon />
+            {lang === "zh" ? "设置" : "Settings"}
           </button>
         </div>
 
@@ -156,9 +380,13 @@ function App() {
                 key={project.pid}
                 onClick={() => openProject(project.pid)}
               >
-                <span className="recent-project-glyph" aria-hidden="true">
-                  {project.title.trim().slice(0, 1).toUpperCase() || "L"}
-                </span>
+                <ProjectCover
+                  compact
+                  mediaAvailable={project.media_available !== false}
+                  pid={project.pid}
+                  title={project.title}
+                  updatedAt={project.updated_at}
+                />
                 <span className="recent-project-copy">
                   <strong>{project.title}</strong>
                   <small>
@@ -203,16 +431,27 @@ function App() {
             onOpenProject={openProject}
           />
         )}
-        {view === "transcript" && (
-          <TranscriptView
-            lang={lang}
-            pid={pid}
-            onOpenSettings={() => setView("settings")}
-            onProjectTitleChange={projectTitleChanged}
-          />
+        {editorMounted && pid && (
+          <div className="persistent-editor-host" hidden={view !== "transcript"}>
+            <TranscriptView
+              active={view === "transcript"}
+              chapterDrafts={chapterDrafts[pid] || {}}
+              key={pid}
+              lang={lang}
+              onChapterDraftsChange={updateChapterDrafts}
+              onTranscriptDraftsChange={updateTranscriptDrafts}
+              onTranslationDraftsChange={updateTranslationDrafts}
+              pid={pid}
+              onOpenProjects={() => setView("projects")}
+              onOpenSettings={() => setView("settings")}
+              onProjectTitleChange={projectTitleChanged}
+              transcriptDrafts={transcriptDrafts[pid] || {}}
+              translationDrafts={translationDrafts[pid] || {}}
+            />
+          </div>
         )}
         {view === "settings" && (
-          <SettingsView lang={lang} pid={pid} />
+          <SettingsView lang={lang} />
         )}
         {view === "tasks" && (
           <TaskCenterView

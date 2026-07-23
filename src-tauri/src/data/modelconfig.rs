@@ -7,6 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AsrEngine {
+    #[default]
+    Local,
+    OpenaiCompatible,
+}
+
 /// Memory-bounded defaults for Apple-silicon ASR and portable diarization.
 fn defaults() -> ModelConfig {
     ModelConfig {
@@ -15,6 +23,10 @@ fn defaults() -> ModelConfig {
         // memory machines even though the two stages also run in isolation.
         asr_model: "mlx-community/Qwen3-ASR-0.6B-8bit".into(),
         asr_aligner: "mlx-community/Qwen3-ForcedAligner-0.6B-4bit".into(),
+        asr_engine: AsrEngine::Local,
+        asr_cloud_endpoint: "https://api.openai.com/v1/audio/transcriptions".into(),
+        asr_cloud_api_key: String::new(),
+        asr_cloud_model: "whisper-1".into(),
         diarize_model: "pyannote/speaker-diarization-3.1".into(),
         hf_token: String::new(),
         llm_endpoint: String::new(),
@@ -29,6 +41,10 @@ fn defaults() -> ModelConfig {
 pub struct ModelConfig {
     pub asr_model: String,
     pub asr_aligner: String,
+    pub asr_engine: AsrEngine,
+    pub asr_cloud_endpoint: String,
+    pub asr_cloud_api_key: String,
+    pub asr_cloud_model: String,
     pub diarize_model: String,
     pub hf_token: String,
     pub llm_endpoint: String,
@@ -54,6 +70,21 @@ pub fn load() -> ModelConfig {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(s) = v.get("asrModel").and_then(|x| x.as_str()) {
                     cfg.asr_model = s.into();
+                }
+                if let Some(engine) = v
+                    .get("asrEngine")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                {
+                    cfg.asr_engine = engine;
+                }
+                if let Some(s) = v.get("asrCloudEndpoint").and_then(|x| x.as_str()) {
+                    cfg.asr_cloud_endpoint = s.into();
+                }
+                if let Some(s) = v.get("asrCloudApiKey").and_then(|x| x.as_str()) {
+                    cfg.asr_cloud_api_key = s.into();
+                }
+                if let Some(s) = v.get("asrCloudModel").and_then(|x| x.as_str()) {
+                    cfg.asr_cloud_model = s.into();
                 }
                 if let Some(s) = v.get("diarizeModel").and_then(|x| x.as_str()) {
                     cfg.diarize_model = match s {
@@ -94,6 +125,12 @@ pub fn load() -> ModelConfig {
 /// API keys remain optional so local OpenAI-compatible services work.
 pub fn llm_configured(cfg: &ModelConfig) -> bool {
     !cfg.llm_endpoint.trim().is_empty() && !cfg.llm_model.trim().is_empty()
+}
+
+pub fn cloud_asr_configured(cfg: &ModelConfig) -> bool {
+    !cfg.asr_cloud_endpoint.trim().is_empty()
+        && !cfg.asr_cloud_api_key.trim().is_empty()
+        && !cfg.asr_cloud_model.trim().is_empty()
 }
 
 /// Hugging Face uses `models--org--name` directories for cached repos.
@@ -216,6 +253,12 @@ mod tests {
         let c = ModelConfig::default();
         assert_eq!(c.asr_model, "mlx-community/Qwen3-ASR-0.6B-8bit");
         assert_eq!(c.asr_aligner, "mlx-community/Qwen3-ForcedAligner-0.6B-4bit");
+        assert_eq!(c.asr_engine, AsrEngine::Local);
+        assert_eq!(
+            c.asr_cloud_endpoint,
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        assert_eq!(c.asr_cloud_model, "whisper-1");
         assert_eq!(c.diarize_model, "pyannote/speaker-diarization-3.1");
         assert_eq!(c.worker_count, 4);
     }
@@ -229,6 +272,16 @@ mod tests {
         assert!(!llm_configured(&c));
         c.llm_model = "model".into();
         assert!(llm_configured(&c));
+    }
+
+    #[test]
+    fn cloud_asr_requires_endpoint_key_and_model() {
+        let mut config = ModelConfig::default();
+        assert!(!cloud_asr_configured(&config));
+        config.asr_cloud_api_key = "secret".into();
+        assert!(cloud_asr_configured(&config));
+        config.asr_cloud_model.clear();
+        assert!(!cloud_asr_configured(&config));
     }
 
     #[test]

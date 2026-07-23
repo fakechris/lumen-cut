@@ -54,7 +54,7 @@ pub fn to_srt_with(doc: &Doc, cuts: &[Cut]) -> String {
     let mut n: u32 = 1;
     for para in &doc.paragraphs {
         for sent in &para.sentences {
-            if sent.words.is_empty() {
+            if sent.words.is_empty() || sent.text.trim().is_empty() {
                 continue;
             }
             let (s, e) = cue_window(sent);
@@ -86,7 +86,7 @@ pub fn to_vtt_with(doc: &Doc, cuts: &[Cut]) -> String {
     let mut out = String::from("WEBVTT\n\n");
     for para in &doc.paragraphs {
         for sent in &para.sentences {
-            if sent.words.is_empty() {
+            if sent.words.is_empty() || sent.text.trim().is_empty() {
                 continue;
             }
             let (s, e) = cue_window(sent);

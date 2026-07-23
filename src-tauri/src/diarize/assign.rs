@@ -31,11 +31,51 @@ pub fn reliable_speaker_match(coverage: f64, margin: f64) -> bool {
     coverage >= MIN_SPEAKER_COVERAGE && margin >= MIN_SPEAKER_MARGIN
 }
 
+/// Normalize transcript paragraphs to the granularity used by diarization:
+/// one subtitle sentence per paragraph. Sentence and word ids stay stable,
+/// while paragraph ids are rebuilt deterministically in document order.
+///
+/// The UI runs this on an in-memory clone for previews. It is only persisted
+/// when the user applies the proposal, so opening speaker tools never mutates
+/// an existing project.
+pub fn normalize_speaker_paragraphs(doc: &mut Doc) -> usize {
+    if doc
+        .paragraphs
+        .iter()
+        .all(|paragraph| paragraph.sentences.len() <= 1)
+    {
+        return 0;
+    }
+
+    let before = doc.paragraphs.len();
+    let mut normalized = Vec::new();
+    for paragraph in std::mem::take(&mut doc.paragraphs) {
+        if paragraph.sentences.is_empty() {
+            normalized.push(Paragraph {
+                id: normalized.len() as u32 + 1,
+                speaker: paragraph.speaker,
+                sentences: Vec::new(),
+            });
+            continue;
+        }
+        for sentence in paragraph.sentences {
+            normalized.push(Paragraph {
+                id: normalized.len() as u32 + 1,
+                speaker: paragraph.speaker.clone(),
+                sentences: vec![sentence],
+            });
+        }
+    }
+    doc.paragraphs = normalized;
+    doc.paragraphs.len().saturating_sub(before)
+}
+
 /// Assign each paragraph its dominant speaker. Returns the number of
 /// paragraphs that received a speaker. Paragraphs whose words overlap no
 /// diarization segment are left untouched, so pre-existing (e.g. manual)
 /// labels survive a re-run.
 pub fn assign_speakers(doc: &mut Doc, segments: &[DiarSegment]) -> usize {
+    normalize_speaker_paragraphs(doc);
     let mut assigned = 0;
     for para in &mut doc.paragraphs {
         if let Some(matched) = match_paragraph(para, segments) {
@@ -130,6 +170,14 @@ mod tests {
                 text: "t".into(),
                 words,
             }],
+        }
+    }
+
+    fn sentence(id: &str, words: Vec<Word>) -> Sentence {
+        Sentence {
+            id: id.into(),
+            text: id.into(),
+            words,
         }
     }
 
@@ -238,6 +286,52 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(d.paragraphs[0].speaker.as_deref(), Some("A"));
         assert_eq!(d.paragraphs[1].speaker.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn a_legacy_multi_sentence_paragraph_is_split_before_assignment() {
+        let mut paragraph = para(42, vec![]);
+        paragraph.sentences = vec![
+            sentence("cue-a", vec![word("w0", 0.0, 1.0)]),
+            sentence("cue-b", vec![word("w1", 5.0, 6.0)]),
+        ];
+        let mut d = doc(vec![paragraph]);
+
+        let assigned = assign_speakers(&mut d, &[seg("A", 0.0, 2.0), seg("B", 4.0, 8.0)]);
+
+        assert_eq!(assigned, 2);
+        assert_eq!(d.paragraphs.len(), 2);
+        assert_eq!(d.paragraphs[0].id, 1);
+        assert_eq!(d.paragraphs[0].sentences[0].id, "cue-a");
+        assert_eq!(d.paragraphs[0].speaker.as_deref(), Some("A"));
+        assert_eq!(d.paragraphs[1].id, 2);
+        assert_eq!(d.paragraphs[1].sentences[0].id, "cue-b");
+        assert_eq!(d.paragraphs[1].speaker.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn preview_normalization_is_deterministic_and_preserves_manual_labels() {
+        let mut paragraph = para(99, vec![]);
+        paragraph.speaker = Some("Chris".into());
+        paragraph.sentences = vec![
+            sentence("cue-a", vec![word("w0", 0.0, 1.0)]),
+            sentence("cue-b", vec![word("w1", 1.0, 2.0)]),
+        ];
+        let mut d = doc(vec![paragraph]);
+
+        assert_eq!(normalize_speaker_paragraphs(&mut d), 1);
+        assert_eq!(normalize_speaker_paragraphs(&mut d), 0);
+        assert_eq!(
+            d.paragraphs
+                .iter()
+                .map(|paragraph| (
+                    paragraph.id,
+                    paragraph.speaker.as_deref(),
+                    paragraph.sentences[0].id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, Some("Chris"), "cue-a"), (2, Some("Chris"), "cue-b")]
+        );
     }
 
     #[test]

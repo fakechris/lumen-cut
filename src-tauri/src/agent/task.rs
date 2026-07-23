@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +212,10 @@ pub fn prepare_task_with_task_options(
         _ => unreachable!(),
     };
     let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     crate::data::storage::write_json(
         &ai_dir.join("task.json"),
         &serde_json::json!({
@@ -222,6 +227,7 @@ pub fn prepare_task_with_task_options(
             "groups": &options.groups,
             "alignFit": options.align_fit,
             "calls": payloads.len(),
+            "startedAt": started_at,
         }),
     )?;
     let mut calls = Vec::with_capacity(payloads.len());
@@ -261,6 +267,7 @@ pub fn prepare_task_with_task_options(
             "groups": &options.groups,
             "alignFit": options.align_fit,
             "calls": calls.len(),
+            "startedAt": started_at,
         }),
     )?;
     Ok(PreparedTask {
@@ -368,6 +375,24 @@ pub fn load_recoverable_task(project_dir: &Path, kind: &str) -> AppResult<Option
     }))
 }
 
+pub fn load_matching_recoverable_task(
+    project_dir: &Path,
+    kind: &str,
+    requested_lang: Option<&str>,
+) -> AppResult<Option<PreparedTask>> {
+    let Some(task) = load_recoverable_task(project_dir, kind)? else {
+        return Ok(None);
+    };
+    if task.lang.as_deref() != requested_lang {
+        return Err(AppError::Schema(format!(
+            "unfinished {kind} task uses language `{}`; resume or finish it before starting language `{}`",
+            task.lang.as_deref().unwrap_or("none"),
+            requested_lang.unwrap_or("none"),
+        )));
+    }
+    Ok(Some(task))
+}
+
 fn remove_task_run_files(ai_dir: &Path, kind: &str, run_id: &str) -> AppResult<()> {
     let prefix = format!("{kind}-{run_id}-");
     for phase in ["pending", "submitted"] {
@@ -386,7 +411,7 @@ fn remove_task_run_files(ai_dir: &Path, kind: &str, run_id: &str) -> AppResult<(
     Ok(())
 }
 
-pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+fn load_tasks(project_dir: &Path, include_paused_and_failed: bool) -> AppResult<Vec<PreparedTask>> {
     let ai_dir = project_dir.join("ai");
     let entries = match std::fs::read_dir(&ai_dir) {
         Ok(entries) => entries,
@@ -404,7 +429,10 @@ pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>
         let task_path = ai_dir.join(&kind).join("task.json");
         if let Ok(raw) = std::fs::read_to_string(&task_path) {
             let stored: StoredTask = serde_json::from_str(&raw)?;
-            if matches!(stored.state.as_str(), "paused" | "failed" | "completed") {
+            if stored.state == "completed"
+                || (!include_paused_and_failed
+                    && matches!(stored.state.as_str(), "paused" | "failed"))
+            {
                 continue;
             }
         }
@@ -413,6 +441,37 @@ pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>
         }
     }
     Ok(tasks)
+}
+
+pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+    load_tasks(project_dir, false)
+}
+
+/// Explicit user resume includes paused and failed apply loops. Automatic
+/// startup recovery intentionally uses [`load_recoverable_tasks`] instead.
+pub fn load_resumable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+    load_tasks(project_dir, true)
+}
+
+pub fn prepare_retry_task(project_dir: &Path, kind: &str) -> AppResult<PreparedTask> {
+    let path = project_dir.join("ai").join(kind).join("task.json");
+    let stored: StoredTask = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    if stored.kind != kind {
+        return Err(AppError::Schema(format!(
+            "stored task kind `{}` does not match retry kind `{kind}`",
+            stored.kind
+        )));
+    }
+    prepare_task_with_task_options(
+        project_dir,
+        kind,
+        stored.lang.as_deref(),
+        TaskOptions {
+            stale_only: stored.stale_only || kind == "translate",
+            groups: stored.groups,
+            align_fit: stored.align_fit,
+        },
+    )
 }
 
 /// Restore already-ACKed worker results and enqueue only calls that still need
@@ -1591,7 +1650,7 @@ pub async fn wait_and_apply(
     task: PreparedTask,
     timeout: Duration,
 ) -> AppResult<usize> {
-    wait_and_apply_inner(allocator, task, timeout, None).await
+    wait_and_apply_inner(allocator, task, timeout, None, None).await
 }
 
 pub async fn wait_and_apply_with_lock(
@@ -1600,7 +1659,24 @@ pub async fn wait_and_apply_with_lock(
     timeout: Duration,
     project_mutation: Arc<tokio::sync::Mutex<()>>,
 ) -> AppResult<usize> {
-    wait_and_apply_inner(allocator, task, timeout, Some(project_mutation)).await
+    wait_and_apply_inner(allocator, task, timeout, Some(project_mutation), None).await
+}
+
+pub async fn wait_and_apply_with_lock_and_pause(
+    allocator: Arc<Allocator>,
+    task: PreparedTask,
+    timeout: Duration,
+    project_mutation: Arc<tokio::sync::Mutex<()>>,
+    pause: Arc<AtomicBool>,
+) -> AppResult<usize> {
+    wait_and_apply_inner(
+        allocator,
+        task,
+        timeout,
+        Some(project_mutation),
+        Some(pause),
+    )
+    .await
 }
 
 async fn wait_and_apply_inner(
@@ -1608,12 +1684,22 @@ async fn wait_and_apply_inner(
     task: PreparedTask,
     timeout: Duration,
     project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+    pause: Option<Arc<AtomicBool>>,
 ) -> AppResult<usize> {
     if task.kind == "translate" {
-        return wait_and_apply_translation(allocator, task, timeout, project_mutation).await;
+        return wait_and_apply_translation(allocator, task, timeout, project_mutation, pause).await;
     }
     let started = Instant::now();
     loop {
+        if pause
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Relaxed))
+        {
+            return Err(AppError::Schema(format!(
+                "task {} paused by user; durable requests and accepted results were preserved",
+                task.kind
+            )));
+        }
         if task
             .calls
             .iter()
@@ -1738,6 +1824,7 @@ async fn wait_and_apply_translation(
     task: PreparedTask,
     timeout: Duration,
     project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+    pause: Option<Arc<AtomicBool>>,
 ) -> AppResult<usize> {
     let started = Instant::now();
     let mut remaining: BTreeSet<String> = task
@@ -1749,6 +1836,15 @@ async fn wait_and_apply_translation(
     let mut errors = Vec::new();
 
     while !remaining.is_empty() {
+        if pause
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Relaxed))
+        {
+            return Err(AppError::Schema(format!(
+                "task {} paused by user; completed batches were saved",
+                task.kind
+            )));
+        }
         let mut progressed = false;
         for prepared in &task.calls {
             if !remaining.contains(&prepared.call.id) {
@@ -2391,6 +2487,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                 &task.project_dir.join("ai").join("cuts.json"),
                 &answer,
             )?;
+            crate::data::activity::touch(&task.project_dir)?;
             return Ok(cuts.cuts.len() - before);
         }
         "broll" => {
@@ -2398,6 +2495,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                 &task.project_dir.join("ai").join("broll-suggestions.json"),
                 &answer,
             )?;
+            crate::data::activity::touch(&task.project_dir)?;
             return Ok(answer["suggestions"]
                 .as_array()
                 .map(Vec::len)
@@ -2411,6 +2509,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
     };
     doc.meta.updated_at = chrono::Utc::now();
     doc.save(&task.project_dir)?;
+    crate::data::activity::touch(&task.project_dir)?;
     Ok(applied)
 }
 
@@ -2613,6 +2712,23 @@ mod tests {
         assert!(load_recoverable_task(tmp.path(), "translate")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_new_language_never_silently_recovers_an_unfinished_translation() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        set_task_state(&task, "paused", Some("provider timeout")).unwrap();
+
+        let matching = load_matching_recoverable_task(tmp.path(), "translate", Some("zh")).unwrap();
+        assert_eq!(matching.unwrap().lang.as_deref(), Some("zh"));
+
+        let error = load_matching_recoverable_task(tmp.path(), "translate", Some("ja"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("language `zh`"));
+        assert!(error.contains("language `ja`"));
     }
 
     #[tokio::test]

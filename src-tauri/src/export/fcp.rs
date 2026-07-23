@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::data::broll::{BrollPlacement, FitMode, PlacementMode};
 use crate::data::doc::Doc;
 use crate::data::soft_cut::Cut;
+use crate::data::title::TitleClip;
 use crate::error::AppResult;
 
 fn xml_escape(s: &str) -> String {
@@ -27,7 +28,7 @@ pub fn to_fcpxml(doc: &Doc, width: u32, height: u32) -> String {
 }
 
 pub fn to_fcpxml_with(doc: &Doc, cuts: &[Cut], width: u32, height: u32) -> String {
-    to_fcpxml_with_broll(doc, cuts, &[], width, height)
+    to_fcpxml_with_broll_titles(doc, cuts, &[], &[], width, height)
 }
 
 struct FcpBroll<'a> {
@@ -41,6 +42,17 @@ pub fn to_fcpxml_with_broll(
     doc: &Doc,
     cuts: &[Cut],
     placements: &[BrollPlacement],
+    width: u32,
+    height: u32,
+) -> String {
+    to_fcpxml_with_broll_titles(doc, cuts, placements, &[], width, height)
+}
+
+pub fn to_fcpxml_with_broll_titles(
+    doc: &Doc,
+    cuts: &[Cut],
+    placements: &[BrollPlacement],
+    titles: &[TitleClip],
     width: u32,
     height: u32,
 ) -> String {
@@ -188,6 +200,40 @@ pub fn to_fcpxml_with_broll(
             let _ = writeln!(out, "              </title>");
         }
     }
+    for title in titles {
+        if super::project::fully_cut(title.start, title.end, &intervals) {
+            continue;
+        }
+        let start = super::project::retime(title.start, &intervals);
+        let end = super::project::retime(title.end, &intervals);
+        if end <= start {
+            continue;
+        }
+        let text = xml_escape(&title.text);
+        let position_x = (title.x - 0.5) * width as f64 / height.max(1) as f64 * 100.0;
+        let position_y = (0.5 - title.y) * 100.0;
+        let _ = writeln!(
+            out,
+            "              <title ref=\"rTitle\" lane=\"3\" offset=\"{}\" duration=\"{}\" name=\"{text}\" role=\"titles.text\">",
+            secs(start),
+            secs(end - start),
+        );
+        let _ = writeln!(out, "                <text>{text}</text>");
+        let _ = writeln!(
+            out,
+            "                <note>lumen-cut.fontSize={}; color={}; background={}; fadeIn={:.3}; fadeOut={:.3}</note>",
+            title.font_size,
+            xml_escape(&title.color),
+            xml_escape(&title.background),
+            title.fade_in,
+            title.fade_out,
+        );
+        let _ = writeln!(
+            out,
+            "                <adjust-transform position=\"{position_x:.3} {position_y:.3}\"/>"
+        );
+        let _ = writeln!(out, "              </title>");
+    }
     for item in &broll {
         write_broll_video(&mut out, item, width, height);
     }
@@ -287,6 +333,19 @@ pub fn write_fcp_with_broll(
     height: u32,
 ) -> AppResult<()> {
     let xml = to_fcpxml_with_broll(doc, cuts, placements, width, height);
+    crate::data::storage::write(path, xml.as_bytes())
+}
+
+pub fn write_fcp_with_broll_titles(
+    doc: &Doc,
+    cuts: &[Cut],
+    placements: &[BrollPlacement],
+    titles: &[TitleClip],
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> AppResult<()> {
+    let xml = to_fcpxml_with_broll_titles(doc, cuts, placements, titles, width, height);
     crate::data::storage::write(path, xml.as_bytes())
 }
 

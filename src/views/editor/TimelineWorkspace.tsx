@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CutSummary } from "../../api";
+import { VirtualList } from "../../components/VirtualList";
 import type { Lang } from "../../i18n";
 import type { Doc } from "../../types";
 
@@ -19,6 +20,77 @@ function clock(seconds: number) {
   return `${minutes}:${rest.toFixed(1).padStart(4, "0")}`;
 }
 
+interface TimelineSentence {
+  end: number;
+  id: string;
+  speaker?: string | null;
+  start: number;
+  text: string;
+}
+
+interface TimelineRegion {
+  end: number;
+  id: string;
+  start: number;
+}
+
+const timelineSentenceKey = (sentence: TimelineSentence) => sentence.id;
+
+const TimelineOverviewRaster = memo(function TimelineOverviewRaster({
+  cuts,
+  duration,
+  sentences,
+}: {
+  cuts: TimelineRegion[];
+  duration: number;
+  sentences: TimelineSentence[];
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const draw = () => {
+      const bounds = canvas.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(1, Math.round(bounds.width * ratio));
+      const height = Math.max(1, Math.round(bounds.height * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      const styles = window.getComputedStyle(canvas);
+      const safeDuration = Math.max(duration, 0.001);
+      context.clearRect(0, 0, width, height);
+      context.fillStyle = styles.getPropertyValue("--accent").trim() || "#487fbd";
+      context.globalAlpha = 0.72;
+      for (const sentence of sentences) {
+        const left = (sentence.start / safeDuration) * width;
+        const right = (sentence.end / safeDuration) * width;
+        context.fillRect(left, 18 * ratio, Math.max(1, right - left), 24 * ratio);
+      }
+      context.fillStyle = styles.getPropertyValue("--danger").trim() || "#b04545";
+      context.globalAlpha = 1;
+      for (const cut of cuts) {
+        const left = (cut.start / safeDuration) * width;
+        const right = (cut.end / safeDuration) * width;
+        context.fillRect(left, height - 18 * ratio, Math.max(1, right - left), 8 * ratio);
+      }
+    };
+
+    draw();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(draw);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [cuts, duration, sentences]);
+
+  return <canvas aria-hidden="true" className="timeline-overview-raster" ref={canvasRef} />;
+});
+
 export function TimelineWorkspace({
   busy,
   currentTime,
@@ -28,8 +100,6 @@ export function TimelineWorkspace({
   onRestoreCut,
   onSeek,
 }: Props) {
-  const cueListRef = useRef<HTMLDivElement | null>(null);
-  const cueRefs = useRef(new Map<string, HTMLElement>());
   const [followPlayback, setFollowPlayback] = useState(true);
   const duration = Math.max(doc.media.durationSeconds, 0.001);
   const words = useMemo(() => doc.paragraphs.flatMap((paragraph) =>
@@ -39,12 +109,13 @@ export function TimelineWorkspace({
     () => new Map(words.map((word) => [word.id, word])),
     [words],
   );
-  const sentences = useMemo(() => doc.paragraphs.flatMap((paragraph) =>
+  const sentences = useMemo<TimelineSentence[]>(() => doc.paragraphs.flatMap((paragraph) =>
     paragraph.sentences.map((sentence) => ({
-      ...sentence,
+      id: sentence.id,
       speaker: paragraph.speaker,
       start: sentence.words[0]?.start ?? 0,
       end: sentence.words[sentence.words.length - 1]?.end ?? 0,
+      text: sentence.text,
     })),
   ), [doc.paragraphs]);
   const cutRegions = useMemo(() => cuts.flatMap((cut) => {
@@ -77,25 +148,6 @@ export function TimelineWorkspace({
     return candidate >= 0 && currentTime < sentences[candidate].end ? candidate : -1;
   }, [currentTime, sentences]);
   const activeSentence = activeSentenceIndex >= 0 ? sentences[activeSentenceIndex] : undefined;
-
-  useEffect(() => {
-    if (!followPlayback || !activeSentence) return;
-    const list = cueListRef.current;
-    const cue = cueRefs.current.get(activeSentence.id);
-    if (!list || !cue) return;
-
-    const top = cue.offsetTop - (list.clientHeight - cue.offsetHeight) / 2;
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    const nextTop = Math.max(0, top);
-    if (typeof list.scrollTo === "function") {
-      list.scrollTo({
-        behavior: reducedMotion ? "auto" : "smooth",
-        top: nextTop,
-      });
-    } else {
-      list.scrollTop = nextTop;
-    }
-  }, [activeSentence?.id, followPlayback]);
 
   const seekTo = (seconds: number, play = true) => {
     onSeek(Math.max(0, Math.min(seconds, duration)), play);
@@ -159,33 +211,17 @@ export function TimelineWorkspace({
                 }
               }}
             >
-              {sentences.map((sentence) => (
-                <button
-                  aria-label={`${clock(sentence.start)} · ${sentence.text}`}
-                  className={`cue-region${activeSentence?.id === sentence.id ? " active" : ""}`}
-                  key={sentence.id}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    seekTo(sentence.start);
-                  }}
-                  style={{
-                    left: `${(sentence.start / duration) * 100}%`,
-                    width: `${Math.max(((sentence.end - sentence.start) / duration) * 100, 0.25)}%`,
-                  }}
-                  title={`${clock(sentence.start)}–${clock(sentence.end)} · ${sentence.text}`}
-                />
-              ))}
-              {cutRegions.map((cut) => (
+              <TimelineOverviewRaster cuts={cutRegions} duration={duration} sentences={sentences} />
+              {activeSentence && (
                 <span
-                  className="cut-region"
-                  key={cut.id}
+                  aria-hidden="true"
+                  className="cue-region active"
                   style={{
-                    left: `${(cut.start / duration) * 100}%`,
-                    width: `${Math.max(((cut.end - cut.start) / duration) * 100, 0.3)}%`,
+                    left: `${(activeSentence.start / duration) * 100}%`,
+                    width: `${Math.max(((activeSentence.end - activeSentence.start) / duration) * 100, 0.25)}%`,
                   }}
-                  title={`${cut.kind} · ${cut.duration.toFixed(2)}s`}
                 />
-              ))}
+              )}
               <span
                 aria-hidden="true"
                 className="timeline-playhead"
@@ -203,15 +239,17 @@ export function TimelineWorkspace({
                   : (lang === "zh" ? "等待播放" : "Waiting for playback")}
               </span>
             </header>
-            <div className="timeline-cue-scroll" id="timeline-cue-list" ref={cueListRef}>
-              {sentences.map((sentence, index) => (
+            <VirtualList
+              activeKey={activeSentence?.id}
+              className="timeline-cue-scroll"
+              estimateHeight={62}
+              followActive={followPlayback}
+              id="timeline-cue-list"
+              itemKey={timelineSentenceKey}
+              items={sentences}
+              renderItem={(sentence, index) => (
                 <article
                   className={activeSentence?.id === sentence.id ? "active" : ""}
-                  key={sentence.id}
-                  ref={(element) => {
-                    if (element) cueRefs.current.set(sentence.id, element);
-                    else cueRefs.current.delete(sentence.id);
-                  }}
                 >
                   <button onClick={() => seekTo(sentence.start)}>
                     <span className="timeline-index">{String(index + 1).padStart(2, "0")}</span>
@@ -227,8 +265,8 @@ export function TimelineWorkspace({
                     </span>
                   </button>
                 </article>
-              ))}
-            </div>
+              )}
+            />
           </section>
         </div>
       </div>

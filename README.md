@@ -64,8 +64,14 @@ collects the distributable DMG, zipped app, CLI archive, and SHA-256 checksums
 in the top-level `build/` directory.
 
 GitHub Actions runs the same checks and packaging process for pushes and pull
-requests. Pushing a version tag such as `v0.2.0` creates a GitHub Release and
-attaches every file from `build/`.
+requests. Branch and pull-request builds use an ad-hoc macOS signature. Version
+tags require `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+`KEYCHAIN_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID`
+repository secrets; the workflow imports the Developer ID certificate,
+notarizes and staples both app and DMG, verifies them with Gatekeeper, then
+creates the GitHub Release and attaches every file from `build/`. A tag fails
+closed instead of publishing an unsigned release when any credential is
+missing.
 
 ## Project layout
 

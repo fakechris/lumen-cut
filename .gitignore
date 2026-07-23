@@ -21,3 +21,4 @@ __pycache__/
 
 # Tauri generated
 src-tauri/gen/
+.gstack/

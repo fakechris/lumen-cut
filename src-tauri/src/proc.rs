@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -12,6 +12,7 @@ use tokio::process::Command as TokioCommand;
 use crate::error::{AppError, AppResult};
 
 const STDERR_TAIL_BYTES: usize = 256 * 1024;
+static ACTIVE_PROCESS_GROUPS: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
 
 tokio::task_local! {
     static CANCEL_FLAG: Arc<AtomicBool>;
@@ -31,6 +32,57 @@ pub fn cancellation_requested() -> bool {
     CANCEL_FLAG
         .try_with(|flag| flag.load(Ordering::Relaxed))
         .unwrap_or(false)
+}
+
+fn active_process_groups() -> &'static Mutex<std::collections::HashSet<u32>> {
+    ACTIVE_PROCESS_GROUPS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+struct ProcessGroupRegistration(Option<u32>);
+
+impl ProcessGroupRegistration {
+    fn new(pid: Option<u32>) -> Self {
+        if let Some(pid) = pid {
+            active_process_groups()
+                .lock()
+                .expect("active subprocess state poisoned")
+                .insert(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for ProcessGroupRegistration {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            active_process_groups()
+                .lock()
+                .expect("active subprocess state poisoned")
+                .remove(&pid);
+        }
+    }
+}
+
+/// Stop every managed subprocess group while the desktop event loop is still
+/// alive. `kill_on_drop` covers normal future cancellation; this registry also
+/// covers application quit, when Tauri exits the process without unwinding all
+/// in-flight async tasks.
+pub fn terminate_all_processes() {
+    #[cfg(unix)]
+    {
+        let groups = active_process_groups()
+            .lock()
+            .expect("active subprocess state poisoned")
+            .drain()
+            .collect::<Vec<_>>();
+        for pid in groups {
+            // Every managed child starts a fresh process group whose id equals
+            // its pid. A negative pid targets that complete group.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+        }
+    }
 }
 
 /// Async variant — runs the subprocess to completion, capturing stdout, and
@@ -87,6 +139,10 @@ async fn run_with_env_and_progress(
     command
         .args(args)
         .envs(environment.iter().copied())
+        // Managed jobs are non-interactive. Inheriting a terminal lets tools
+        // such as ffmpeg stop themselves with SIGTTIN when they probe stdin
+        // from their isolated process group, leaving the UI waiting forever.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.kill_on_drop(true);
@@ -96,6 +152,7 @@ async fn run_with_env_and_progress(
         sidecar: label(bin),
         message: format!("spawn: {e}"),
     })?;
+    let _process_group = ProcessGroupRegistration::new(child.id());
 
     let stdout = child
         .stdout
@@ -246,12 +303,30 @@ mod tests {
             production.contains("kill_on_drop(true)"),
             "child processes must not survive an app shutdown"
         );
+        assert!(
+            production.contains("terminate_all_processes"),
+            "the desktop shutdown path must be able to terminate every active process group"
+        );
     }
 
     #[tokio::test]
     async fn run_captures_stdout() {
         let out = run("/bin/echo", &["hello"]).await.unwrap();
         assert_eq!(out.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn managed_processes_receive_eof_instead_of_terminal_input() {
+        let out = run(
+            "/bin/sh",
+            &[
+                "-c",
+                "if read -r _value; then printf input; else printf eof; fi",
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "eof");
     }
 
     #[tokio::test]

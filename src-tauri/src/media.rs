@@ -24,6 +24,8 @@ pub struct MediaInfo {
     pub channels: Option<u32>,
     pub codec_name: Option<String>,
     pub codec_type: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Extract one frame at the given timestamp; useful for B-roll thumbnail prep
@@ -110,6 +112,8 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
         codec_type: Option<String>,
         sample_rate: Option<String>,
         channels: Option<u32>,
+        width: Option<u32>,
+        height: Option<u32>,
     }
 
     let parsed: FfProbeOut =
@@ -126,6 +130,10 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
         .streams
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("audio"));
+    let video = parsed
+        .streams
+        .iter()
+        .find(|s| s.codec_type.as_deref() == Some("video"));
 
     Ok(MediaInfo {
         path: input.to_path_buf(),
@@ -136,6 +144,8 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
         channels: audio.and_then(|s| s.channels),
         codec_name: audio.and_then(|s| s.codec_name.clone()),
         codec_type: audio.and_then(|s| s.codec_type.clone()),
+        width: video.and_then(|s| s.width),
+        height: video.and_then(|s| s.height),
     })
 }
 
