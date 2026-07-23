@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Lumen Cut">
+<rect x="4" y="4" width="120" height="120" rx="30" fill="#231a13"></rect>
+<rect x="4.75" y="4.75" width="118.5" height="118.5" rx="29.25" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1.5"></rect>
+<rect x="34" y="40" width="60" height="48" rx="13" fill="none" stroke="#5b9bf0" stroke-width="8"></rect>
+<g fill="#5b9bf0">
+<rect x="46" y="56" width="36" height="7" rx="3.5"></rect>
+<rect x="46" y="69" width="22" height="7" rx="3.5"></rect>
+</g>
+</svg>

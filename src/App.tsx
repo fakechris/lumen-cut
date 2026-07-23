@@ -8,6 +8,7 @@ import {
   TranscriptIcon,
 } from "./components/Icons";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
+import lumenCutMark from "./assets/lumen-cut.svg";
 import { t, type Lang } from "./i18n";
 import { ProjectsView } from "./views/ProjectsView";
 import { SettingsView } from "./views/SettingsView";
@@ -92,10 +93,10 @@ function App() {
   ];
 
   return (
-    <div className="app-shell" data-theme={theme}>
+    <div className={`app-shell app-view-${view}`} data-theme={theme}>
       <aside className="sidebar">
         <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true">S</div>
+          <img className="brand-mark" src={lumenCutMark} alt="" aria-hidden="true" />
           <div>
             <strong>lumen-cut</strong>
             <span>{t("tagline", lang)}</span>

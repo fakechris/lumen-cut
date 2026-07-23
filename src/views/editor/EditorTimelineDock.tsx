@@ -17,7 +17,8 @@ interface Props {
   onTogglePlayback: () => void;
 }
 
-const SPEAKER_COLORS = ["#2f7e63", "#3582c4", "#b06f38", "#8a62ad", "#b94f6f", "#6c7b42"];
+// Lumen categorical palette (matches .speaker-swatch-* order in styles.css)
+const SPEAKER_COLORS = ["#9f4f24", "#2563bb", "#2f7d52", "#6c4dab", "#b04545", "#b8862e"];
 
 function clock(seconds: number) {
   const safe = Math.max(0, seconds);
