@@ -12,8 +12,10 @@ import { t, type Lang } from "./i18n";
 import { ProjectsView } from "./views/ProjectsView";
 import { SettingsView } from "./views/SettingsView";
 import { TranscriptView } from "./views/TranscriptView";
+import type { ProjectSummary } from "./types";
+import { TaskCenterView } from "./views/TaskCenterView";
 
-type View = "projects" | "transcript" | "settings";
+type View = "projects" | "transcript" | "tasks" | "settings";
 type Theme = "dark" | "light";
 
 const LAST_PROJECT_KEY = "lumen-cut.lastProject";
@@ -27,8 +29,8 @@ function initialTheme(): Theme {
 function App() {
   const [view, setView] = useState<View>("projects");
   const [pid, setPid] = useState<string | null>(null);
-  const [projectTitle, setProjectTitle] = useState<string | null>(null);
   const [version, setVersion] = useState<string>("—");
+  const [recentProjects, setRecentProjects] = useState<ProjectSummary[]>([]);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [lang, setLang] = useState<Lang>(
     () => (localStorage.getItem("lumen-cut.lang") as Lang) || "zh",
@@ -39,14 +41,14 @@ function App() {
       .then((result) => setVersion(result.version))
       .catch(() => setVersion("—"));
 
-    const previous = localStorage.getItem(LAST_PROJECT_KEY);
-    if (!previous) return;
     void projectList()
       .then((projects) => {
+        setRecentProjects(projects);
+        const previous = localStorage.getItem(LAST_PROJECT_KEY);
+        if (!previous) return;
         const project = projects.find((candidate) => candidate.pid === previous);
         if (project) {
           setPid(previous);
-          setProjectTitle(project.title);
         }
       })
       .catch(() => {
@@ -62,18 +64,25 @@ function App() {
     localStorage.setItem("lumen-cut.lang", lang);
   }, [lang]);
 
-  const openProject = (id: string, title?: string) => {
+  const openProject = (id: string) => {
     setPid(id);
-    setProjectTitle(title || id);
     localStorage.setItem(LAST_PROJECT_KEY, id);
     setView("transcript");
+    void projectList().then(setRecentProjects).catch(() => undefined);
   };
 
   const projectDeleted = (id: string) => {
+    setRecentProjects((projects) => projects.filter((project) => project.pid !== id));
     if (pid !== id) return;
     setPid(null);
-    setProjectTitle(null);
     localStorage.removeItem(LAST_PROJECT_KEY);
+  };
+
+  const projectTitleChanged = (title: string) => {
+    if (!pid) return;
+    setRecentProjects((projects) =>
+      projects.map((project) => project.pid === pid ? { ...project, title } : project),
+    );
   };
 
   const navigation = [
@@ -92,6 +101,11 @@ function App() {
             <span>{t("tagline", lang)}</span>
           </div>
         </div>
+
+        <button className="sidebar-new-project" onClick={() => setView("projects")}>
+          <span aria-hidden="true">＋</span>
+          {lang === "zh" ? "新建转写" : "New transcription"}
+        </button>
 
         <nav className="primary-nav" aria-label={t("navigation", lang)}>
           {navigation.map((item) => {
@@ -113,17 +127,52 @@ function App() {
           })}
         </nav>
 
-        {pid ? (
-          <button className="current-project" onClick={() => setView("transcript")}>
-            <span>{t("currentProject", lang)}</span>
-            <strong title={pid}>{projectTitle || pid}</strong>
+        <div className="sidebar-utilities">
+          <button
+            className={view === "tasks" ? "active" : ""}
+            onClick={() => setView("tasks")}
+          >
+            <span className="sidebar-utility-icon" aria-hidden="true">◷</span>
+            {lang === "zh" ? "后台任务" : "Background tasks"}
           </button>
-        ) : (
-          <div className="sidebar-tip">
-            <span>{t("firstStep", lang)}</span>
-            <p>{t("chooseMediaHint", lang)}</p>
+          <button onClick={() => setView("settings")}>
+            <span className="sidebar-utility-icon" aria-hidden="true">⌘</span>
+            {lang === "zh" ? "自动化接口" : "Automation"}
+          </button>
+        </div>
+
+        <section className="sidebar-recents" aria-label={lang === "zh" ? "最近项目" : "Recent projects"}>
+          <header>
+            <span>{lang === "zh" ? "最近项目" : "Recent"}</span>
+            <button onClick={() => setView("projects")}>{lang === "zh" ? "全部" : "All"}</button>
+          </header>
+          <div>
+            {recentProjects.slice(0, 12).map((project) => (
+              <button
+                aria-current={pid === project.pid && view === "transcript" ? "page" : undefined}
+                aria-label={`${lang === "zh" ? "切换到" : "Switch to"} ${project.title}`}
+                className={pid === project.pid ? "active" : ""}
+                key={project.pid}
+                onClick={() => openProject(project.pid)}
+              >
+                <span className="recent-project-glyph" aria-hidden="true">
+                  {project.title.trim().slice(0, 1).toUpperCase() || "L"}
+                </span>
+                <span className="recent-project-copy">
+                  <strong>{project.title}</strong>
+                  <small>
+                    {project.word_count > 0
+                      ? `${project.word_count} ${lang === "zh" ? "字" : "words"}`
+                      : (lang === "zh" ? "等待转写" : "Ready")}
+                  </small>
+                </span>
+              </button>
+            ))}
+            {recentProjects.length === 0 && (
+              <p>{lang === "zh" ? "导入媒体后会出现在这里。" : "Imported media will appear here."}</p>
+            )}
           </div>
-        )}
+        </section>
 
         <div className="sidebar-footer">
           <button
@@ -158,11 +207,18 @@ function App() {
             lang={lang}
             pid={pid}
             onOpenSettings={() => setView("settings")}
-            onProjectTitleChange={setProjectTitle}
+            onProjectTitleChange={projectTitleChanged}
           />
         )}
         {view === "settings" && (
           <SettingsView lang={lang} pid={pid} />
+        )}
+        {view === "tasks" && (
+          <TaskCenterView
+            lang={lang}
+            projects={recentProjects}
+            onOpenProject={openProject}
+          />
         )}
       </main>
     </div>

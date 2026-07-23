@@ -270,6 +270,9 @@ beforeEach(() => {
       case "subtitle_list":
       case "speakers_list":
         return [];
+      case "subtitle_set":
+      case "translation_set":
+        return true;
       case "cut_list":
         return cutListState;
       case "speaker_evidence":
@@ -438,6 +441,16 @@ test("opening a project renders the serialized media details", async () => {
 
   expect(await screen.findByRole("heading", { name: "Interview" })).toBeVisible();
   expect(screen.getAllByText("2212.8s")[0]).toBeVisible();
+});
+
+test("background tasks open a user-facing processing center without server setup", async () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
+
+  expect(await screen.findByRole("heading", { name: "处理中心" })).toBeVisible();
+  expect(screen.getByText(/不需要手动启动服务器/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: /start server/i })).not.toBeInTheDocument();
 });
 
 test("a project rendering error shows recovery UI instead of a white window", async () => {
@@ -672,6 +685,40 @@ test("translation shows completed batches instead of an indefinite running state
   expect(await screen.findByText("已完成 2 / 10 批")).toBeVisible();
   expect(screen.getByRole("progressbar", { name: "翻译进度" })).toHaveAttribute("value", "2");
   expect(screen.getByRole("progressbar", { name: "翻译进度" })).toHaveAttribute("max", "10");
+});
+
+test("translation text can be edited and saved per cue", async () => {
+  projectDoc = {
+    ...projectDoc,
+    paragraphs: [{
+      id: 1,
+      speaker: "Host",
+      sentences: [{
+        id: "s1",
+        text: "Hello world",
+        words: [{ id: "w1", text: "Hello", start: 0, end: 1 }],
+      }],
+    }],
+    translations: {
+      zh: { s1: { text: "你好世界" } },
+    },
+  };
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "翻译" }));
+
+  const editor = await screen.findByRole("textbox", { name: /编辑译文 00:00/ });
+  fireEvent.change(editor, { target: { value: "世界你好" } });
+  fireEvent.blur(editor);
+
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("translation_set", {
+    pid: "project-1",
+    lang: "zh",
+    id: "s1",
+    text: "世界你好",
+    root: null,
+  }));
 });
 
 test("setup blocks transcription until the local runtime and models are ready", async () => {
@@ -1026,10 +1073,11 @@ test("timeline keeps the video visible and follows the active subtitle cue", asy
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "时间线" }));
 
-  await screen.findByText("播放预览");
-  const video = document.querySelector("video");
+  await screen.findByText("节目监看");
+  const video = document.querySelector(".workbench-preview video");
   if (!video) throw new Error("timeline video preview was not rendered");
-  expect(video.closest(".timeline-media-column")).not.toBeNull();
+  expect(document.querySelectorAll("video")).toHaveLength(1);
+  expect(video.closest(".workbench-preview")).not.toBeNull();
   expect(screen.getByText("字幕轨道").closest(".timeline-edit-column")).not.toBeNull();
   expect(screen.getByRole("button", { name: "跟随播放" })).toHaveAttribute("aria-pressed", "true");
 

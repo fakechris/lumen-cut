@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   audit,
   asrStatus,
@@ -39,6 +39,7 @@ import {
   subtitleReplace,
   subtitleSet,
   subtitleVisibility,
+  translationSet,
   taskStart,
   taskResume,
   taskStatus,
@@ -89,6 +90,8 @@ import { TranscriptEditor } from "./editor/TranscriptEditor";
 import { TranslationWorkspace } from "./editor/TranslationWorkspace";
 import { HistoryWorkspace } from "./editor/HistoryWorkspace";
 import { BrollWorkspace } from "./editor/BrollWorkspace";
+import { EditorMediaPreview } from "./editor/EditorMediaPreview";
+import { EditorTimelineDock } from "./editor/EditorTimelineDock";
 
 interface Props {
   lang: Lang;
@@ -335,9 +338,58 @@ export function TranscriptView({
   });
   const [brollPreviewJob, setBrollPreviewJob] = useState<BrollPreviewJobStatus | null>(null);
   const [brollPreviewPaths, setBrollPreviewPaths] = useState<string[]>([]);
+  const workbenchPlayerRef = useRef<HTMLMediaElement | null>(null);
+  const [workbenchTime, setWorkbenchTime] = useState(0);
+  const [workbenchPlaying, setWorkbenchPlaying] = useState(false);
+  const [previewTranslationLanguage, setPreviewTranslationLanguage] = useState<string | null>(null);
   const previousPending = useRef(0);
   const activeProject = useRef(pid);
   activeProject.current = pid;
+  const previewRows = useMemo(() => {
+    if (!doc || activeTab !== "translate" || !previewTranslationLanguage) {
+      return subtitleRows;
+    }
+    const track = doc.translations[previewTranslationLanguage];
+    if (!track) return subtitleRows;
+    return subtitleRows.map((row) => ({
+      ...row,
+      text: track[row.id]?.text || row.text,
+    }));
+  }, [activeTab, doc, previewTranslationLanguage, subtitleRows]);
+  const { wordsByCue, nextCueById } = useMemo(() => {
+    const words: Record<string, string[]> = {};
+    const nextCues: Record<string, string> = {};
+    for (const paragraph of doc?.paragraphs ?? []) {
+      paragraph.sentences.forEach((sentence, index) => {
+        words[sentence.id] = sentence.words.map((word) => word.text);
+        const next = paragraph.sentences[index + 1];
+        if (next) nextCues[sentence.id] = next.id;
+      });
+    }
+    return { wordsByCue: words, nextCueById: nextCues };
+  }, [doc?.paragraphs]);
+
+  const seekWorkbench = useCallback((seconds: number, autoplay = false) => {
+    if (!doc) return;
+    const next = Math.max(0, Math.min(seconds, doc.media.durationSeconds));
+    const player = workbenchPlayerRef.current;
+    setWorkbenchTime(next);
+    if (!player) return;
+    player.currentTime = next;
+    if (autoplay) {
+      void player.play().catch(() => setWorkbenchPlaying(false));
+    }
+  }, [doc]);
+
+  const toggleWorkbenchPlayback = useCallback(() => {
+    const player = workbenchPlayerRef.current;
+    if (!player) return;
+    if (player.paused) {
+      void player.play().catch(() => setWorkbenchPlaying(false));
+    } else {
+      player.pause();
+    }
+  }, []);
 
   const reload = async (projectId: string, resetTab = true) => {
     setFinishItems(null);
@@ -378,6 +430,9 @@ export function TranscriptView({
   useEffect(() => {
     setDoc(null);
     setFeedback(null);
+    setWorkbenchTime(0);
+    setWorkbenchPlaying(false);
+    workbenchPlayerRef.current?.pause();
     setAuditReport(null);
     setFinishItems(null);
     setAllowDraftExport(false);
@@ -815,6 +870,12 @@ export function TranscriptView({
     previousPending.current = pending;
   }, [pid, taskState?.pending]);
 
+  useEffect(() => {
+    if (!feedback || feedback.tone === "error") return;
+    const timer = window.setTimeout(() => setFeedback(null), 4500);
+    return () => window.clearTimeout(timer);
+  }, [feedback]);
+
   if (!pid) {
     return (
       <section className="editor-empty">
@@ -848,16 +909,6 @@ export function TranscriptView({
   const stoppedTasks = taskState?.kinds.filter(
     (task) => task.state === "paused" || task.state === "failed",
   ).length ?? 0;
-  const wordsByCue: Record<string, string[]> = {};
-  const nextCueById: Record<string, string> = {};
-  for (const paragraph of doc.paragraphs) {
-    paragraph.sentences.forEach((sentence, index) => {
-      wordsByCue[sentence.id] = sentence.words.map((word) => word.text);
-      const next = paragraph.sentences[index + 1];
-      if (next) nextCueById[sentence.id] = next.id;
-    });
-  }
-
   const perform = async (name: string, action: () => Promise<void>) => {
     setOperation(name);
     setFeedback(null);
@@ -954,6 +1005,27 @@ export function TranscriptView({
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "这句转写已保存。" : "This transcript line was saved.",
+      });
+    });
+  };
+
+  const saveTranslation = async (language: string, id: string, text: string) => {
+    await perform(`translation-${id}`, async () => {
+      const changed = await translationSet(pid, language, id, text);
+      if (!changed) throw new Error(`subtitle ${id} was not found`);
+      setDoc((current) => current ? {
+        ...current,
+        translations: {
+          ...current.translations,
+          [language]: {
+            ...(current.translations[language] || {}),
+            [id]: { text },
+          },
+        },
+      } : current);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "这句译文已保存。" : "This translation was saved.",
       });
     });
   };
@@ -1372,6 +1444,28 @@ export function TranscriptView({
             {hasTranscript && ` · ${doc.paragraphs.length} ${c.paragraphs} · ${doc.paragraphs.flatMap((p) => p.sentences.flatMap((s) => s.words)).length} ${c.words}`}
           </p>
         </div>
+        <div className="editor-header-actions">
+          <button
+            className={activeTab === "history" ? "active" : ""}
+            onClick={() => setActiveTab("history")}
+          >
+            {lang === "zh" ? "历史" : "History"}
+          </button>
+          <button
+            className={activeTab === "review" ? "active" : ""}
+            disabled={!hasTranscript}
+            onClick={() => setActiveTab("review")}
+          >
+            {lang === "zh" ? "检查" : "Review"}
+          </button>
+          <button
+            aria-label={lang === "zh" ? "导出作品" : "Export project"}
+            className="editor-export-button"
+            disabled={!hasTranscript}
+            onClick={() => setActiveTab("export")}
+          >
+            {lang === "zh" ? "导出" : "Export"}
+          </button>
         {taskState && taskState.kinds.length > 0 && (
           <details className="task-activity">
             <summary className="task-pill">
@@ -1407,7 +1501,19 @@ export function TranscriptView({
             </div>
           </details>
         )}
+        </div>
       </header>
+
+      <EditorMediaPreview
+            currentTime={workbenchTime}
+            doc={doc}
+            lang={lang}
+        playerRef={workbenchPlayerRef}
+        rows={previewRows}
+        subtitleStyle={subtitleStyle}
+        onPlayingChange={setWorkbenchPlaying}
+        onTimeChange={setWorkbenchTime}
+      />
 
       <nav className="editor-tabs" aria-label={lang === "zh" ? "编辑步骤" : "Editor sections"}>
         {tabs.map((tab) => (
@@ -1563,6 +1669,8 @@ export function TranscriptView({
           </aside>
           <TranscriptEditor
             busy={operation !== null}
+            currentTime={workbenchTime}
+            isPlaying={workbenchPlaying}
             lang={lang}
             nextCueById={nextCueById}
             rows={subtitleRows}
@@ -1570,6 +1678,7 @@ export function TranscriptView({
             onMerge={mergeSubtitleLines}
             onReplace={replaceSubtitles}
             onSave={saveSubtitle}
+            onSeek={seekWorkbench}
             onSplit={splitSubtitleLine}
             onVisibility={changeSubtitleVisibility}
           />
@@ -1580,10 +1689,14 @@ export function TranscriptView({
         <TranslationWorkspace
           busy={operation !== null}
           configured={agentConfigured}
+          currentTime={workbenchTime}
           doc={doc}
           lang={lang}
           status={taskState}
           onOpenSettings={onOpenSettings}
+          onLanguageChange={setPreviewTranslationLanguage}
+          onSave={saveTranslation}
+          onSeek={seekWorkbench}
           onStart={startTranslation}
         />
       )}
@@ -1634,10 +1747,12 @@ export function TranscriptView({
       {activeTab === "timeline" && (
         <TimelineWorkspace
           busy={operation !== null}
+          currentTime={workbenchTime}
           cuts={cuts}
           doc={doc}
           lang={lang}
           onRestoreCut={restoreCut}
+          onSeek={seekWorkbench}
         />
       )}
 
@@ -1906,6 +2021,19 @@ export function TranscriptView({
           </div>
         </div>
       )}
+
+      <EditorTimelineDock
+        broll={brollOverview}
+        currentTime={workbenchTime}
+        cuts={cuts}
+        doc={doc}
+        isPlaying={workbenchPlaying}
+        lang={lang}
+        rows={subtitleRows}
+        onOpenBroll={() => setActiveTab("broll")}
+        onSeek={seekWorkbench}
+        onTogglePlayback={toggleWorkbenchPlayback}
+      />
     </section>
   );
 }

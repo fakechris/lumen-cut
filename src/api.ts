@@ -201,6 +201,15 @@ export async function subtitleSet(
   return invoke("subtitle_set", { pid, id, text, root: null });
 }
 
+export async function translationSet(
+  pid: string,
+  lang: string,
+  id: string,
+  text: string,
+): Promise<boolean> {
+  return invoke("translation_set", { pid, lang, id, text, root: null });
+}
+
 export async function subtitleReplace(
   pid: string,
   query: string,

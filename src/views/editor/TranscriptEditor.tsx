@@ -1,10 +1,12 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { Lang } from "../../i18n";
 import type { SubtitleRow } from "../../types";
 import { CheckIcon } from "../../components/Icons";
 
 interface Props {
   busy: boolean;
+  currentTime: number;
+  isPlaying: boolean;
   lang: Lang;
   nextCueById: Record<string, string>;
   rows: SubtitleRow[];
@@ -12,6 +14,7 @@ interface Props {
   onMerge: (id1: string, id2: string) => Promise<void>;
   onReplace: (query: string, replacement: string) => Promise<number>;
   onSave: (id: string, text: string) => Promise<void>;
+  onSeek: (seconds: number, autoplay?: boolean) => void;
   onSplit: (id: string, at: number) => Promise<void>;
   onVisibility: (id: string, hidden: boolean) => Promise<void>;
 }
@@ -24,6 +27,8 @@ function timecode(seconds: number) {
 
 export function TranscriptEditor({
   busy,
+  currentTime,
+  isPlaying,
   lang,
   nextCueById,
   rows,
@@ -31,6 +36,7 @@ export function TranscriptEditor({
   onMerge,
   onReplace,
   onSave,
+  onSeek,
   onSplit,
   onVisibility,
 }: Props) {
@@ -41,6 +47,7 @@ export function TranscriptEditor({
   const [savingId, setSavingId] = useState<string | null>(null);
   const [replaceResult, setReplaceResult] = useState<number | null>(null);
   const [structureId, setStructureId] = useState<string | null>(null);
+  const cueRefs = useRef(new Map<string, HTMLElement>());
 
   useEffect(() => {
     setDrafts(Object.fromEntries(rows.map((row) => [row.id, row.text])));
@@ -56,6 +63,20 @@ export function TranscriptEditor({
       (drafts[row.id] ?? row.text).toLocaleLowerCase().includes(needle),
     );
   }, [drafts, query, rows]);
+  const activeRow = useMemo(
+    () => rows.find((row) => row.start <= currentTime && currentTime < row.end),
+    [currentTime, rows],
+  );
+
+  useEffect(() => {
+    if (!isPlaying || !activeRow) return;
+    const cue = cueRefs.current.get(activeRow.id);
+    if (!cue || cue.contains(document.activeElement)) return;
+    cue.scrollIntoView({
+      behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+      block: "center",
+    });
+  }, [activeRow?.id, isPlaying]);
 
   const save = async (row: SubtitleRow) => {
     const text = (drafts[row.id] ?? row.text).trim();
@@ -144,8 +165,21 @@ export function TranscriptEditor({
           const nextCueId = nextCueById[row.id];
           const structureOpen = structureId === row.id;
           return (
-            <article className={`cue-editor${row.hidden ? " hidden-cue" : ""}`} key={row.id}>
-              <div className="cue-ordinal">{String(index + 1).padStart(2, "0")}</div>
+            <article
+              className={`cue-editor${row.hidden ? " hidden-cue" : ""}${activeRow?.id === row.id ? " active-cue" : ""}`}
+              key={row.id}
+              ref={(element) => {
+                if (element) cueRefs.current.set(row.id, element);
+                else cueRefs.current.delete(row.id);
+              }}
+            >
+              <button
+                aria-label={`${lang === "zh" ? "播放字幕" : "Play cue"} ${index + 1}`}
+                className="cue-ordinal cue-play"
+                onClick={() => onSeek(row.start, true)}
+              >
+                {String(index + 1).padStart(2, "0")}
+              </button>
               <div className="cue-time">
                 <span>{timecode(row.start)}</span>
                 <span>{timecode(row.end)}</span>
