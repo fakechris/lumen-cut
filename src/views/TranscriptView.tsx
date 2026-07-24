@@ -38,6 +38,7 @@ import {
   exportSettingsSet,
   exportPreflight,
   finishCheckForExport,
+  translationAutoFit,
   mergeSubtitles,
   pickBrollFile,
   pickMediaFile,
@@ -378,7 +379,11 @@ const COPY = {
     exportReady: "当前版本可以交付",
     exportBlocked: "存在阻止正式交付的问题",
     projectModeTitle: "项目模式",
-    projectModeHint: "转写完成即进入可编辑状态。finish-check 与导出是交付动作，不会在转写后自动运行。",
+    projectModeHint: "转写/翻译完成只表示可以编辑。导出成片前才会做交付检查；不会自动导出。",
+    autoFitCaptions: "自动拆开过长字幕",
+    autoFitting: "正在拆开…",
+    saveVersionContinue: "保存版本并继续",
+    savingVersion: "正在保存版本…",
     draftOverride: "仍要导出草稿（我了解检查项不会自动修复）",
     revealExports: "在 Finder 中打开项目目录",
     videoExportHint: "视频渲染可能需要数分钟，会在后台运行，编辑窗口不会失去响应。",
@@ -440,7 +445,11 @@ const COPY = {
     exportReady: "The current version is ready to deliver",
     exportBlocked: "Issues are blocking a production delivery",
     projectModeTitle: "Project mode",
-    projectModeHint: "A finished transcript is edit-ready. Finish-check and export are explicit delivery actions and never run automatically after transcription.",
+    projectModeHint: "Transcription/translation only makes the project editable. Delivery checks run when you export — never automatically.",
+    autoFitCaptions: "Auto-split long captions",
+    autoFitting: "Splitting…",
+    saveVersionContinue: "Save version and continue",
+    savingVersion: "Saving version…",
     draftOverride: "Export a draft anyway (I understand checks are not fixed automatically)",
     revealExports: "Open project folder in Finder",
     videoExportHint: "Video rendering can take several minutes. It runs in the background and the editor remains responsive.",
@@ -1171,7 +1180,7 @@ export function TranscriptView({
           await exportSettingsSet(pid, videoExportSettings);
           if (shouldRecheck) {
             const [items, preflight] = await Promise.all([
-              finishCheckForExport(pid, videoExportSettings),
+              finishCheckForExport(pid, videoExportSettings, lang),
               exportPreflight(pid, videoExportSettings),
             ]);
             if (disposed || activeProject.current !== pid) return;
@@ -2381,13 +2390,97 @@ export function TranscriptView({
   const runFinishCheck = () =>
     perform("finish", async () => {
       const [items, preflight] = await Promise.all([
-        finishCheckForExport(pid, videoExportSettings),
+        finishCheckForExport(pid, videoExportSettings, lang),
         exportPreflight(pid, videoExportSettings),
       ]);
       setFinishItems(items);
       setExportPreflightReport(preflight);
       exportCheckRun.current = true;
       setAllowDraftExport(false);
+    });
+
+  const exportReasonCodes = new Set(
+    (finishItems ?? []).flatMap((item) => item.reasonCodes ?? []),
+  );
+  const needsCaptionFit = exportReasonCodes.has("target-width")
+    || exportReasonCodes.has("target-width-aim")
+    || (finishItems ?? []).some((item) =>
+      item.blockers.some((message) =>
+        message.includes("太长")
+        || message.includes("too long")
+        || message.includes("hard capacity")
+        || message.includes("硬上限"),
+      ),
+    );
+  const needsVersionCommit = exportReasonCodes.has("version-uncommitted")
+    || (finishItems ?? []).some((item) =>
+      item.blockers.some((message) =>
+        message.includes("版本")
+        || message.includes("version")
+        || message.includes("not committed"),
+      ),
+    );
+  const fitLanguage = previewTranslationLanguage
+    || (doc
+      ? Object.keys(doc.translations).find((key) => Object.keys(doc.translations[key] || {}).length > 0)
+      : null)
+    || "zh";
+
+  const runAutoFitCaptions = () =>
+    perform("auto-fit", async () => {
+      const report = await translationAutoFit(pid, fitLanguage, null);
+      await reload(pid, false);
+      const [items, preflight] = await Promise.all([
+        finishCheckForExport(pid, videoExportSettings, lang),
+        exportPreflight(pid, videoExportSettings),
+      ]);
+      setFinishItems(items);
+      setExportPreflightReport(preflight);
+      exportCheckRun.current = true;
+      setFeedback({
+        tone: report.remainingHard > 0 ? "error" : "success",
+        text: lang === "zh"
+          ? report.fixed > 0
+            ? `已拆开 ${report.fixed} 行字幕${
+              report.remainingHard > 0
+                ? `，仍有 ${report.remainingHard} 行需要手动缩短`
+                : "，可重新导出"
+            }。`
+            : report.remainingHard > 0
+              ? `仍有 ${report.remainingHard} 行过长，请在翻译页手动缩短。`
+              : "字幕长度已符合要求。"
+          : report.fixed > 0
+            ? `Split ${report.fixed} caption line(s)${
+              report.remainingHard > 0
+                ? `; ${report.remainingHard} still need a manual shorten`
+                : "; ready to export again"
+            }.`
+            : report.remainingHard > 0
+              ? `${report.remainingHard} line(s) still too long — edit them in Translate.`
+              : "Captions already fit.",
+      });
+    });
+
+  const runSaveVersionAndContinue = () =>
+    perform("version-commit", async () => {
+      const stamp = new Date().toISOString().slice(0, 19).replace("T", " ");
+      await versionCommit(
+        pid,
+        lang === "zh" ? `导出前快照 ${stamp}` : `Pre-export snapshot ${stamp}`,
+        lang === "zh" ? "导出检查自动保存" : "Saved from export check",
+      );
+      setVersionHistory(await versionList(pid));
+      const [items, preflight] = await Promise.all([
+        finishCheckForExport(pid, videoExportSettings, lang),
+        exportPreflight(pid, videoExportSettings),
+      ]);
+      setFinishItems(items);
+      setExportPreflightReport(preflight);
+      exportCheckRun.current = true;
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "版本已保存，可继续导出。" : "Version saved — you can continue exporting.",
+      });
     });
 
   const restoreCut = (cutId: string) =>
@@ -3225,6 +3318,32 @@ export function TranscriptView({
                   </li>
                 ))}
               </ul>
+            )}
+            {(needsCaptionFit || needsVersionCommit) && (
+              <div className="export-fix-actions">
+                {needsCaptionFit && (
+                  <button
+                    className="button-primary"
+                    disabled={operation !== null}
+                    onClick={runAutoFitCaptions}
+                    type="button"
+                  >
+                    {operation === "auto-fit" ? <span className="spinner" /> : null}
+                    {operation === "auto-fit" ? c.autoFitting : c.autoFitCaptions}
+                  </button>
+                )}
+                {needsVersionCommit && (
+                  <button
+                    className={needsCaptionFit ? "button-quiet" : "button-primary"}
+                    disabled={operation !== null}
+                    onClick={runSaveVersionAndContinue}
+                    type="button"
+                  >
+                    {operation === "version-commit" ? <span className="spinner" /> : null}
+                    {operation === "version-commit" ? c.savingVersion : c.saveVersionContinue}
+                  </button>
+                )}
+              </div>
             )}
             {exportPreflightReport && exportPreflightBlockers.length > 0 && (
               <ul className="export-preflight-specific">

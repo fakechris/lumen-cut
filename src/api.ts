@@ -16,6 +16,7 @@ import type {
   DoctorCheck,
   FinishCheckItem,
   ExportPreflightReport,
+  TranslationFitReport,
   MergeSummary,
   ModelConfig,
   PerformanceStatus,
@@ -624,15 +625,27 @@ export async function brollPreviewCancel(pid: string): Promise<BrollPreviewJobSt
   return invoke("broll_preview_cancel", { pid });
 }
 
-export async function finishCheck(pid: string): Promise<FinishCheckItem[]> {
-  return invoke("finish_check_pid", { pid, settings: null, root: null });
+export async function finishCheck(
+  pid: string,
+  locale: string | null = null,
+): Promise<FinishCheckItem[]> {
+  return invoke("finish_check_pid", { pid, settings: null, root: null, locale });
 }
 
 export async function finishCheckForExport(
   pid: string,
   settings: VideoExportSettings,
+  locale: string | null = null,
 ): Promise<FinishCheckItem[]> {
-  return invoke("finish_check_pid", { pid, settings, root: null });
+  return invoke("finish_check_pid", { pid, settings, root: null, locale });
+}
+
+export async function translationAutoFit(
+  pid: string,
+  lang: string,
+  fit: number | null = null,
+): Promise<TranslationFitReport> {
+  return invoke("translation_auto_fit", { pid, lang, fit, root: null });
 }
 
 export async function exportPreflight(

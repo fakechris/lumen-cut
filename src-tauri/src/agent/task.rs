@@ -1067,25 +1067,39 @@ fn align_payloads(
     }
 
     // Align-local: wrap ordinary over-fit lines deterministically (no agent).
-    let mut local_changed = false;
     if align_local {
-        if let Some(translations) = doc.translations.get_mut(lang) {
+        let scoped = if requested.is_empty() {
+            None
+        } else {
+            Some(requested.iter().map(|id| (*id).to_string()).collect::<Vec<_>>())
+        };
+        // Prefer the shared Phase-2 fitter (punctuation-aware multi-line wrap).
+        if scoped.is_none() {
+            let _ = crate::pipeline::align::auto_fit_translations(doc, lang, Some(fit))?;
+        } else if let Some(translations) = doc.translations.get_mut(lang) {
+            let hard_i = hard as usize;
+            let mut local_changed = false;
             for (id, group) in translations.iter_mut() {
-                if !requested.is_empty() && !requested.contains(id.as_str()) {
+                if !requested.contains(id.as_str()) {
                     continue;
                 }
-                let cells = projected_cells(&group.text);
-                if cells > fit as f64 && cells <= hard {
-                    let wrapped = wrap_to_aim(&group.text, fit);
+                let cells = crate::pipeline::align::max_line_cells(&group.text);
+                if cells > fit as f64 {
+                    let wrapped =
+                        crate::pipeline::align::wrap_display_lines(&group.text, fit, hard_i);
                     if wrapped != group.text {
                         group.text = wrapped;
                         local_changed = true;
                     }
                 }
             }
+            if local_changed {
+                doc.meta.updated_at = chrono::Utc::now();
+                doc.save(project_dir)?;
+            }
         }
-        if local_changed {
-            doc.meta.updated_at = chrono::Utc::now();
+        if scoped.is_none() {
+            // auto_fit already saved? No — auto_fit only mutates; save here.
             doc.save(project_dir)?;
         }
     }
@@ -1101,7 +1115,7 @@ fn align_payloads(
         .collect();
     let mut pairs = Vec::new();
     for (id, group) in translations {
-        let cells = projected_cells(&group.text);
+        let cells = crate::pipeline::align::max_line_cells(&group.text);
         if (!requested.is_empty() && !requested.contains(id.as_str()))
             || (requested.is_empty() && cells <= fit as f64)
         {
@@ -1109,9 +1123,6 @@ fn align_payloads(
         }
         // With align-local, ordinary over-fit was already wrapped; only hard
         // residual problems still go to the agent.
-        if align_local && cells <= hard && cells <= fit as f64 {
-            continue;
-        }
         if align_local && cells <= hard {
             continue;
         }
@@ -1161,43 +1172,6 @@ fn align_payloads(
         "budgets": {"s": 60, "t": 14, "f": fit},
         "pairs": pairs,
     })])
-}
-
-/// Deterministic wrap used by `--align-local` for ordinary over-fit lines.
-fn wrap_to_aim(text: &str, aim: usize) -> String {
-    let aim = aim.max(1);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_cells = 0.0;
-    let push_char = |ch: char, current: &mut String, current_cells: &mut f64, lines: &mut Vec<String>| {
-        let cost = if ch.is_whitespace() || ch.is_ascii_punctuation() {
-            0.0
-        } else if ch.is_ascii() {
-            0.5
-        } else {
-            1.0
-        };
-        if *current_cells + cost > aim as f64 && !current.is_empty() {
-            lines.push(std::mem::take(current));
-            *current_cells = 0.0;
-        }
-        current.push(ch);
-        *current_cells += cost;
-    };
-    for ch in text.chars() {
-        if ch == '\n' {
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                current_cells = 0.0;
-            }
-            continue;
-        }
-        push_char(ch, &mut current, &mut current_cells, &mut lines);
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines.join("\n")
 }
 
 fn polish_payloads(doc: &Doc) -> AppResult<Vec<serde_json::Value>> {

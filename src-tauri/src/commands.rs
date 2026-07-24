@@ -2572,8 +2572,13 @@ pub async fn finish_check_pid(
     pid: String,
     settings: Option<crate::data::export_settings::VideoExportSettings>,
     root: Option<PathBuf>,
+    locale: Option<String>,
 ) -> AppResult<Vec<FinishCheckItem>> {
     let dir = resolve_project_dir(&pid, root)?;
+    let zh = locale
+        .as_deref()
+        .map(|value| value.starts_with("zh"))
+        .unwrap_or(true);
     run_blocking("finish check", move || {
         let doc = Doc::load(&dir)?;
         let cuts_path = dir.join("cuts.json");
@@ -2601,23 +2606,191 @@ pub async fn finish_check_pid(
         }
         Ok(items
             .into_iter()
-            .map(|i| FinishCheckItem {
-                code: i.code.label().to_string(),
-                ordinal: i.code as u32,
-                pass: i.pass,
-                blockers: i.blockers.iter().map(|b| b.message.clone()).collect(),
-            })
+            .map(|i| humanize_finish_item(i, zh))
             .collect())
     })
     .await
 }
 
+fn humanize_finish_item(
+    item: crate::audit::finish_check::EmitItem,
+    zh: bool,
+) -> FinishCheckItem {
+    let mut reason_codes = Vec::new();
+    let mut target_width = 0usize;
+    let mut target_aim = 0usize;
+    let mut flash = 0usize;
+    let mut translation_missing = 0usize;
+    let mut translation_empty = 0usize;
+    let mut cut_heavy = 0usize;
+    let mut timing = 0usize;
+    let mut version = false;
+    let mut other_messages = Vec::new();
+    for finding in &item.blockers {
+        match finding.code {
+            Code::TargetWidth => target_width += 1,
+            Code::TargetWidthAim | Code::TargetSplittableOverAim => target_aim += 1,
+            Code::TargetFlash | Code::TargetFlashCompleteSentence => flash += 1,
+            Code::TranslationMissing => translation_missing += 1,
+            Code::TranslationEmpty => translation_empty += 1,
+            Code::CutHeavyRemoval => cut_heavy += 1,
+            Code::WordTimeBoundary => timing += 1,
+            Code::PipelineFallback => version = true,
+            _ if finding.message.contains("not committed") => version = true,
+            _ => other_messages.push(finding.message.clone()),
+        }
+    }
+    let mut blockers = Vec::new();
+    if target_width > 0 {
+        reason_codes.push("target-width".into());
+        blockers.push(if zh {
+            format!(
+                "有 {target_width} 行字幕太长（超过硬上限）。点「自动拆开过长字幕」即可，不会重新翻译。"
+            )
+        } else {
+            format!(
+                "{target_width} caption line(s) are too long (over hard capacity). Tap “Auto-split long captions” — no re-translation."
+            )
+        });
+    }
+    if target_aim > 0 {
+        reason_codes.push("target-width-aim".into());
+        blockers.push(if zh {
+            format!("另有 {target_aim} 行略长于建议长度，可选拆开，不阻止导出。")
+        } else {
+            format!("{target_aim} line(s) are slightly over the soft aim (optional).")
+        });
+    }
+    if flash > 0 {
+        reason_codes.push("target-flash".into());
+        blockers.push(if zh {
+            format!("有 {flash} 行字幕在画面上停留偏短，读起来可能偏快（建议拆行或略改时码）。")
+        } else {
+            format!("{flash} caption line(s) flash too quickly on screen.")
+        });
+    }
+    if version {
+        reason_codes.push("version-uncommitted".into());
+        blockers.push(if zh {
+            "当前修改还没有保存版本快照。点「保存版本并继续」即可。".into()
+        } else {
+            "Unsaved project changes need a version snapshot. Tap “Save version and continue”."
+                .into()
+        });
+    }
+    if translation_missing > 0 {
+        reason_codes.push("translation-missing".into());
+        blockers.push(if zh {
+            format!("还有 {translation_missing} 处缺少译文，请先完成翻译。")
+        } else {
+            format!("{translation_missing} cue(s) still need a translation.")
+        });
+    }
+    if translation_empty > 0 {
+        reason_codes.push("translation-empty".into());
+        blockers.push(if zh {
+            "还没有转写内容。请先完成转写。".into()
+        } else {
+            "There is no transcript yet. Transcribe first.".into()
+        });
+    }
+    if cut_heavy > 0 {
+        reason_codes.push("cut-heavy".into());
+        blockers.push(if zh {
+            format!("时间线剪掉了过多内容（{cut_heavy} 项检查未通过）。")
+        } else {
+            format!("Timeline cuts remove too much media ({cut_heavy} check(s)).")
+        });
+    }
+    if timing > 0 {
+        reason_codes.push("timing".into());
+        blockers.push(if zh {
+            format!("字幕时码与媒体时长不一致（{timing} 处）。")
+        } else {
+            format!("Caption timing does not fit the media ({timing}).")
+        });
+    }
+    for message in other_messages {
+        if !blockers.iter().any(|existing| existing == &message) {
+            blockers.push(message);
+        }
+    }
+    if blockers.is_empty() && !item.blockers.is_empty() {
+        blockers = item
+            .blockers
+            .iter()
+            .map(|finding| finding.message.clone())
+            .collect();
+    }
+    FinishCheckItem {
+        code: item.code.label().to_string(),
+        ordinal: item.code as u32,
+        pass: item.pass,
+        blockers,
+        reason_codes,
+    }
+}
+
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FinishCheckItem {
     pub code: String,
     pub ordinal: u32,
     pub pass: bool,
+    /// Human-readable blocker summaries (locale-aware when `locale` is passed).
     pub blockers: Vec<String>,
+    /// Machine codes for UI actions (e.g. `target-width`, `version-uncommitted`).
+    #[serde(default)]
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationFitReport {
+    pub language: String,
+    pub fit_chars: usize,
+    pub hard_chars: usize,
+    pub scanned: usize,
+    pub fixed: usize,
+    pub remaining_hard: usize,
+    pub remaining_aim: usize,
+}
+
+/// One-click Phase-2 fit: split over-long translated captions into short lines
+/// without re-translating. Prefer punctuation seams; falls back to cell budget.
+#[tauri::command]
+pub async fn translation_auto_fit(
+    pid: String,
+    lang: String,
+    fit: Option<usize>,
+    root: Option<PathBuf>,
+) -> AppResult<TranslationFitReport> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("translation auto fit", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Auto-fit long captions",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let report = crate::pipeline::align::auto_fit_translations(&mut doc, &lang, fit)?;
+                if report.fixed > 0 {
+                    doc.save(&dir)?;
+                }
+                Ok(TranslationFitReport {
+                    language: report.language,
+                    fit_chars: report.fit_chars,
+                    hard_chars: report.hard_chars,
+                    scanned: report.scanned,
+                    fixed: report.fixed,
+                    remaining_hard: report.remaining_hard,
+                    remaining_aim: report.remaining_aim,
+                })
+            },
+            |report| report.fixed > 0,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -9609,9 +9782,14 @@ mod tests {
         .save(&project)
         .unwrap();
 
-        let general = finish_check_pid("p1".into(), None, Some(tmp.path().to_path_buf()))
-            .await
-            .unwrap();
+        let general = finish_check_pid(
+            "p1".into(),
+            None,
+            Some(tmp.path().to_path_buf()),
+            Some("en".into()),
+        )
+        .await
+        .unwrap();
         assert!(general
             .iter()
             .any(|item| item.code == "translations-filled" && !item.pass));
@@ -9620,6 +9798,7 @@ mod tests {
             "p1".into(),
             Some(crate::data::export_settings::VideoExportSettings::default()),
             Some(tmp.path().to_path_buf()),
+            Some("en".into()),
         )
         .await
         .unwrap();

@@ -398,6 +398,18 @@ export interface FinishCheckItem {
   ordinal: number;
   pass: boolean;
   blockers: string[];
+  /** Machine codes for UI actions, e.g. target-width, version-uncommitted. */
+  reasonCodes?: string[];
+}
+
+export interface TranslationFitReport {
+  language: string;
+  fitChars: number;
+  hardChars: number;
+  scanned: number;
+  fixed: number;
+  remainingHard: number;
+  remainingAim: number;
 }
 
 export interface ExportPreflightItem {

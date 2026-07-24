@@ -6344,6 +6344,21 @@ pre.out {
   padding: var(--inspector-pad-y) var(--inspector-pad-x);
 }
 
+.editor-view .export-fix-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.editor-view .export-preflight .check-list small,
+.editor-view .export-preflight li small {
+  display: block;
+  line-height: 1.45;
+  margin-top: 2px;
+  white-space: normal;
+}
+
 .editor-view .export-project-mode p {
   font-size: var(--inspector-body-size);
   line-height: 1.45;

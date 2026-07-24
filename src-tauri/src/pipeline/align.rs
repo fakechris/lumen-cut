@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::doc::Doc;
 use crate::data::version::CueDiff;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AlignSpec {
@@ -256,16 +256,166 @@ pub fn align_list(doc: &Doc, lang: &str, fit: usize, pid: &str) -> AppResult<Ali
 
 fn target_cells(text: &str) -> f64 {
     text.chars()
-        .map(|character| {
-            if character.is_whitespace() || character.is_ascii_punctuation() {
-                0.0
-            } else if character.is_ascii() {
-                0.5
-            } else {
-                1.0
-            }
-        })
+        .map(char_cells)
         .sum()
+}
+
+fn char_cells(character: char) -> f64 {
+    if character.is_whitespace() || character.is_ascii_punctuation() {
+        0.0
+    } else if character.is_ascii() {
+        0.5
+    } else {
+        1.0
+    }
+}
+
+/// Longest projected display line in a multi-line caption (newlines separate lines).
+pub fn max_line_cells(text: &str) -> f64 {
+    if text.trim().is_empty() {
+        return 0.0;
+    }
+    text.lines()
+        .map(|line| target_cells(line))
+        .fold(0.0_f64, f64::max)
+}
+
+/// Result of the one-click local Phase-2 fit (split over-long translation lines).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FitFixReport {
+    pub language: String,
+    pub fit_chars: usize,
+    pub hard_chars: usize,
+    pub scanned: usize,
+    /// Groups rewritten with line breaks under the fit/hard budget.
+    pub fixed: usize,
+    /// Still over hard after local wrap (needs manual edit or AI rewrite).
+    pub remaining_hard: usize,
+    /// Over soft aim but within hard (advisory; export still allowed).
+    pub remaining_aim: usize,
+}
+
+/// Deterministic Phase-2: wrap every over-fit translation group into short
+/// display lines. Does **not** re-translate; inserts line breaks at punctuation
+/// seams when possible, otherwise at the fit budget. Mutates `doc` in place.
+pub fn auto_fit_translations(doc: &mut Doc, lang: &str, fit: Option<usize>) -> AppResult<FitFixReport> {
+    let fit = fit
+        .unwrap_or_else(|| crate::pipeline::translate::aim_chars_for_lang(lang))
+        .clamp(8, 32);
+    let hard = crate::pipeline::translate::hard_chars_for_lang(lang);
+    let Some(track) = doc.translations.get_mut(lang) else {
+        return Err(AppError::Schema(format!("no `{lang}` translations to fit")));
+    };
+    let mut scanned = 0usize;
+    let mut fixed = 0usize;
+    let mut remaining_hard = 0usize;
+    let mut remaining_aim = 0usize;
+    for group in track.values_mut() {
+        scanned += 1;
+        let before = group.text.clone();
+        let cells = max_line_cells(&before);
+        if cells <= fit as f64 {
+            continue;
+        }
+        let wrapped = wrap_display_lines(&before, fit, hard);
+        if wrapped != before {
+            group.text = wrapped;
+            fixed += 1;
+        }
+        let after = max_line_cells(&group.text);
+        if after > hard as f64 {
+            remaining_hard += 1;
+        } else if after > fit as f64 {
+            remaining_aim += 1;
+        }
+    }
+    if fixed > 0 {
+        doc.meta.updated_at = Utc::now();
+    }
+    Ok(FitFixReport {
+        language: lang.to_string(),
+        fit_chars: fit,
+        hard_chars: hard,
+        scanned,
+        fixed,
+        remaining_hard,
+        remaining_aim,
+    })
+}
+
+/// Wrap one caption so each display line stays within `fit` cells when possible,
+/// never above `hard` unless a single unbreakable run is longer than hard.
+pub fn wrap_display_lines(text: &str, fit: usize, hard: usize) -> String {
+    let fit = fit.max(1) as f64;
+    let hard = hard.max(1) as f64;
+    let compact = text
+        .chars()
+        .filter(|character| *character != '\n' && *character != '\r')
+        .collect::<String>();
+    if max_line_cells(&compact) <= fit {
+        return compact;
+    }
+    let chars: Vec<char> = compact.chars().collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        // Skip leading spaces on a new line.
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+        if start >= chars.len() {
+            break;
+        }
+        let mut cells = 0.0;
+        let mut end = start;
+        let mut last_punct: Option<usize> = None;
+        let mut last_fit_break: Option<usize> = None;
+        while end < chars.len() {
+            let cost = char_cells(chars[end]);
+            if cells + cost > hard && end > start {
+                break;
+            }
+            cells += cost;
+            end += 1;
+            if matches!(
+                chars[end - 1],
+                '，' | '。' | '、' | '；' | '：' | '！' | '？' | ',' | '.' | ';' | ':' | '!' | '?'
+                    | '…'
+            ) {
+                last_punct = Some(end);
+            }
+            if cells <= fit {
+                // Prefer break after whitespace or punctuation inside fit.
+                if chars[end - 1].is_whitespace()
+                    || last_punct == Some(end)
+                    || !chars[end - 1].is_ascii()
+                {
+                    last_fit_break = Some(end);
+                }
+            }
+            if cells > fit && last_fit_break.is_some() {
+                break;
+            }
+        }
+        let cut = if cells > fit {
+            last_punct
+                .filter(|&index| index > start)
+                .or(last_fit_break.filter(|&index| index > start))
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        let cut = cut.max(start + 1).min(chars.len());
+        let line: String = chars[start..cut].iter().collect();
+        lines.push(line.trim().to_string());
+        start = cut;
+    }
+    lines
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn target_seam_preview(text: &str) -> String {
@@ -476,5 +626,46 @@ mod tests {
         assert_eq!(list.groups[0].fit_chars, 8);
         assert!(list.groups[0].seam_preview.starts_with("<#0>"));
         assert!(list.next.unwrap().contains("--groups g2"));
+    }
+
+    #[test]
+    fn wrap_display_lines_keeps_each_line_under_fit() {
+        let text = "今天我们来聊聊人工智能，以及它对生活的改变。";
+        let wrapped = wrap_display_lines(text, 16, 22);
+        assert!(wrapped.contains('\n') || max_line_cells(&wrapped) <= 16.0);
+        for line in wrapped.lines() {
+            assert!(
+                max_line_cells(line) <= 22.0,
+                "line over hard: {line} ({})",
+                max_line_cells(line)
+            );
+        }
+        // Content preserved (whitespace-insensitive).
+        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert_eq!(strip(&wrapped), strip(text));
+    }
+
+    #[test]
+    fn auto_fit_translations_rewrites_over_fit_groups() {
+        let mut source = doc();
+        source.translations.insert(
+            "zh".into(),
+            BTreeMap::from([(
+                "g1".into(),
+                TranslationGroup {
+                    id: "g1".into(),
+                    text: "这是一个明显超过十六个汉字宽度的翻译句子需要拆开".into(),
+                    source_words: vec!["w0".into(), "w1".into()],
+                    source_text: Some("alpha beta".into()),
+                },
+            )]),
+        );
+        let report = auto_fit_translations(&mut source, "zh", Some(16)).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.fixed, 1);
+        assert_eq!(report.remaining_hard, 0);
+        let text = &source.translations["zh"]["g1"].text;
+        assert!(max_line_cells(text) <= 16.0 || text.contains('\n'));
+        assert!(max_line_cells(text) <= 22.0);
     }
 }

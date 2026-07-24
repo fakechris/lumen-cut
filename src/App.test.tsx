@@ -39,6 +39,7 @@ let finishCheckItems: Array<{
   ordinal: number;
   pass: boolean;
   blockers: string[];
+  reasonCodes?: string[];
 }>;
 let exportPreflightState: ExportPreflightReport;
 let cutListState: Array<{
@@ -641,6 +642,16 @@ beforeEach(() => {
         return null;
       case "finish_check_pid":
         return finishCheckItems;
+      case "translation_auto_fit":
+        return {
+          language: "zh",
+          fitChars: 16,
+          hardChars: 22,
+          scanned: 10,
+          fixed: 3,
+          remainingHard: 0,
+          remainingAim: 0,
+        };
       case "export_preflight":
         return exportPreflightState;
       case "export_subtitles":

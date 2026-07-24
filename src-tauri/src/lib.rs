@@ -92,6 +92,7 @@ pub fn run() {
             commands::task_prioritize,
             commands::task_status,
             commands::finish_check_pid,
+            commands::translation_auto_fit,
             commands::cut_auto,
             commands::cut_manual,
             commands::cut_manual_many,
