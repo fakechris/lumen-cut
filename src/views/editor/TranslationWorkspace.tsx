@@ -281,55 +281,168 @@ export function TranslationWorkspace({
     selected,
   ]));
 
+  const primaryActionLabel = otherTranslateTask
+    ? (lang === "zh" ? "其他语言待处理" : "Other language pending")
+    : translateTask?.pending && taskStopped
+      ? (lang === "zh" ? "继续翻译" : "Resume")
+      : translateTask?.pending
+        ? (lang === "zh" ? "翻译中…" : "Running…")
+        : completed > 0
+          ? needsUpdate > 0
+            ? (lang === "zh" ? `更新 ${needsUpdate}` : `Update ${needsUpdate}`)
+            : (lang === "zh" ? "已是最新" : "Up to date")
+          : (lang === "zh" ? "开始翻译" : "Start");
+  const primaryActionTitle = lang === "zh"
+    ? "按上下文批量请求；更新只发送缺失或源文有变化的字幕。"
+    : "Context-aware batches. Update sends only missing or changed lines.";
+  const taskStatusLabel = translateTask
+    ? translateTask.pending > 0
+      ? taskStopped
+        ? (lang === "zh" ? "已暂停" : "Paused")
+        : (lang === "zh" ? "后台翻译中" : "Translating")
+      : translateTask.failed > 0
+        ? (lang === "zh" ? "部分失败" : "Partial failure")
+        : (lang === "zh" ? "最近完成" : "Complete")
+    : null;
+
   return (
     <div className="translation-workspace">
       <aside className="translation-sidebar">
-        <p className="eyebrow">{lang === "zh" ? "目标语言" : "Target language"}</p>
-        <select
-          aria-label={lang === "zh" ? "目标语言" : "Target language"}
-          value={selected}
-          onChange={(event) => {
-            requestLanguageChange(event.target.value);
-          }}
-        >
-          {languageOptions.map((code) => (
-            <option key={code} value={code}>{LANGUAGE_NAMES[code] || code}</option>
-          ))}
-        </select>
-        <div className="translation-custom-language">
-          <input
-            aria-label={lang === "zh" ? "自定义目标语言代码" : "Custom target language code"}
-            placeholder={lang === "zh" ? "其他语言，如 de-CH" : "Other, e.g. de-CH"}
-            value={customLanguage}
-            onChange={(event) => setCustomLanguage(event.target.value)}
-          />
-          <button
-            className="button-quiet"
-            disabled={!validCustomLanguage}
-            onClick={() => {
-              requestLanguageChange(normalizedCustomLanguage);
-              setCustomLanguage("");
+        <div className="translation-toolbar">
+          <select
+            aria-label={lang === "zh" ? "目标语言" : "Target language"}
+            value={selected}
+            onChange={(event) => {
+              requestLanguageChange(event.target.value);
             }}
           >
-            {lang === "zh" ? "使用" : "Use"}
-          </button>
+            {languageOptions.map((code) => (
+              <option key={code} value={code}>{LANGUAGE_NAMES[code] || code}</option>
+            ))}
+          </select>
+          <div className="translation-custom-language">
+            <input
+              aria-label={lang === "zh" ? "自定义目标语言代码" : "Custom target language code"}
+              placeholder={lang === "zh" ? "其他语言，如 de-CH" : "Other, e.g. de-CH"}
+              value={customLanguage}
+              onChange={(event) => setCustomLanguage(event.target.value)}
+            />
+            <button
+              className="button-quiet"
+              disabled={!validCustomLanguage}
+              onClick={() => {
+                requestLanguageChange(normalizedCustomLanguage);
+                setCustomLanguage("");
+              }}
+            >
+              {lang === "zh" ? "使用" : "Use"}
+            </button>
+          </div>
+          <label className="translation-search">
+            <span className="sr-only">{lang === "zh" ? "搜索翻译" : "Search translation"}</span>
+            <input
+              placeholder={lang === "zh" ? "搜索原文或译文…" : "Search source or translation…"}
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          {configured ? (
+            <div className="translation-actions">
+              <button
+                className="button-primary"
+                disabled={busy
+                  || Boolean(otherTranslateTask)
+                  || Boolean(translateTask?.pending && !taskStopped)
+                  || (completed > 0 && needsUpdate === 0 && !taskStopped)}
+                title={primaryActionTitle}
+                onClick={() => onStart(selected, completed > 0)}
+              >
+                {primaryActionLabel}
+              </button>
+              {completed > 0 && !translateTask?.pending && !confirmRetranslate && (
+                <button
+                  className="translation-retranslate button-quiet"
+                  disabled={busy}
+                  onClick={() => setConfirmRetranslate(true)}
+                >
+                  {lang === "zh" ? "全部重译" : "Retranslate"}
+                </button>
+              )}
+            </div>
+          ) : (
+            <button className="button-quiet" onClick={onOpenSettings}>
+              {lang === "zh" ? "连接 Agent" : "Connect Agent"}
+            </button>
+          )}
         </div>
-        <label className="translation-search">
-          <span className="sr-only">{lang === "zh" ? "搜索翻译" : "Search translation"}</span>
-          <input
-            placeholder={lang === "zh" ? "搜索原文或译文…" : "Search source or translation…"}
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
-        </label>
-        <div className="translation-progress">
-          <span>
-            {lang === "zh" ? "完成度" : "Coverage"}
-            <strong>{completed}/{sentences.length}</strong>
-          </span>
-          <progress max={Math.max(sentences.length, 1)} value={completed} />
+
+        <div className="translation-status">
+          <div className="translation-progress">
+            <span>
+              {lang === "zh" ? "完成度" : "Coverage"}
+              <strong>{completed}/{sentences.length}</strong>
+            </span>
+            <progress max={Math.max(sentences.length, 1)} value={completed} />
+          </div>
+          {translateTask && (
+            <div className="task-detail">
+              <strong>{taskStatusLabel}</strong>
+              <span>
+                {lang === "zh"
+                  ? `${translateTask.done}/${batchTotal} 批`
+                  : `${translateTask.done}/${batchTotal} batches`}
+                {translateTask.failed > 0 && ` · ${translateTask.failed} ${lang === "zh" ? "失败" : "failed"}`}
+              </span>
+              {liveActivity && <small className="task-live-activity">{liveActivity}</small>}
+              <progress
+                aria-label={lang === "zh" ? "翻译进度" : "Translation progress"}
+                max={Math.max(batchTotal, 1)}
+                value={translateTask.done}
+              />
+              {translateTask.pending > 0 && !taskStopped && (
+                <button
+                  className="button-quiet"
+                  disabled={busy}
+                  onClick={() => void onPause().catch(() => undefined)}
+                >
+                  {lang === "zh" ? "暂停" : "Pause"}
+                </button>
+              )}
+              {translateTask.lastError && (
+                <p className="task-error-detail">{translateTask.lastError}</p>
+              )}
+            </div>
+          )}
         </div>
+
+        {confirmRetranslate && (
+          <div className="translation-retranslate-confirm" role="alert">
+            <span>
+              {lang === "zh"
+                ? `确认覆盖并重新翻译全部 ${sentences.length} 条？`
+                : `Replace and retranslate all ${sentences.length} lines?`}
+            </span>
+            <button
+              className="button-quiet"
+              disabled={busy}
+              onClick={() => setConfirmRetranslate(false)}
+            >
+              {lang === "zh" ? "取消" : "Cancel"}
+            </button>
+            <button
+              className="button-danger"
+              disabled={busy}
+              onClick={() => {
+                setConfirmRetranslate(false);
+                void onStart(selected, false);
+              }}
+            >
+              {lang === "zh" ? "确认重译" : "Confirm"}
+            </button>
+          </div>
+        )}
+
         {dirtyIds.size > 0 && (
           <div className="translation-draft-actions" role="status">
             <span>
@@ -343,16 +456,17 @@ export function TranslationWorkspace({
               onClick={() => void saveAllDrafts().catch(() => undefined)}
             >
               {savingAll
-                ? (lang === "zh" ? "正在保存…" : "Saving…")
+                ? (lang === "zh" ? "保存中…" : "Saving…")
                 : (lang === "zh" ? "保存全部" : "Save all")}
             </button>
           </div>
         )}
+
         {pendingLanguage && (
           <div className="translation-language-confirm" role="alert">
             <span>
               {lang === "zh"
-                ? `切换到 ${LANGUAGE_NAMES[pendingLanguage] || pendingLanguage} 前，要如何处理未保存修改？`
+                ? `切换到 ${LANGUAGE_NAMES[pendingLanguage] || pendingLanguage} 前，如何处理未保存修改？`
                 : `Handle unsaved changes before switching to ${LANGUAGE_NAMES[pendingLanguage] || pendingLanguage}.`}
             </span>
             <button
@@ -367,7 +481,7 @@ export function TranslationWorkspace({
               disabled={savingAll}
               onClick={() => discardAndSwitchLanguage(pendingLanguage)}
             >
-              {lang === "zh" ? "放弃修改" : "Discard"}
+              {lang === "zh" ? "放弃" : "Discard"}
             </button>
             <button
               className="button-primary"
@@ -383,122 +497,24 @@ export function TranslationWorkspace({
             </button>
           </div>
         )}
-        {translateTask && (
-          <div className="task-detail">
-            <strong>{translateTask.pending > 0
-              ? taskStopped
-                ? (lang === "zh" ? "翻译已暂停" : "Translation paused")
-                : (lang === "zh" ? "正在后台翻译" : "Translating in background")
-              : translateTask.failed > 0
-                ? (lang === "zh" ? "部分任务失败" : "Some calls failed")
-                : (lang === "zh" ? "最近翻译完成" : "Latest translation complete")}
-            </strong>
-            <span>
-              {lang === "zh"
-                ? `已完成 ${translateTask.done} / ${batchTotal} 批`
-                : `${translateTask.done} / ${batchTotal} batches completed`}
-              {translateTask.failed > 0 && ` · ${translateTask.failed} ${lang === "zh" ? "失败" : "failed"}`}
-            </span>
-            {liveActivity && <small className="task-live-activity">{liveActivity}</small>}
-            <progress
-              aria-label={lang === "zh" ? "翻译进度" : "Translation progress"}
-              max={Math.max(batchTotal, 1)}
-              value={translateTask.done}
-            />
-            {translateTask.pending > 0 && !taskStopped && (
-              <button
-                className="button-quiet"
-                disabled={busy}
-                onClick={() => void onPause().catch(() => undefined)}
-              >
-                {lang === "zh" ? "暂停翻译" : "Pause translation"}
-              </button>
-            )}
-            {translateTask.lastError && (
-              <p className="task-error-detail">{translateTask.lastError}</p>
-            )}
-          </div>
-        )}
+
         {otherTranslateTask && (
           <div className="translation-task-conflict" role="alert">
             <span>
               {lang === "zh"
-                ? `${(otherTranslateTask.lang || "").toUpperCase()} 翻译仍有 ${otherTranslateTask.pending} 个批次未完成。处理完该任务后才能开始 ${selected.toUpperCase()}。`
-                : `${(otherTranslateTask.lang || "").toUpperCase()} still has ${otherTranslateTask.pending} unfinished batches. Finish it before starting ${selected.toUpperCase()}.`}
+                ? `${(otherTranslateTask.lang || "").toUpperCase()} 仍有 ${otherTranslateTask.pending} 批未完成，完成后才能开始 ${selected.toUpperCase()}。`
+                : `${(otherTranslateTask.lang || "").toUpperCase()} still has ${otherTranslateTask.pending} batches. Finish it before ${selected.toUpperCase()}.`}
             </span>
             <button
               className="button-quiet"
               onClick={() => requestLanguageChange(otherTranslateTask.lang || selected)}
             >
-              {lang === "zh" ? "切回该任务" : "Open that task"}
+              {lang === "zh" ? "切回" : "Open"}
             </button>
           </div>
         )}
-        {configured ? (
-          <div className="translation-actions">
-            <button
-              className="button-primary"
-              disabled={busy
-                || Boolean(otherTranslateTask)
-                || Boolean(translateTask?.pending && !taskStopped)
-                || (completed > 0 && needsUpdate === 0 && !taskStopped)}
-              onClick={() => onStart(selected, completed > 0)}
-            >
-              {otherTranslateTask
-                ? (lang === "zh" ? "其他语言任务待处理" : "Another language needs attention")
-                : translateTask?.pending && taskStopped
-                ? (lang === "zh" ? "继续翻译" : "Resume translation")
-                : translateTask?.pending
-                ? (lang === "zh" ? "翻译进行中…" : "Translation running…")
-                : completed > 0
-                  ? needsUpdate > 0
-                    ? (lang === "zh" ? `更新 ${needsUpdate} 条变化` : `Update ${needsUpdate} changed`)
-                    : (lang === "zh" ? "翻译已是最新" : "Translation is up to date")
-                  : (lang === "zh" ? "开始翻译" : "Start translation")}
-            </button>
-            <small>
-              {lang === "zh"
-                ? "按上下文批量请求；更新只发送缺失或源文有变化的字幕。"
-                : "Requests are context-aware batches. Update sends only missing or changed lines."}
-            </small>
-            {completed > 0 && !translateTask?.pending && (
-              confirmRetranslate ? (
-                <div className="translation-retranslate-confirm">
-                  <span>
-                    {lang === "zh"
-                      ? `确认覆盖并重新翻译全部 ${sentences.length} 条？`
-                      : `Replace and retranslate all ${sentences.length} lines?`}
-                  </span>
-                  <button
-                    className="button-quiet"
-                    disabled={busy}
-                    onClick={() => setConfirmRetranslate(false)}
-                  >
-                    {lang === "zh" ? "取消" : "Cancel"}
-                  </button>
-                  <button
-                    className="button-danger"
-                    disabled={busy}
-                    onClick={() => {
-                      setConfirmRetranslate(false);
-                      void onStart(selected, false);
-                    }}
-                  >
-                    {lang === "zh" ? "确认全部重译" : "Retranslate all"}
-                  </button>
-                </div>
-              ) : (
-                <button
-                  className="translation-retranslate button-quiet"
-                  disabled={busy}
-                  onClick={() => setConfirmRetranslate(true)}
-                >
-                  {lang === "zh" ? "重新翻译全部…" : "Retranslate all…"}
-                </button>
-              )
-            )}
-          </div>
-        ) : (
+
+        {!configured && (
           <div className="agent-setup-callout">
             <strong>{lang === "zh" ? "先连接 AI Agent" : "Connect an AI Agent first"}</strong>
             <p>
@@ -506,9 +522,6 @@ export function TranslationWorkspace({
                 ? "本地转写不需要 Agent；翻译需要在设置中填写服务地址和模型。"
                 : "Local transcription does not need an Agent. Translation needs an endpoint and model in Settings."}
             </p>
-            <button className="button-quiet" onClick={onOpenSettings}>
-              {lang === "zh" ? "打开设置" : "Open settings"}
-            </button>
           </div>
         )}
       </aside>
@@ -521,7 +534,7 @@ export function TranslationWorkspace({
         <VirtualList
           activeKey={activeSentence?.id}
           className="translation-virtual-list"
-          estimateHeight={118}
+          estimateHeight={96}
           followActive={!query}
           itemKey={translationRowKey}
           items={visibleSentences}

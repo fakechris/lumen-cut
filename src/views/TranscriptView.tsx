@@ -678,7 +678,7 @@ export function TranscriptView({
   const [compactTimelineViewport, setCompactTimelineViewport] = useState(
     () => window.matchMedia?.(COMPACT_TIMELINE_QUERY).matches ?? false,
   );
-  const [inspectorPercent, setInspectorPercent] = useState(46);
+  const [inspectorPercent, setInspectorPercent] = useState(50);
   const [resizingPanes, setResizingPanes] = useState(false);
   const [previewTranslationLanguage, setPreviewTranslationLanguage] = useState<string | null>(null);
   const previousPending = useRef(0);

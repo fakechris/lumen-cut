@@ -1,6 +1,6 @@
 [package]
 name = "lumen-cut"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 default-run = "lumen-cut"
 license = "AGPL-3.0-or-later"
