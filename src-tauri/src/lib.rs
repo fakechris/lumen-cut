@@ -56,6 +56,7 @@ pub fn run() {
             commands::pick_audio_file,
             commands::project_create,
             commands::project_show,
+            commands::project_pending_open_take,
             commands::project_list,
             commands::project_search,
             commands::project_set_star,

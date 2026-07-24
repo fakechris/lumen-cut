@@ -494,6 +494,60 @@ pub async fn project_show(pid: String, root: Option<PathBuf>) -> AppResult<Doc> 
     .await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopProjectOpenRequest {
+    pub pid: String,
+    pub path: String,
+    pub url: String,
+    pub queued_at: String,
+}
+
+fn desktop_pending_open_path() -> PathBuf {
+    crate::log_directory()
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".lumen-cut")
+        })
+        .join("pending-open.json")
+}
+
+/// Queue a project for the desktop app to open on next launch.
+/// Used by `lumen-cut-cli project open --desktop`.
+pub fn queue_desktop_project_open(pid: &str, path: &str) -> AppResult<()> {
+    let request = DesktopProjectOpenRequest {
+        pid: pid.to_string(),
+        path: path.to_string(),
+        url: format!("lumencut://project/{pid}"),
+        queued_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let path = desktop_pending_open_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::data::storage::write_json(&path, &request)
+}
+
+/// Consume a pending desktop open request (one-shot).
+#[tauri::command]
+pub async fn project_pending_open_take() -> AppResult<Option<DesktopProjectOpenRequest>> {
+    run_blocking("pending project open", || {
+        let path = desktop_pending_open_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let request: DesktopProjectOpenRequest =
+            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        let _ = std::fs::remove_file(&path);
+        Ok(Some(request))
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn project_list(root: Option<PathBuf>) -> AppResult<Vec<ProjectSummary>> {
     let root = resolve_project_root(root);

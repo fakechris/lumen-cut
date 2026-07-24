@@ -5733,10 +5733,20 @@ pre.out {
 }
 
 .editor-view {
+  /* Shared inspector density tokens — used by transcript/translate/style/subtitle/export */
   --control-h: 28px;
   --control-h-sm: 24px;
+  --control-h-lg: 32px;
   --inspector-pad-y: 10px;
   --inspector-pad-x: 12px;
+  --inspector-gap: 10px;
+  --inspector-section-gap: 14px;
+  --inspector-radius: 10px;
+  --inspector-label-size: 11px;
+  --inspector-body-size: 12px;
+  --inspector-title-size: 14px;
+  --inspector-meta-size: 10px;
+  --inspector-width: 50%;
   display: grid;
   grid-template-areas:
     "header header"
@@ -6320,8 +6330,83 @@ pre.out {
 }
 
 .editor-view .button-large {
-  min-height: 32px;
+  min-height: var(--control-h-lg);
   padding: 0 12px;
+}
+
+.editor-view .export-project-mode {
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--inspector-radius);
+  display: grid;
+  gap: 4px;
+  margin: 0 0 var(--inspector-section-gap);
+  padding: var(--inspector-pad-y) var(--inspector-pad-x);
+}
+
+.editor-view .export-project-mode p {
+  font-size: var(--inspector-body-size);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace,
+  .subtitle-layout,
+  .transcript-layout,
+  .export-layout,
+  .review-layout
+) {
+  gap: var(--inspector-gap);
+}
+
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace,
+  .export-layout,
+  .review-layout
+) h2,
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace,
+  .export-layout
+) h3 {
+  font-size: var(--inspector-title-size);
+}
+
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace,
+  .export-layout,
+  .review-layout
+) label > span,
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace
+) .field-label {
+  font-size: var(--inspector-label-size);
+}
+
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace,
+  .export-layout,
+  .review-layout
+) small,
+.editor-view :is(
+  .translation-workspace,
+  .style-workspace,
+  .properties-workspace,
+  .export-layout
+) .field-hint {
+  font-size: var(--inspector-meta-size);
 }
 
 .editor-view .eyebrow {

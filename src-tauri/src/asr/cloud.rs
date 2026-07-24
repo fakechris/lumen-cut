@@ -102,13 +102,31 @@ async fn transcribe_chunks(
     let mut all_words = Vec::new();
     let mut previous_text = String::new();
 
+    report_progress(
+        &on_progress,
+        started,
+        "preparing",
+        0,
+        total_chunks,
+        5,
+    );
+
     for index in 0..total_chunks {
         ensure_not_cancelled()?;
         let offset = f64::from(index) * CHUNK_SECONDS;
         let chunk_duration = (duration_seconds - offset).min(CHUNK_SECONDS);
+        let base = 10 + ((index * 80) / total_chunks.max(1)) as u8;
         let chunk_path = if total_chunks == 1 {
             wav.to_path_buf()
         } else {
+            report_progress(
+                &on_progress,
+                started,
+                "extracting",
+                index,
+                total_chunks,
+                base,
+            );
             let path = work_dir.join(format!("chunk-{index:05}.wav"));
             extract_chunk(wav, &path, offset, chunk_duration).await?;
             path
@@ -116,9 +134,10 @@ async fn transcribe_chunks(
         report_progress(
             &on_progress,
             started,
+            "uploading",
             index,
             total_chunks,
-            45 + ((index * 40) / total_chunks.max(1)) as u8,
+            base.saturating_add(4).min(90),
         );
         let response = upload_chunk(
             &client,
@@ -130,6 +149,14 @@ async fn transcribe_chunks(
         if total_chunks > 1 {
             let _ = tokio::fs::remove_file(&chunk_path).await;
         }
+        report_progress(
+            &on_progress,
+            started,
+            "transcribing",
+            index,
+            total_chunks,
+            base.saturating_add(10).min(92),
+        );
         let response = response?;
         if language_detected.is_none() {
             language_detected = response.language.filter(|value| !value.trim().is_empty());
@@ -160,18 +187,35 @@ async fn transcribe_chunks(
         report_progress(
             &on_progress,
             started,
+            "transcribing",
             index + 1,
             total_chunks,
-            45 + (((index + 1) * 40) / total_chunks.max(1)) as u8,
+            10 + (((index + 1) * 80) / total_chunks.max(1)) as u8,
         );
     }
 
+    report_progress(
+        &on_progress,
+        started,
+        "assembling",
+        total_chunks,
+        total_chunks,
+        95,
+    );
     let sentences = cue_sentences(all_words);
     if sentences.is_empty() {
         return Err(AppError::Schema(
             "cloud transcription returned no usable timed words".into(),
         ));
     }
+    report_progress(
+        &on_progress,
+        started,
+        "complete",
+        total_chunks,
+        total_chunks,
+        100,
+    );
     Ok(AsrOutV1 {
         schema_version: 1,
         language: config
@@ -448,13 +492,14 @@ fn is_cjk(character: char) -> bool {
 fn report_progress(
     callback: &Option<AsrProgressCallback>,
     started: Instant,
+    phase: &str,
     current: u32,
     total: u32,
     progress: u8,
 ) {
     if let Some(callback) = callback {
         callback(AsrProgress {
-            phase: "transcribing".into(),
+            phase: phase.into(),
             progress,
             current: Some(current),
             total: Some(total),

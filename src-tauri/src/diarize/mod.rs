@@ -17,8 +17,8 @@ use crate::error::{AppError, AppResult};
 use crate::proc;
 
 pub use assign::{
-    assign_speakers, match_paragraph, normalize_speaker_paragraphs, reliable_speaker_match,
-    SpeakerMatch,
+    assign_speakers, match_paragraph, normalize_speaker_paragraphs, proposals_from_segments,
+    reliable_speaker_match, SpeakerMatch,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

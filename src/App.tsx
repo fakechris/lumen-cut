@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { greet, projectList, projectMarkOpened } from "./api";
+import { greet, projectList, projectMarkOpened, projectPendingOpenTake } from "./api";
 import {
   FolderIcon,
   MoonIcon,
@@ -105,6 +105,32 @@ function initialTheme(): Theme {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
+/** Accept `#project=<pid>`, `#/project/<pid>`, or `lumencut://project/<pid>` in the hash. */
+function parseProjectDeepLink(hash: string): string | null {
+  const raw = hash.replace(/^#/, "").trim();
+  if (!raw) return null;
+  const asUrl = raw.startsWith("lumencut://")
+    ? raw
+    : raw.startsWith("project=")
+      ? `lumencut://project/${decodeURIComponent(raw.slice("project=".length))}`
+      : raw.startsWith("/project/")
+        ? `lumencut://project/${decodeURIComponent(raw.slice("/project/".length))}`
+        : raw.startsWith("project/")
+          ? `lumencut://project/${decodeURIComponent(raw.slice("project/".length))}`
+          : null;
+  if (!asUrl) return null;
+  try {
+    const url = new URL(asUrl);
+    if (url.protocol !== "lumencut:") return null;
+    const parts = url.pathname.replace(/^\/+/, "").split("/").filter(Boolean);
+    if (parts[0] !== "project" || !parts[1]) return null;
+    const pid = decodeURIComponent(parts[1]).trim();
+    return pid || null;
+  } catch {
+    return null;
+  }
+}
+
 function App() {
   const [view, setView] = useState<View>("projects");
   const [pid, setPid] = useState<string | null>(null);
@@ -128,8 +154,28 @@ function App() {
       .catch(() => setVersion("—"));
 
     void projectList()
-      .then((projects) => {
+      .then(async (projects) => {
         setRecentProjects(projects);
+        const openFromHash = parseProjectDeepLink(window.location.hash);
+        if (openFromHash && projects.some((project) => project.pid === openFromHash)) {
+          setPid(openFromHash);
+          setEditorMounted(true);
+          setView("transcript");
+          localStorage.setItem(LAST_PROJECT_KEY, openFromHash);
+          return;
+        }
+        try {
+          const pending = await projectPendingOpenTake();
+          if (pending?.pid && projects.some((project) => project.pid === pending.pid)) {
+            setPid(pending.pid);
+            setEditorMounted(true);
+            setView("transcript");
+            localStorage.setItem(LAST_PROJECT_KEY, pending.pid);
+            return;
+          }
+        } catch {
+          // Pending open is optional; fall through to last project.
+        }
         const previous = localStorage.getItem(LAST_PROJECT_KEY);
         if (!previous) return;
         const project = projects.find((candidate) => candidate.pid === previous);
@@ -256,7 +302,7 @@ function App() {
     });
   }, [pid]);
 
-  const openProject = (id: string) => {
+  const openProject = useCallback((id: string) => {
     setPid(id);
     setEditorMounted(true);
     localStorage.setItem(LAST_PROJECT_KEY, id);
@@ -273,7 +319,17 @@ function App() {
       .then(() => projectList())
       .then(setRecentProjects)
       .catch(() => undefined);
-  };
+  }, []);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const target = parseProjectDeepLink(window.location.hash);
+      if (!target) return;
+      openProject(target);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [openProject]);
 
   const projectDeleted = (id: string) => {
     setRecentProjects((projects) => projects.filter((project) => project.pid !== id));

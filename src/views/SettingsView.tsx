@@ -14,6 +14,10 @@ import {
 import { PipelineFreshness } from "../components/PipelineFreshness";
 import type { Lang } from "../i18n";
 import {
+  ASR_PROVIDER_PRESETS,
+  matchAsrProviderPreset,
+} from "../asrProviders";
+import {
   getLlmProvider,
   inferLlmProvider,
   LLM_PROVIDER_PRESETS,
@@ -35,12 +39,14 @@ const COPY = {
     asrEngine: "转写引擎",
     localEngine: "本机 MLX · 隐私优先",
     cloudEngine: "OpenAI Compatible · 云端",
+    cloudProvider: "云端转写服务商",
     cloudEndpoint: "转写服务地址",
     cloudModel: "转写模型",
     cloudKey: "转写 API Key",
     cloudReady: "云端转写已配置",
     cloudIncomplete: "请补全转写服务地址、模型和 API Key",
-    cloudPrivacy: "音频会从这台 Mac 直接上传到所选服务。长音频会按 10 分钟分片，任务可取消；服务必须返回真实词级时码。",
+    cloudPrivacy: "音频会从这台 Mac 直接上传到所选服务。长音频会按 10 分钟分片，进度分阶段显示，任务可取消；服务必须返回真实词级时码。",
+    cloudProviderPrompt: "选择服务商会自动填写地址和常用模型；其他兼容服务请选自定义。",
     storedSecret: "已保存；留空会继续使用原 Key",
     asrModel: "转写模型",
     aligner: "字词对齐模型",
@@ -109,12 +115,14 @@ const COPY = {
     asrEngine: "Transcription engine",
     localEngine: "Local MLX · privacy first",
     cloudEngine: "OpenAI Compatible · cloud",
+    cloudProvider: "Cloud transcription provider",
     cloudEndpoint: "Transcription endpoint",
     cloudModel: "Transcription model",
     cloudKey: "Transcription API key",
     cloudReady: "Cloud transcription is configured",
     cloudIncomplete: "Complete the transcription endpoint, model, and API key",
-    cloudPrivacy: "Audio is uploaded directly from this Mac to the selected service. Long audio is split into 10-minute chunks and remains cancellable; the service must return real word timestamps.",
+    cloudPrivacy: "Audio is uploaded directly from this Mac to the selected service. Long audio is split into 10-minute chunks with staged progress and remains cancellable; the service must return real word timestamps.",
+    cloudProviderPrompt: "Provider presets fill in the endpoint and a common model. Choose custom for any other OpenAI-compatible service.",
     storedSecret: "Already saved; leave blank to keep the existing key",
     asrModel: "Transcription model",
     aligner: "Word alignment model",
@@ -639,6 +647,36 @@ export function SettingsView({ lang }: Props) {
                 </div>
               </div>
               <label>
+                <span>{c.cloudProvider}</span>
+                <select
+                  aria-label={c.cloudProvider}
+                  value={matchAsrProviderPreset(settings.asrCloudEndpoint).id}
+                  onChange={(event) => {
+                    const preset = ASR_PROVIDER_PRESETS.find(
+                      (item) => item.id === event.target.value,
+                    );
+                    if (!preset) return;
+                    setSettings((current) => ({
+                      ...current,
+                      asrCloudEndpoint: preset.custom
+                        ? current.asrCloudEndpoint
+                        : preset.endpoint,
+                      asrCloudModel: preset.custom
+                        ? current.asrCloudModel
+                        : (preset.model || current.asrCloudModel),
+                    }));
+                    setCloudAsrModels(preset.models);
+                    setCloudAsrCatalogState(preset.models.length ? "loaded" : "idle");
+                    setCloudAsrCatalogMessage(null);
+                  }}
+                >
+                  {ASR_PROVIDER_PRESETS.map((preset) => (
+                    <option key={preset.id} value={preset.id}>{preset.label}</option>
+                  ))}
+                </select>
+                <small className="field-hint">{c.cloudProviderPrompt}</small>
+              </label>
+              <label>
                 <span>{c.cloudKey}</span>
                 <input
                   aria-label={c.cloudKey}
@@ -654,7 +692,7 @@ export function SettingsView({ lang }: Props) {
                 <div className="provider-model-input">
                   <input
                     aria-label={c.cloudModel}
-                    list={cloudAsrModels.length ? "asr-cloud-model-options" : undefined}
+                    list="asr-cloud-model-options"
                     value={settings.asrCloudModel}
                     onChange={(event) => update("asrCloudModel", event.target.value)}
                   />
@@ -669,15 +707,16 @@ export function SettingsView({ lang }: Props) {
                     {cloudAsrCatalogState === "loading" ? c.refreshingModels : c.refreshModels}
                   </button>
                 </div>
-                {cloudAsrModels.length ? (
-                  <datalist id="asr-cloud-model-options">
-                    {cloudAsrModels.map((model) => <option key={model} value={model} />)}
-                  </datalist>
-                ) : null}
+                <datalist id="asr-cloud-model-options">
+                  {Array.from(new Set([
+                    ...matchAsrProviderPreset(settings.asrCloudEndpoint).models,
+                    ...cloudAsrModels,
+                  ])).map((model) => <option key={model} value={model} />)}
+                </datalist>
                 <small className="field-hint">
                   {lang === "zh"
-                    ? "默认 whisper-1；当前必须支持 verbose_json 和 word timestamps，不能用推测时码代替。"
-                    : "Defaults to whisper-1. The model must support verbose_json word timestamps; inferred timing is never substituted."}
+                    ? "进度阶段：准备 → 切片 → 上传 → 转写 → 组装。模型必须支持 verbose_json 词级时码。"
+                    : "Progress stages: prepare → extract → upload → transcribe → assemble. The model must support verbose_json word timestamps."}
                 </small>
                 {cloudAsrCatalogMessage ? (
                   <small className={`field-hint model-catalog-message ${cloudAsrCatalogState}`} role={cloudAsrCatalogState === "error" ? "alert" : "status"}>
