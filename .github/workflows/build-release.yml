@@ -136,11 +136,16 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
-      - name: Build and package desktop release
+      - name: Build and package ad-hoc desktop release
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: pnpm release:local
+
+      - name: Build, sign, and notarize desktop release
+        if: startsWith(github.ref, 'refs/tags/')
         env:
-          APPLE_ID: ${{ startsWith(github.ref, 'refs/tags/') && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/') && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ startsWith(github.ref, 'refs/tags/') && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: pnpm release:local
 
       - name: Verify signed and notarized tag artifacts
