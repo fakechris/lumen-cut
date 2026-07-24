@@ -176,6 +176,10 @@ impl Code {
 
     /// Severity is based on delivery impact: corruption, missing data, and
     /// invalid boundaries fail; recoverable quality concerns warn.
+    ///
+    /// Caption **aim** / flash density are presentation quality and never
+    /// hard-block export. Only **hard capacity** (`TargetWidth` /
+    /// `SourceWidth`) remains a Fail for width.
     pub fn severity(self) -> Severity {
         match self {
             // fail — data corruption / missing / out-of-bounds (export gates)
@@ -197,9 +201,6 @@ impl Code {
             | Code::BrollOverlap
             | Code::SourceWidth
             | Code::TargetWidth
-            | Code::TargetFlash
-            | Code::TargetWidthAim
-            | Code::TargetFlashCompleteSentence
             | Code::TranslationBoundaryAuditUnavailable
             | Code::TranslationSeamProvenanceUnavailable
             | Code::ParagraphCrossesTranslation
@@ -207,7 +208,7 @@ impl Code {
             | Code::TranslationPinNotCueEnd
             | Code::PipelineFallback => Severity::Fail,
 
-            // warn — quality regressions, repairable
+            // warn — quality regressions, repairable (including soft fit / flash)
             Code::TranslationStampMissing
             | Code::TranslationStampExtra
             | Code::TranslationExtra
@@ -227,6 +228,9 @@ impl Code {
             | Code::TargetAtomicTermOverBudget
             | Code::TargetMergeableFragments
             | Code::TargetSplittableOverAim
+            | Code::TargetWidthAim
+            | Code::TargetFlash
+            | Code::TargetFlashCompleteSentence
             | Code::TargetTermSplit
             | Code::CleanupFillerZeroDuration
             | Code::CleanupFixedFillerResidual
@@ -2093,6 +2097,19 @@ mod tests {
         assert_eq!(report.by_code(Code::TargetWidth).len(), 1);
         assert_eq!(report.by_code(Code::TargetFlash).len(), 1);
         assert_eq!(report.by_code(Code::TargetFlashCompleteSentence).len(), 1);
+        assert_eq!(
+            report.by_code(Code::TargetWidth)[0].severity,
+            Severity::Fail
+        );
+        assert_eq!(
+            report.by_code(Code::TargetFlash)[0].severity,
+            Severity::Warn
+        );
+        assert_eq!(
+            report.by_code(Code::TargetFlashCompleteSentence)[0].severity,
+            Severity::Warn
+        );
+        assert_eq!(Code::TargetWidthAim.severity(), Severity::Warn);
     }
 
     #[test]
