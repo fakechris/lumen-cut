@@ -445,6 +445,15 @@ enum TaskCmd {
         /// Override compact-v4 one-line fit capacity (8..32).
         #[arg(long)]
         align_fit: Option<usize>,
+        /// Prefer local wrapping for ordinary over-fit align lines.
+        #[arg(long, default_value_t = false)]
+        align_local: bool,
+        /// Second-look policy after align rewrites: semantic|targeted|off.
+        #[arg(long, default_value = "semantic")]
+        second_look: String,
+        /// Skip automatic phase-2 align after translate.
+        #[arg(long, default_value_t = false)]
+        no_phase2: bool,
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
@@ -468,6 +477,12 @@ enum TaskCmd {
         groups: Vec<String>,
         #[arg(long)]
         align_fit: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        align_local: bool,
+        #[arg(long, default_value = "semantic")]
+        second_look: String,
+        #[arg(long, default_value_t = false)]
+        no_phase2: bool,
         #[arg(long, default_value = ".")]
         root: PathBuf,
         /// TCP port (0 = ephemeral).
@@ -863,6 +878,9 @@ async fn run_cli() -> AppResult<()> {
                 stale_only,
                 groups,
                 align_fit,
+                align_local,
+                second_look,
+                no_phase2,
                 root,
             } => {
                 let n = task_start(
@@ -872,6 +890,9 @@ async fn run_cli() -> AppResult<()> {
                     stale_only,
                     groups,
                     align_fit,
+                    align_local,
+                    &second_look,
+                    !no_phase2,
                     &root,
                 )
                 .await?;
@@ -925,6 +946,9 @@ async fn run_cli() -> AppResult<()> {
                 stale_only,
                 groups,
                 align_fit,
+                align_local,
+                second_look,
+                no_phase2,
                 root,
                 port,
                 hold,
@@ -936,6 +960,9 @@ async fn run_cli() -> AppResult<()> {
                     stale_only,
                     groups,
                     align_fit,
+                    align_local,
+                    &second_look,
+                    !no_phase2,
                     &root,
                     port,
                     hold,
@@ -1919,6 +1946,14 @@ struct TaskServeResult {
     held: bool,
 }
 
+fn parse_second_look(raw: &str) -> AppResult<lumen_cut::agent::task::SecondLookMode> {
+    lumen_cut::agent::task::SecondLookMode::parse(raw).ok_or_else(|| {
+        AppError::Schema(format!(
+            "invalid --second-look `{raw}` (expected semantic|targeted|off)"
+        ))
+    })
+}
+
 async fn task_serve(
     kind: &str,
     pid: &str,
@@ -1926,12 +1961,16 @@ async fn task_serve(
     stale_only: bool,
     groups: Vec<String>,
     align_fit: Option<usize>,
+    align_local: bool,
+    second_look: &str,
+    auto_phase2: bool,
     root: &Path,
     port: u16,
     hold: bool,
     json: bool,
 ) -> AppResult<TaskServeResult> {
     let dir = root.join(pid);
+    let second_look = parse_second_look(second_look)?;
     let task = if let Some(task) = lumen_cut::agent::task::load_recoverable_task(&dir, kind)? {
         task
     } else {
@@ -1943,6 +1982,9 @@ async fn task_serve(
                 stale_only,
                 groups,
                 align_fit,
+                align_local,
+                second_look,
+                auto_phase2,
             },
         )?
     };
@@ -2015,9 +2057,13 @@ async fn task_start(
     stale_only: bool,
     groups: Vec<String>,
     align_fit: Option<usize>,
+    align_local: bool,
+    second_look: &str,
+    auto_phase2: bool,
     root: &Path,
 ) -> AppResult<usize> {
     let dir = root.join(pid);
+    let second_look = parse_second_look(second_look)?;
     let task = if let Some(task) = lumen_cut::agent::task::load_recoverable_task(&dir, kind)? {
         task
     } else {
@@ -2029,6 +2075,9 @@ async fn task_start(
                 stale_only,
                 groups,
                 align_fit,
+                align_local,
+                second_look,
+                auto_phase2,
             },
         )?
     };
@@ -2513,8 +2562,19 @@ async fn run_auto(opts: AutoOptions<'_>) -> AppResult<AutoSummary> {
     if wants_polish || wants_translate || opts.rough_cut {
         report_cli_phase("enhancing", 92);
         if wants_polish {
-            let _ = task_start("polish", &pid_stem, None, false, Vec::new(), None, &out_dir)
-                .await?;
+            let _ = task_start(
+                "polish",
+                &pid_stem,
+                None,
+                false,
+                Vec::new(),
+                None,
+                false,
+                "semantic",
+                true,
+                &out_dir,
+            )
+            .await?;
             polished = true;
         }
         if let Some(target) = translate_lang {
@@ -2525,19 +2585,13 @@ async fn run_auto(opts: AutoOptions<'_>) -> AppResult<AutoSummary> {
                 opts.stale_only,
                 Vec::new(),
                 None,
-                &out_dir,
-            )
-            .await?;
-            let _ = task_start(
-                "align",
-                &pid_stem,
-                Some(target),
                 false,
-                Vec::new(),
-                opts.align_fit,
+                "semantic",
+                true,
                 &out_dir,
             )
             .await?;
+            // Phase-2 align is auto-chained inside translate when auto_phase2.
             translated = Some(target.to_string());
         }
         if opts.rough_cut {

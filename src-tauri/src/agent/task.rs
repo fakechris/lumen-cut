@@ -12,12 +12,33 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{Allocator, PendingCall};
 use crate::data::{ClipCuts, Cut, CutKind, Doc, TranslationGroup};
 use crate::error::{AppError, AppResult};
-use crate::pipeline::{
-    pack_for_requests, SentencePacket, DEFAULT_BUDGET, MAX_LINES_PER_REQUEST,
-    REQUEST_OVERHEAD_BUDGET,
-};
+use crate::pipeline::{pack_for_requests, SentencePacket, MAX_LINES_PER_REQUEST};
 
-const TRANSLATE_PAYLOAD_VERSION: u32 = 2;
+const TRANSLATE_PAYLOAD_VERSION: u32 = 3;
+
+/// Second-look policy after an align rewrite lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecondLookMode {
+    /// Re-check only mistranslation / omission rewrites (default).
+    #[default]
+    Semantic,
+    /// Re-check every rewrite.
+    Targeted,
+    /// Never schedule a second look.
+    Off,
+}
+
+impl SecondLookMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "semantic" => Some(Self::Semantic),
+            "targeted" => Some(Self::Targeted),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedCall {
@@ -48,11 +69,32 @@ pub fn set_task_state(task: &PreparedTask, state: &str, error: Option<&str>) -> 
     crate::data::storage::write_json(&path, &value)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TaskOptions {
     pub stale_only: bool,
     pub groups: Vec<String>,
     pub align_fit: Option<usize>,
+    /// Prefer local wrapping for ordinary over-fit lines; only hard problems
+    /// go to the agent.
+    pub align_local: bool,
+    /// After align rewrites, optionally re-check selected groups once.
+    pub second_look: SecondLookMode,
+    /// After translate finishes, automatically run phase-2 align on over-fit
+    /// groups (default true).
+    pub auto_phase2: bool,
+}
+
+impl Default for TaskOptions {
+    fn default() -> Self {
+        Self {
+            stale_only: false,
+            groups: Vec::new(),
+            align_fit: None,
+            align_local: false,
+            second_look: SecondLookMode::Semantic,
+            auto_phase2: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +113,17 @@ struct StoredTask {
     #[serde(default)]
     align_fit: Option<usize>,
     #[serde(default)]
+    align_local: bool,
+    #[serde(default)]
+    second_look: SecondLookMode,
+    #[serde(default = "default_auto_phase2")]
+    auto_phase2: bool,
+    #[serde(default)]
     payload_version: u32,
+}
+
+fn default_auto_phase2() -> bool {
+    true
 }
 
 fn stored_task_running() -> String {
@@ -145,12 +197,7 @@ struct TimedWord {
     speaker: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TimelinePayload {
-    media_duration: f64,
-    words: Vec<TimedWord>,
-}
+
 
 pub fn prepare_task(project_dir: &Path, kind: &str, lang: Option<&str>) -> AppResult<PreparedTask> {
     prepare_task_with_options(project_dir, kind, lang, false)
@@ -187,7 +234,7 @@ pub fn prepare_task_with_task_options(
             "task kind `{kind}` is not implemented; supported kinds: translate, align, polish, segment, repunct, chapters, cleanup, broll"
         )));
     }
-    let doc = Doc::load(project_dir)?;
+    let mut doc = Doc::load(project_dir)?;
     let locked_terms = load_locked_terms(project_dir);
     if kind == "cleanup" {
         let cuts_path = project_dir.join("cuts.json");
@@ -213,14 +260,22 @@ pub fn prepare_task_with_task_options(
         crate::data::storage::write(&ai_dir.join("contract.md"), body.as_bytes())?;
     }
 
+    // Align-local may mutate the doc (deterministic wraps) before agent calls.
     let payloads = match kind {
         "translate" => translate_payloads(&doc, lang, options.stale_only, &locked_terms)?,
-        "align" => align_payloads(&doc, lang, &options.groups, options.align_fit)?,
+        "align" => align_payloads(
+            &mut doc,
+            project_dir,
+            lang,
+            &options.groups,
+            options.align_fit,
+            options.align_local,
+        )?,
         "polish" => polish_payloads(&doc)?,
         "segment" => vec![segment_payload(&doc)],
         "repunct" => vec![repunct_payload(&doc)],
         "chapters" => vec![chapters_payload(&doc)],
-        "cleanup" | "broll" => vec![timeline_payload(&doc)?],
+        "cleanup" | "broll" => vec![timeline_payload(project_dir, &doc)?],
         _ => unreachable!(),
     };
     let run_id = uuid::Uuid::new_v4().simple().to_string();
@@ -238,6 +293,9 @@ pub fn prepare_task_with_task_options(
             "staleOnly": options.stale_only,
             "groups": &options.groups,
             "alignFit": options.align_fit,
+            "alignLocal": options.align_local,
+            "secondLook": options.second_look,
+            "autoPhase2": options.auto_phase2,
             "payloadVersion": task_payload_version(kind),
             "calls": payloads.len(),
             "startedAt": started_at,
@@ -279,6 +337,9 @@ pub fn prepare_task_with_task_options(
             "staleOnly": options.stale_only,
             "groups": &options.groups,
             "alignFit": options.align_fit,
+            "alignLocal": options.align_local,
+            "secondLook": options.second_look,
+            "autoPhase2": options.auto_phase2,
             "payloadVersion": task_payload_version(kind),
             "calls": calls.len(),
             "startedAt": started_at,
@@ -321,6 +382,9 @@ pub fn load_recoverable_task(project_dir: &Path, kind: &str) -> AppResult<Option
                 stale_only: true,
                 groups: stored.groups,
                 align_fit: stored.align_fit,
+                align_local: stored.align_local,
+                second_look: stored.second_look,
+                auto_phase2: stored.auto_phase2,
             },
         )
         .map(Some);
@@ -337,6 +401,9 @@ pub fn load_recoverable_task(project_dir: &Path, kind: &str) -> AppResult<Option
                 stale_only: stored.stale_only,
                 groups: stored.groups,
                 align_fit: stored.align_fit,
+                align_local: stored.align_local,
+                second_look: stored.second_look,
+                auto_phase2: stored.auto_phase2,
             },
         )
         .map(Some);
@@ -500,6 +567,9 @@ pub fn prepare_retry_task(project_dir: &Path, kind: &str) -> AppResult<PreparedT
             stale_only: stored.stale_only || kind == "translate",
             groups: stored.groups,
             align_fit: stored.align_fit,
+            align_local: stored.align_local,
+            second_look: stored.second_look,
+            auto_phase2: stored.auto_phase2,
         },
     )
 }
@@ -703,8 +773,8 @@ pub fn task_counts(project_dir: &Path) -> (usize, usize) {
     )
 }
 
-fn timeline_payload(doc: &Doc) -> AppResult<serde_json::Value> {
-    let words = doc
+fn timeline_payload(project_dir: &Path, doc: &Doc) -> AppResult<serde_json::Value> {
+    let words: Vec<TimedWord> = doc
         .paragraphs
         .iter()
         .flat_map(|paragraph| {
@@ -720,10 +790,69 @@ fn timeline_payload(doc: &Doc) -> AppResult<serde_json::Value> {
             })
         })
         .collect();
-    Ok(serde_json::to_value(TimelinePayload {
-        media_duration: doc.media.duration_seconds,
-        words,
-    })?)
+    // Display stream with pause markers and already-cut markers so agents
+    // can reason about cleanup without inventing spans.
+    let existing: ClipCuts = std::fs::read_to_string(project_dir.join("cuts.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    let word_index: HashMap<&str, usize> = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| (word.id.as_str(), index))
+        .collect();
+    for cut in &existing.cuts {
+        if let (Some(&a), Some(&b)) = (
+            word_index.get(cut.a_word.as_str()),
+            word_index.get(cut.b_word.as_str()),
+        ) {
+            for word in &words[a..=b] {
+                covered.insert(word.id.clone());
+            }
+        }
+    }
+    let mut display = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        if index > 0 {
+            let prev = &words[index - 1];
+            let gap = word.start - prev.end;
+            if gap >= 0.35 {
+                display.push(format!("·{gap:.1}s·"));
+            }
+        }
+        if covered.contains(&word.id) {
+            display.push(format!("{}:⌫{}⌫", word.id, word.text));
+        } else {
+            display.push(format!("{}:{}", word.id, word.text));
+        }
+    }
+    Ok(serde_json::json!({
+        "mediaDuration": doc.media.duration_seconds,
+        "words": words,
+        "display": display,
+    }))
+}
+
+fn load_task_second_look(ai_dir: &Path) -> SecondLookMode {
+    std::fs::read_to_string(ai_dir.join("task.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("secondLook")
+                .and_then(|mode| mode.as_str())
+                .and_then(SecondLookMode::parse)
+        })
+        .unwrap_or_default()
+}
+
+fn load_task_auto_phase2(ai_dir: &Path) -> bool {
+    std::fs::read_to_string(ai_dir.join("task.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("autoPhase2").and_then(|flag| flag.as_bool()))
+        .unwrap_or(true)
 }
 
 fn translate_payloads(
@@ -759,21 +888,21 @@ fn translate_payloads(
         })
         .cloned()
         .collect();
+    // Display fit is per-line maxChars (hard aim×1.4). Request packing stays
+    // order-preserving and is capped by line count so context windows remain
+    // bounded — never reverse-sort by length (token FFD).
     let max_chars = crate::pipeline::translate::hard_chars_for_lang(lang);
     let positions: HashMap<&str, usize> = all_packets
         .iter()
         .enumerate()
         .map(|(index, sentence)| (sentence.sentence_id.as_str(), index))
         .collect();
-    let request_budget = DEFAULT_BUDGET.saturating_sub(REQUEST_OVERHEAD_BUDGET);
+    // Large budget so the line-count cap dominates packing (character fit is
+    // enforced on each TranslateLine.maxChars, not by request batching).
+    let request_budget = u32::MAX / 4;
     pack_for_requests(packets, request_budget, MAX_LINES_PER_REQUEST, lang)
         .into_iter()
         .map(|batch| {
-            if batch.estimated_tokens > request_budget {
-                return Err(AppError::Schema(
-                    "a source subtitle is too large for one translation request".into(),
-                ));
-            }
             let first = batch
                 .sentences
                 .first()
@@ -908,30 +1037,63 @@ fn target_with_seams(text: &str) -> String {
 }
 
 fn align_payloads(
-    doc: &Doc,
+    doc: &mut Doc,
+    project_dir: &Path,
     lang: Option<&str>,
     groups: &[String],
     align_fit: Option<usize>,
+    align_local: bool,
 ) -> AppResult<Vec<serde_json::Value>> {
     let lang = lang
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Schema("align requires a target language".into()))?;
+    let fit = align_fit
+        .unwrap_or_else(|| crate::pipeline::translate::aim_chars_for_lang(lang))
+        .clamp(8, 32);
+    let hard = crate::pipeline::translate::hard_chars_for_lang(lang) as f64;
+    let requested: BTreeSet<&str> = groups.iter().map(String::as_str).collect();
+    {
+        let translations = doc
+            .translations
+            .get(lang)
+            .ok_or_else(|| AppError::Schema(format!("no `{lang}` translations to align")))?;
+        for id in &requested {
+            if !translations.contains_key(*id) {
+                return Err(AppError::Schema(format!(
+                    "align group `{id}` does not exist in `{lang}`"
+                )));
+            }
+        }
+    }
+
+    // Align-local: wrap ordinary over-fit lines deterministically (no agent).
+    let mut local_changed = false;
+    if align_local {
+        if let Some(translations) = doc.translations.get_mut(lang) {
+            for (id, group) in translations.iter_mut() {
+                if !requested.is_empty() && !requested.contains(id.as_str()) {
+                    continue;
+                }
+                let cells = projected_cells(&group.text);
+                if cells > fit as f64 && cells <= hard {
+                    let wrapped = wrap_to_aim(&group.text, fit);
+                    if wrapped != group.text {
+                        group.text = wrapped;
+                        local_changed = true;
+                    }
+                }
+            }
+        }
+        if local_changed {
+            doc.meta.updated_at = chrono::Utc::now();
+            doc.save(project_dir)?;
+        }
+    }
+
     let translations = doc
         .translations
         .get(lang)
         .ok_or_else(|| AppError::Schema(format!("no `{lang}` translations to align")))?;
-    let fit = align_fit
-        .unwrap_or_else(|| crate::pipeline::translate::aim_chars_for_lang(lang))
-        .clamp(8, 32);
-    let requested: BTreeSet<&str> = groups.iter().map(String::as_str).collect();
-    for id in &requested {
-        if !translations.contains_key(*id) {
-            return Err(AppError::Schema(format!(
-                "align group `{id}` does not exist in `{lang}`"
-            )));
-        }
-    }
-
     let word_times: std::collections::BTreeMap<&str, (f64, f64)> = doc
         .all_words()
         .into_iter()
@@ -945,6 +1107,14 @@ fn align_payloads(
         {
             continue;
         }
+        // With align-local, ordinary over-fit was already wrapped; only hard
+        // residual problems still go to the agent.
+        if align_local && cells <= hard && cells <= fit as f64 {
+            continue;
+        }
+        if align_local && cells <= hard {
+            continue;
+        }
         if group.source_words.is_empty() {
             return Err(AppError::Schema(format!(
                 "align group `{id}` has no source-word provenance"
@@ -954,7 +1124,7 @@ fn align_payloads(
         if cells > fit as f64 {
             problems.push("overFit");
         }
-        if cells > 20.0 {
+        if cells > hard {
             problems.push("overHard");
         }
         let mut advisory = Vec::new();
@@ -991,6 +1161,43 @@ fn align_payloads(
         "budgets": {"s": 60, "t": 14, "f": fit},
         "pairs": pairs,
     })])
+}
+
+/// Deterministic wrap used by `--align-local` for ordinary over-fit lines.
+fn wrap_to_aim(text: &str, aim: usize) -> String {
+    let aim = aim.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_cells = 0.0;
+    let push_char = |ch: char, current: &mut String, current_cells: &mut f64, lines: &mut Vec<String>| {
+        let cost = if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            0.0
+        } else if ch.is_ascii() {
+            0.5
+        } else {
+            1.0
+        };
+        if *current_cells + cost > aim as f64 && !current.is_empty() {
+            lines.push(std::mem::take(current));
+            *current_cells = 0.0;
+        }
+        current.push(ch);
+        *current_cells += cost;
+    };
+    for ch in text.chars() {
+        if ch == '\n' {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_cells = 0.0;
+            }
+            continue;
+        }
+        push_char(ch, &mut current, &mut current_cells, &mut lines);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines.join("\n")
 }
 
 fn polish_payloads(doc: &Doc) -> AppResult<Vec<serde_json::Value>> {
@@ -1641,6 +1848,24 @@ fn validate_cleanup(
         }
         occupied.push((a_word.index, b_word.index));
     }
+    // Soft warn only: over-cleaning is accepted (not a hard reject).
+    let media = payload["mediaDuration"].as_f64().unwrap_or(0.0).max(0.001);
+    let mut cut_secs = 0.0;
+    for cut in cuts {
+        let a = cut["a"].as_str().unwrap_or_default();
+        let b = cut["b"].as_str().unwrap_or_default();
+        if let (Some(a_word), Some(b_word)) = (words.get(a), words.get(b)) {
+            cut_secs += (b_word.end - a_word.start).max(0.0);
+        }
+    }
+    if cut_secs / media > 0.40 {
+        tracing::warn!(
+            cut_secs,
+            media,
+            ratio = cut_secs / media,
+            "cleanup answer removes more than 40% of media duration"
+        );
+    }
     Ok(())
 }
 
@@ -2122,11 +2347,42 @@ async fn wait_and_apply_translation(
         }
     }
 
-    if errors.is_empty() {
-        Ok(applied)
-    } else {
-        Err(AppError::Schema(errors.join("; ")))
+    if !errors.is_empty() {
+        return Err(AppError::Schema(errors.join("; ")));
     }
+
+    // Phase-2: after whole-sentence translation, align over-fit lines.
+    let mut total = applied;
+    if load_task_auto_phase2(&task.ai_dir) {
+        if let Some(lang) = task.lang.clone() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if !remaining.is_zero() {
+                let phase2 = prepare_task_with_task_options(
+                    &task.project_dir,
+                    "align",
+                    Some(lang.as_str()),
+                    TaskOptions {
+                        align_local: true,
+                        auto_phase2: false,
+                        second_look: load_task_second_look(&task.ai_dir),
+                        ..Default::default()
+                    },
+                )?;
+                if !phase2.calls.is_empty() {
+                    let phase2_applied = Box::pin(wait_and_apply_inner(
+                        allocator,
+                        phase2,
+                        remaining,
+                        project_mutation,
+                        pause,
+                    ))
+                    .await?;
+                    total += phase2_applied;
+                }
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Rebuild the active run's analysis evidence in call order, regardless of
@@ -2453,32 +2709,80 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
             let changes = answer["pairs"]
                 .as_array()
                 .ok_or_else(|| AppError::Schema("missing align pairs".into()))?;
-            let target = doc
-                .translations
-                .get_mut(lang)
-                .ok_or_else(|| AppError::Schema(format!("no `{lang}` translations to align")))?;
+            let mut second_look_groups: Vec<String> = Vec::new();
+            let second_look = load_task_second_look(&task.ai_dir);
+            {
+                let target = doc.translations.get_mut(lang).ok_or_else(|| {
+                    AppError::Schema(format!("no `{lang}` translations to align"))
+                })?;
+                for change in changes {
+                    let id = change["id"]
+                        .as_str()
+                        .ok_or_else(|| AppError::Schema("align change missing id".into()))?;
+                    let group = target
+                        .get_mut(id)
+                        .ok_or_else(|| AppError::Schema(format!("unknown align group `{id}`")))?;
+                    match change["action"].as_str() {
+                        Some("rewrite") => {
+                            group.text = change["pieces"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|piece| piece["t"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let reason = change["reasonCode"].as_str().unwrap_or_default();
+                            let needs_second = match second_look {
+                                SecondLookMode::Off => false,
+                                SecondLookMode::Semantic => {
+                                    matches!(reason, "mistranslation" | "omission")
+                                }
+                                SecondLookMode::Targeted => true,
+                            };
+                            if needs_second {
+                                second_look_groups.push(id.to_string());
+                            }
+                        }
+                        Some("recut") => {
+                            // Boundary-only: keep text, persist provenance via
+                            // the rebind artifact below (cuts feed seams).
+                        }
+                        other => {
+                            return Err(AppError::Schema(format!(
+                                "unsupported align action `{other:?}`"
+                            )));
+                        }
+                    }
+                }
+            }
+            let mut artifact = crate::pipeline::TranslateRebindArtifact::from_doc(&doc, lang);
             for change in changes {
-                if change["action"].as_str() != Some("rewrite") {
+                if change["action"].as_str() != Some("recut") {
                     continue;
                 }
-                let id = change["id"]
-                    .as_str()
-                    .ok_or_else(|| AppError::Schema("align change missing id".into()))?;
-                let group = target
-                    .get_mut(id)
-                    .ok_or_else(|| AppError::Schema(format!("unknown align group `{id}`")))?;
-                group.text = change["pieces"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|piece| piece["t"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let id = change["id"].as_str().unwrap_or_default();
+                if let Some(seam) = artifact.seams.iter_mut().find(|seam| seam.group_key == id) {
+                    if let Some(last_cut) = change["cuts"]
+                        .as_array()
+                        .and_then(|cuts| cuts.last())
+                        .and_then(|cut| cut["s"].as_str())
+                    {
+                        seam.final_end_id = last_cut.to_string();
+                        seam.displacement_words = seam.aligned_end_id != seam.final_end_id;
+                        seam.origin = Some("recut".into());
+                    }
+                }
             }
-            let changed = changes.len();
-            crate::pipeline::TranslateRebindArtifact::from_doc(&doc, lang)
-                .save(&task.project_dir.join("ai").join("align-artifact.json"))?;
-            changed
+            artifact.save(&task.project_dir.join("ai").join("align-artifact.json"))?;
+            if !second_look_groups.is_empty()
+                && !task.ai_dir.join("second-look-done").exists()
+            {
+                crate::data::storage::write_json(
+                    &task.ai_dir.join("second-look-pending.json"),
+                    &serde_json::json!({ "groups": second_look_groups }),
+                )?;
+            }
+            changes.len()
         }
         "polish" => {
             let source_sentences: Vec<&serde_json::Value> = payload["paragraphs"]
@@ -3045,8 +3349,88 @@ mod tests {
                 &std::fs::read_to_string(ai_dir.join("task.json")).unwrap()
             )
             .unwrap()["payloadVersion"],
-            2
+            TRANSLATE_PAYLOAD_VERSION
         );
+    }
+
+    #[test]
+    fn align_local_wraps_ordinary_over_fit_without_agent_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doc = sample_doc();
+        // 24 CJK cells → over aim(16) but under hard(~22)? Use longer to force wrap
+        // but stay under hard after wrap. hard_chars for zh = round(16*1.4)=22.
+        // 20 cells wraps to two lines without needing agent.
+        let long = "一二三四五六七八九十一二三四五六七八九十"; // 20 cells
+        assert!(projected_cells(long) > 16.0 && projected_cells(long) <= 22.0);
+        doc.translations.insert(
+            "zh".into(),
+            [(
+                "s1".into(),
+                TranslationGroup {
+                    id: "s1".into(),
+                    text: long.into(),
+                    source_words: vec!["w0".into()],
+                    source_text: Some("hello".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        doc.save(tmp.path()).unwrap();
+        let task = prepare_task_with_task_options(
+            tmp.path(),
+            "align",
+            Some("zh"),
+            TaskOptions {
+                align_local: true,
+                auto_phase2: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            task.calls.is_empty(),
+            "ordinary over-fit should be wrapped locally"
+        );
+        let saved = Doc::load(tmp.path()).unwrap();
+        let text = &saved.translations["zh"]["s1"].text;
+        assert!(
+            text.contains('\n'),
+            "expected wrapped text, got {text}"
+        );
+    }
+
+    #[test]
+    fn align_apply_handles_recut_and_rewrite_contracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doc = sample_doc();
+        // Force agent path with over-hard text so prepare yields a call.
+        let over_hard = "一二三四五六七八九十一二三四五六七八九十一二三四五"; // 25 cells
+        assert!(projected_cells(over_hard) > 22.0);
+        doc.translations.insert(
+            "zh".into(),
+            [(
+                "s1".into(),
+                TranslationGroup {
+                    id: "s1".into(),
+                    text: over_hard.into(),
+                    source_words: vec!["w0".into()],
+                    source_text: Some("hello".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        doc.save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "align", Some("zh")).unwrap();
+        assert!(!task.calls.is_empty());
+        let rewrite = r#"{"pairs":[{"id":"s1","action":"rewrite","reasonCode":"mistranslation","reason":"fix","pieces":[{"through":"end","t":"更正译文"}]}]}"#;
+        assert!(validate_call_answer(&task.calls[0].call, rewrite).is_ok());
+        apply_answer(&task, &task.calls[0].call, rewrite).unwrap();
+        let saved = Doc::load(tmp.path()).unwrap();
+        assert_eq!(saved.translations["zh"]["s1"].text, "更正译文");
+        assert!(tmp.path().join("ai/align/second-look-pending.json").exists());
+        assert!(tmp.path().join("ai/align-artifact.json").exists());
     }
 
     #[test]

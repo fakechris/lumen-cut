@@ -2204,6 +2204,7 @@ pub async fn task_start(
                     stale_only: args.stale_only,
                     groups: args.groups,
                     align_fit: args.align_fit,
+                    ..Default::default()
                 },
             )
         }
