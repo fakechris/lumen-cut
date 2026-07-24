@@ -30,6 +30,13 @@ function hexToAss(value: string) {
   return `&H00${clean.slice(4, 6)}${clean.slice(2, 4)}${clean.slice(0, 2)}`.toUpperCase();
 }
 
+function applyValues(
+  base: SubtitleStyle,
+  values: Partial<SubtitleStyle>,
+): SubtitleStyle {
+  return { ...base, ...values };
+}
+
 function isSubtitleStyle(value: unknown): value is SubtitleStyle {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const style = value as Record<string, unknown>;
@@ -152,6 +159,50 @@ const STYLE_PRESETS: Array<{
       outline: 2,
       shadow: 1,
       marginV: 72,
+    },
+  },
+  {
+    id: "karaoke-bold",
+    zh: "短视频加粗",
+    en: "Short-form bold",
+    descriptionZh: "大字号、厚描边，适合竖屏口播",
+    descriptionEn: "Large type with heavy outline for talking-head verticals",
+    values: {
+      name: "Short-form bold",
+      fontname: "PingFang SC",
+      fontsize: 64,
+      primaryColour: "&H00FFFFFF",
+      outlineColour: "&H00000000",
+      bold: true,
+      italic: false,
+      underline: false,
+      strikeOut: false,
+      alignment: 2,
+      outline: 4,
+      shadow: 0,
+      marginV: 100,
+    },
+  },
+  {
+    id: "soft-box",
+    zh: "柔和底衬",
+    en: "Soft box",
+    descriptionZh: "浅阴影、中等字号，适合访谈",
+    descriptionEn: "Soft shadow, medium size for interviews",
+    values: {
+      name: "Soft box",
+      fontname: "PingFang SC",
+      fontsize: 48,
+      primaryColour: "&H00F5F5F5",
+      outlineColour: "&H00282828",
+      bold: false,
+      italic: false,
+      underline: false,
+      strikeOut: false,
+      alignment: 2,
+      outline: 1,
+      shadow: 2,
+      marginV: 88,
     },
   },
 ];
@@ -357,19 +408,40 @@ export function StyleWorkspace({
           </small>}
         </div>
 
-        <div className="style-presets">
+        <div className="style-presets style-preset-gallery">
           <span>{lang === "zh" ? "快速样式" : "Quick styles"}</span>
-          <div>
-            {STYLE_PRESETS.map((preset) => (
-              <button
-                key={preset.id}
-                type="button"
-                onClick={() => applyPreset(preset.values)}
-              >
-                <strong>{lang === "zh" ? preset.zh : preset.en}</strong>
-                <small>{lang === "zh" ? preset.descriptionZh : preset.descriptionEn}</small>
-              </button>
-            ))}
+          <div className="style-preset-grid" role="list">
+            {STYLE_PRESETS.map((preset) => {
+              const sample = applyValues(draft, preset.values);
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  role="listitem"
+                  className="style-preset-card"
+                  onClick={() => applyPreset(preset.values)}
+                >
+                  <span
+                    className="style-preset-swatch"
+                    style={{
+                      color: assToHex(sample.primaryColour || "&H00FFFFFF"),
+                      textShadow: sample.shadow
+                        ? `0 ${sample.shadow}px ${sample.shadow + 1}px ${assToHex(sample.outlineColour || "&H00000000")}`
+                        : undefined,
+                      fontWeight: sample.bold ? 700 : 500,
+                      fontSize: Math.min(22, Math.max(14, (sample.fontsize || 48) / 3.2)),
+                      WebkitTextStroke: sample.outline
+                        ? `${Math.min(2, sample.outline / 2)}px ${assToHex(sample.outlineColour || "&H00000000")}`
+                        : undefined,
+                    }}
+                  >
+                    Aa 字幕
+                  </span>
+                  <strong>{lang === "zh" ? preset.zh : preset.en}</strong>
+                  <small>{lang === "zh" ? preset.descriptionZh : preset.descriptionEn}</small>
+                </button>
+              );
+            })}
           </div>
         </div>
 

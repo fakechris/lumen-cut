@@ -2506,7 +2506,7 @@ test("subtitle presets are applied before saving the project style", async () =>
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "样式" }));
-  fireEvent.click(screen.getByRole("button", { name: /创作者黄字/ }));
+  fireEvent.click(screen.getByText("创作者黄字").closest("button")!);
   const previewSubtitle = document.querySelector<HTMLElement>(".program-subtitle span");
   const previewPosition = document.querySelector<HTMLElement>(".program-subtitle");
   expect(previewSubtitle).toHaveStyle({
@@ -2520,7 +2520,7 @@ test("subtitle presets are applied before saving the project style", async () =>
 
   fireEvent.click(screen.getByRole("button", { name: "转写稿" }));
   fireEvent.click(screen.getByRole("button", { name: "样式" }));
-  expect(screen.getByRole("button", { name: /创作者黄字/ })).toBeVisible();
+  expect(screen.getByText("创作者黄字")).toBeVisible();
   expect(screen.getByText(/有未保存修改/)).toBeVisible();
   expect(document.querySelector<HTMLElement>(".program-subtitle span")).toHaveStyle({
     fontWeight: "700",
@@ -2578,7 +2578,7 @@ test("unsaved subtitle style previews survive an application restart", async () 
   const first = render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "样式" }));
-  fireEvent.click(screen.getByRole("button", { name: /创作者黄字/ }));
+  fireEvent.click(screen.getByText("创作者黄字").closest("button")!);
 
   await waitFor(() => expect(
     JSON.parse(localStorage.getItem("lumen-cut.styleDrafts.project-1") || "{}"),

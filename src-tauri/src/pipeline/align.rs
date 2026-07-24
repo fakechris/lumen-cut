@@ -296,6 +296,11 @@ pub struct FitFixReport {
     pub remaining_aim: usize,
 }
 
+/// Minimum display duration (seconds) for a caption group when we know
+/// source timing. Shorter groups are flagged by fit report consumers; wrap
+/// still prefers longer visual lines so CPS stays readable (Palmier uses 0.7s).
+pub const MIN_CAPTION_DISPLAY_SECONDS: f64 = 0.7;
+
 /// Deterministic Phase-2: wrap every over-fit translation group into short
 /// display lines. Does **not** re-translate; inserts line breaks at punctuation
 /// seams when possible, otherwise at the fit budget. Mutates `doc` in place.
@@ -304,6 +309,11 @@ pub fn auto_fit_translations(doc: &mut Doc, lang: &str, fit: Option<usize>) -> A
         .unwrap_or_else(|| crate::pipeline::translate::aim_chars_for_lang(lang))
         .clamp(8, 32);
     let hard = crate::pipeline::translate::hard_chars_for_lang(lang);
+    let word_times: std::collections::BTreeMap<String, (f64, f64)> = doc
+        .all_words()
+        .into_iter()
+        .map(|word| (word.id.clone(), (word.start, word.end)))
+        .collect();
     let Some(track) = doc.translations.get_mut(lang) else {
         return Err(AppError::Schema(format!("no `{lang}` translations to fit")));
     };
@@ -315,10 +325,31 @@ pub fn auto_fit_translations(doc: &mut Doc, lang: &str, fit: Option<usize>) -> A
         scanned += 1;
         let before = group.text.clone();
         let cells = max_line_cells(&before);
-        if cells <= fit as f64 {
+        let duration = group
+            .source_words
+            .first()
+            .and_then(|id| word_times.get(id))
+            .zip(group.source_words.last().and_then(|id| word_times.get(id)))
+            .map(|(first, last)| (last.1 - first.0).max(0.0))
+            .unwrap_or(0.0);
+        // Prefer slightly shorter lines when the cue is short, so CPS stays
+        // under the delivery flash threshold (~9 cells/s).
+        let line_fit = if duration > 0.0 && duration < MIN_CAPTION_DISPLAY_SECONDS * 2.0 {
+            fit.min(12)
+        } else {
+            fit
+        };
+        if cells <= line_fit as f64 && !before.contains('\n') {
+            if duration > 0.0
+                && duration < MIN_CAPTION_DISPLAY_SECONDS
+                && cells > 0.0
+                && cells / duration > 9.0
+            {
+                remaining_aim += 1;
+            }
             continue;
         }
-        let wrapped = wrap_display_lines(&before, fit, hard);
+        let wrapped = rebalance_display_lines(&wrap_display_lines(&before, line_fit, hard), hard);
         if wrapped != before {
             group.text = wrapped;
             fixed += 1;
@@ -342,6 +373,34 @@ pub fn auto_fit_translations(doc: &mut Doc, lang: &str, fit: Option<usize>) -> A
         remaining_hard,
         remaining_aim,
     })
+}
+
+/// Merge tiny trailing fragments into the previous line when they still fit hard.
+pub fn rebalance_display_lines(text: &str, hard: usize) -> String {
+    let hard = hard.max(1) as f64;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.len() < 2 {
+        return lines.join("\n");
+    }
+    let mut i = 1;
+    while i < lines.len() {
+        let prev_cells = target_cells(&lines[i - 1]);
+        let cur_cells = target_cells(&lines[i]);
+        // Very short second line (e.g. one particle) → pull back if under hard.
+        if cur_cells <= 4.0 && prev_cells + cur_cells <= hard {
+            let merged = format!("{}{}", lines[i - 1], lines[i]);
+            lines[i - 1] = merged;
+            lines.remove(i);
+            continue;
+        }
+        i += 1;
+    }
+    lines.join("\n")
 }
 
 /// Wrap one caption so each display line stays within `fit` cells when possible,
@@ -667,5 +726,13 @@ mod tests {
         let text = &source.translations["zh"]["g1"].text;
         assert!(max_line_cells(text) <= 16.0 || text.contains('\n'));
         assert!(max_line_cells(text) <= 22.0);
+    }
+
+    #[test]
+    fn rebalance_merges_tiny_trailing_fragments() {
+        let balanced = rebalance_display_lines("今天天气不错\n啊", 22);
+        assert_eq!(balanced, "今天天气不错啊");
+        let kept = rebalance_display_lines("一二三四五六七八九十一二三\n四五六七八", 16);
+        assert!(kept.contains('\n'));
     }
 }
