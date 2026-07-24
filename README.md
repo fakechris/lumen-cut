@@ -50,6 +50,16 @@ lumen-cut-cli export ./projects/talk --srt --start 10 --end 90 -o clip.srt
 lumen-cut-cli task serve translate talk --lang zh --root ./projects --port 0
 # Workers: GET http://127.0.0.1:<port>/agent/next
 #          POST http://127.0.0.1:<port>/agent/submit  { "lease_id", "answer": { "text": "..." } }
+
+# Speakers: assign / review proposal / apply
+lumen-cut-cli speakers ./projects/talk assign --speaker Host --paragraph 1
+lumen-cut-cli speakers ./projects/talk reidentify --review
+lumen-cut-cli speakers ./projects/talk proposals
+lumen-cut-cli speakers ./projects/talk apply
+
+# Resolve project path / deep-link URL (optional --desktop queues the desktop app)
+lumen-cut-cli project open talk --root ./projects
+# URL form: lumencut://project/talk  (desktop also accepts #project=talk)
 ```
 
 ## Requirements

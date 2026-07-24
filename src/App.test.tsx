@@ -637,6 +637,8 @@ beforeEach(() => {
         return 1;
       case "speaker_assign":
         return undefined;
+      case "project_pending_open_take":
+        return null;
       case "finish_check_pid":
         return finishCheckItems;
       case "export_preflight":

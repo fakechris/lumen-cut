@@ -6,10 +6,11 @@
 //! largest share of the paragraph's word-level timestamps; paragraphs with
 //! no overlap keep `speaker: None`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::data::speakers::SpeakerProposal;
 use crate::data::{Doc, Paragraph};
 
 use super::DiarSegment;
@@ -29,6 +30,93 @@ pub const MIN_SPEAKER_MARGIN: f64 = 0.15;
 
 pub fn reliable_speaker_match(coverage: f64, margin: f64) -> bool {
     coverage >= MIN_SPEAKER_COVERAGE && margin >= MIN_SPEAKER_MARGIN
+}
+
+/// Build non-destructive re-identification proposals from fresh segments.
+/// Preserves human names by greedily mapping new clusters onto current labels
+/// with the largest measured overlap (one-to-one).
+pub fn proposals_from_segments(
+    doc: &Doc,
+    segments: &[DiarSegment],
+) -> (Vec<SpeakerProposal>, usize) {
+    let mut unassigned = 0usize;
+    let matches = doc
+        .paragraphs
+        .iter()
+        .filter_map(|paragraph| {
+            let Some((start, end)) = paragraph_time_bounds(paragraph) else {
+                unassigned += 1;
+                return None;
+            };
+            let Some(matched) = match_paragraph(paragraph, segments) else {
+                unassigned += 1;
+                return None;
+            };
+            Some((paragraph, matched, start, end))
+        })
+        .collect::<Vec<_>>();
+
+    let mut scores = BTreeMap::<(String, String), f64>::new();
+    for (paragraph, matched, _, _) in &matches {
+        if let Some(current) = paragraph.speaker.as_ref() {
+            *scores
+                .entry((matched.speaker.clone(), current.clone()))
+                .or_default() += matched.covered_seconds;
+        }
+    }
+    let mut ranked = scores.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut cluster_names = HashMap::<String, String>::new();
+    let mut used_names = HashSet::<String>::new();
+    for ((cluster, current), _) in ranked {
+        if !cluster_names.contains_key(&cluster) && used_names.insert(current.clone()) {
+            cluster_names.insert(cluster, current);
+        }
+    }
+
+    let proposals = matches
+        .into_iter()
+        .map(|(paragraph, matched, start, end)| {
+            let cluster = matched.speaker;
+            SpeakerProposal {
+                paragraph_id: paragraph.id,
+                current: paragraph.speaker.clone(),
+                proposed: cluster_names
+                    .get(&cluster)
+                    .cloned()
+                    .unwrap_or_else(|| cluster.clone()),
+                cluster,
+                start,
+                end,
+                text: paragraph
+                    .sentences
+                    .iter()
+                    .map(|sentence| sentence.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                coverage: matched.coverage,
+                margin: matched.margin,
+            }
+        })
+        .collect();
+    (proposals, unassigned)
+}
+
+fn paragraph_time_bounds(paragraph: &Paragraph) -> Option<(f64, f64)> {
+    let words = paragraph
+        .sentences
+        .iter()
+        .flat_map(|sentence| sentence.words.iter())
+        .collect::<Vec<_>>();
+    let first = words.first()?;
+    let last = words.last()?;
+    Some((first.start, last.end))
 }
 
 /// Normalize transcript paragraphs to the granularity used by diarization:

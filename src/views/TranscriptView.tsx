@@ -205,6 +205,7 @@ const DEFAULT_VIDEO_EXPORT_SETTINGS: VideoExportSettings = {
 };
 const BROLL_DRAFTS_KEY_PREFIX = "lumen-cut.brollDrafts.";
 const STYLE_DRAFTS_KEY_PREFIX = "lumen-cut.styleDrafts.";
+const INSPECTOR_PERCENT_KEY = "lumen-cut.inspectorPercent";
 const COMPACT_TIMELINE_QUERY =
   "(max-height: 760px), (max-width: 860px) and (max-height: 820px)";
 type TimelinePreference = "auto" | "expanded" | "collapsed";
@@ -371,11 +372,13 @@ const COPY = {
     exportSubtitles: "导出字幕",
     exportVideo: "导出带字幕视频",
     exportFcp: "导出 Final Cut 工程",
-    exportHint: "先完成交付检查，再选择输出格式。文件会写入当前项目目录。",
+    exportHint: "项目模式只负责编辑。交付前请主动运行检查；仅转写完成不会自动导出。",
     exportCheckTitle: "交付检查",
     exportUnchecked: "尚未检查当前版本",
     exportReady: "当前版本可以交付",
     exportBlocked: "存在阻止正式交付的问题",
+    projectModeTitle: "项目模式",
+    projectModeHint: "转写完成即进入可编辑状态。finish-check 与导出是交付动作，不会在转写后自动运行。",
     draftOverride: "仍要导出草稿（我了解检查项不会自动修复）",
     revealExports: "在 Finder 中打开项目目录",
     videoExportHint: "视频渲染可能需要数分钟，会在后台运行，编辑窗口不会失去响应。",
@@ -431,11 +434,13 @@ const COPY = {
     exportSubtitles: "Export subtitles",
     exportVideo: "Export subtitled video",
     exportFcp: "Export Final Cut project",
-    exportHint: "Run the delivery check, then choose an output. Files are written to the current project folder.",
+    exportHint: "Project mode is for editing. Run the delivery check before export; transcription alone never auto-exports.",
     exportCheckTitle: "Delivery check",
     exportUnchecked: "The current version has not been checked",
     exportReady: "The current version is ready to deliver",
     exportBlocked: "Issues are blocking a production delivery",
+    projectModeTitle: "Project mode",
+    projectModeHint: "A finished transcript is edit-ready. Finish-check and export are explicit delivery actions and never run automatically after transcription.",
     draftOverride: "Export a draft anyway (I understand checks are not fixed automatically)",
     revealExports: "Open project folder in Finder",
     videoExportHint: "Video rendering can take several minutes. It runs in the background and the editor remains responsive.",
@@ -678,7 +683,16 @@ export function TranscriptView({
   const [compactTimelineViewport, setCompactTimelineViewport] = useState(
     () => window.matchMedia?.(COMPACT_TIMELINE_QUERY).matches ?? false,
   );
-  const [inspectorPercent, setInspectorPercent] = useState(50);
+  const [inspectorPercent, setInspectorPercent] = useState(() => {
+    try {
+      const raw = localStorage.getItem(INSPECTOR_PERCENT_KEY);
+      const parsed = raw ? Number(raw) : 50;
+      if (!Number.isFinite(parsed)) return 50;
+      return Math.min(58, Math.max(32, parsed));
+    } catch {
+      return 50;
+    }
+  });
   const [resizingPanes, setResizingPanes] = useState(false);
   const [previewTranslationLanguage, setPreviewTranslationLanguage] = useState<string | null>(null);
   const previousPending = useRef(0);
@@ -710,6 +724,14 @@ export function TranscriptView({
     query.addListener?.(update);
     return () => query.removeListener?.(update);
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(INSPECTOR_PERCENT_KEY, String(Math.round(inspectorPercent)));
+    } catch {
+      // Split preference is session-only when storage is unavailable.
+    }
+  }, [inspectorPercent]);
 
   useEffect(() => {
     if (!toolsMenuOpen) return;
@@ -2853,8 +2875,23 @@ export function TranscriptView({
             <li className={hasTranscript ? "current" : ""} aria-current={hasTranscript ? "step" : undefined}>
               <span>3</span>
               <div>
-                <strong>{lang === "zh" ? "编辑并导出" : "Edit & export"}</strong>
-                <small>{lang === "zh" ? "字幕、说话人、翻译与画面" : "Captions, speakers, translation, and visuals"}</small>
+                <strong>{lang === "zh" ? "编辑（项目模式）" : "Edit (project mode)"}</strong>
+                <small>
+                  {lang === "zh"
+                    ? "转写完成后即可编辑；不会自动导出"
+                    : "Edit-ready after transcription; export is never automatic"}
+                </small>
+              </div>
+            </li>
+            <li>
+              <span>4</span>
+              <div>
+                <strong>{lang === "zh" ? "交付检查并导出" : "Delivery check & export"}</strong>
+                <small>
+                  {lang === "zh"
+                    ? "在导出页主动运行 finish-check"
+                    : "Run finish-check on the export tab when ready"}
+                </small>
               </div>
             </li>
           </ol>
@@ -3143,6 +3180,10 @@ export function TranscriptView({
             <h2>{lang === "zh" ? "交付你的作品" : "Deliver your work"}</h2>
             <p>{c.exportHint}</p>
           </div>
+          <section className="export-project-mode" role="note">
+            <p className="eyebrow">{c.projectModeTitle}</p>
+            <p>{c.projectModeHint}</p>
+          </section>
           <section className={`export-preflight ${exportPreflightUpdating ? "checking" : exportReady ? "ready" : failedFinishItems.length > 0 || exportPreflightBlockers.length > 0 ? "blocked" : "unchecked"}`}>
             <header>
               <div>

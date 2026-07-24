@@ -107,6 +107,18 @@ export async function projectMarkOpened(pid: string): Promise<ProjectSummary> {
   return invoke("project_mark_opened", { pid, root: null });
 }
 
+export interface DesktopProjectOpenRequest {
+  pid: string;
+  path: string;
+  url: string;
+  queuedAt: string;
+}
+
+/** Consume a one-shot desktop open request queued by the CLI. */
+export async function projectPendingOpenTake(): Promise<DesktopProjectOpenRequest | null> {
+  return invoke("project_pending_open_take");
+}
+
 export async function projectThumbnail(pid: string): Promise<ProjectThumbnail> {
   return invoke("project_thumbnail", { pid, root: null });
 }

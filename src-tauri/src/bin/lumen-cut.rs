@@ -37,7 +37,8 @@ use lumen_cut::data::version::{
 use lumen_cut::data::ClipCuts;
 use lumen_cut::data::{Doc, MediaRef, Meta};
 use lumen_cut::diarize::{
-    assign_speakers, diarize_file_with_model_progress, DiarizeProgress, DiarizeProgressCallback,
+    assign_speakers, diarize_file_with_model_progress, proposals_from_segments, DiarizeProgress,
+    DiarizeProgressCallback,
 };
 use lumen_cut::error::{AppError, AppResult};
 use lumen_cut::export::{
@@ -415,6 +416,18 @@ enum ProjectCmd {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    /// Resolve a project path (and deep-link URL) for agents or the desktop app.
+    Open {
+        pid: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Reveal the project folder in the system file manager (macOS Finder).
+        #[arg(long, default_value_t = false)]
+        reveal: bool,
+        /// Queue the project for the desktop app to open on next launch.
+        #[arg(long, default_value_t = false)]
+        desktop: bool,
+    },
     /// List projects under `root`.
     List {
         #[arg(long, default_value = ".")]
@@ -604,6 +617,27 @@ enum SpeakersCmd {
         #[arg(long)]
         rerun: bool,
     },
+    /// Assign or clear a speaker on one paragraph, cue, or time range.
+    Assign {
+        /// Label to write. Omit with `--clear` to remove the label.
+        #[arg(long)]
+        speaker: Option<String>,
+        /// Clear the matched speaker label instead of writing a name.
+        #[arg(long, default_value_t = false)]
+        clear: bool,
+        /// Target a single paragraph id.
+        #[arg(long)]
+        paragraph: Option<u32>,
+        /// Target the paragraph that owns this cue/sentence id.
+        #[arg(long)]
+        cue: Option<String>,
+        /// Inclusive start of a media time range (seconds).
+        #[arg(long)]
+        start: Option<f64>,
+        /// Exclusive end of a media time range (seconds).
+        #[arg(long)]
+        end: Option<f64>,
+    },
     Rename {
         sid: String,
         name: String,
@@ -612,7 +646,23 @@ enum SpeakersCmd {
         from: String,
         into: String,
     },
-    Reidentify,
+    /// Re-run diarization. Default applies immediately; `--review` stores a proposal.
+    Reidentify {
+        /// Store a non-destructive proposal instead of writing labels.
+        #[arg(long, default_value_t = false)]
+        review: bool,
+    },
+    /// Show the stored re-identification proposal, if any.
+    Proposals,
+    /// Apply the stored re-identification proposal.
+    Apply {
+        /// Apply only rows where the proposed label differs (default).
+        #[arg(long, default_value_t = true)]
+        changed_only: bool,
+        /// Apply every proposal row, including unchanged labels.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -808,6 +858,21 @@ async fn run_cli() -> AppResult<()> {
             }
             ProjectCmd::Show { pid, root } => {
                 project_show(&pid, &root)?;
+            }
+            ProjectCmd::Open {
+                pid,
+                root,
+                reveal,
+                desktop,
+            } => {
+                let summary = project_open(&pid, &root, reveal, desktop)?;
+                emit!(
+                    json,
+                    &summary,
+                    "✓ project open {pid}: {} ({})",
+                    summary.path,
+                    summary.url
+                );
             }
             ProjectCmd::List { root } => {
                 let mut pids: Vec<String> = std::fs::read_dir(&root)
@@ -1359,18 +1424,143 @@ async fn run_cli() -> AppResult<()> {
                         view.path.display()
                     );
                 }
-                SpeakersCmd::Reidentify => {
-                    let (segments, assigned) = diarize_project(&dir).await?;
+                SpeakersCmd::Assign {
+                    speaker,
+                    clear,
+                    paragraph,
+                    cue,
+                    start,
+                    end,
+                } => {
+                    if clear && speaker.is_some() {
+                        return Err(AppError::Schema(
+                            "pass either --speaker or --clear, not both".into(),
+                        ));
+                    }
+                    if !clear && speaker.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                        return Err(AppError::Schema(
+                            "speakers assign requires --speaker NAME or --clear".into(),
+                        ));
+                    }
+                    let label = if clear { None } else { speaker.as_deref() };
+                    let selectors = usize::from(paragraph.is_some())
+                        + usize::from(cue.is_some())
+                        + usize::from(start.is_some() || end.is_some());
+                    if selectors != 1 {
+                        return Err(AppError::Schema(
+                            "speakers assign requires exactly one of --paragraph, --cue, or --start/--end"
+                                .into(),
+                        ));
+                    }
+                    let mut doc = Doc::load(&dir)?;
+                    let changed = if let Some(paragraph_id) = paragraph {
+                        if speakers::assign(&mut doc, paragraph_id, label) {
+                            1
+                        } else {
+                            return Err(AppError::Schema(format!(
+                                "paragraph {paragraph_id} was not found"
+                            )));
+                        }
+                    } else if let Some(cue_id) = cue {
+                        if speakers::assign_by_cue(&mut doc, &cue_id, label) {
+                            1
+                        } else {
+                            return Err(AppError::Schema(format!(
+                                "cue `{cue_id}` was not found"
+                            )));
+                        }
+                    } else {
+                        let (Some(range_start), Some(range_end)) = (start, end) else {
+                            return Err(AppError::Schema(
+                                "speakers assign --start requires --end".into(),
+                            ));
+                        };
+                        speakers::assign_by_range(&mut doc, range_start, range_end, label)
+                    };
+                    doc.save(&dir)?;
+                    let _ = speakers::clear_proposal(&dir)?;
                     emit!(
                         json,
-                        serde_json::json!({"pid": pid, "segments": segments, "assigned": assigned}),
-                        "✓ speakers re-run {pid}: segments={segments} speakers={assigned}"
+                        serde_json::json!({
+                            "pid": pid,
+                            "speaker": label,
+                            "changed": changed,
+                        }),
+                        "✓ speakers assign {pid}: {changed} paragraph(s)"
+                    );
+                }
+                SpeakersCmd::Reidentify { review } => {
+                    if review {
+                        let preview = diarize_project_review(&dir).await?;
+                        emit!(
+                            json,
+                            &preview,
+                            "✓ speakers reidentify --review {pid}: proposal={} changed={} unassigned={}",
+                            preview.id,
+                            preview.changed,
+                            preview.unassigned
+                        );
+                    } else {
+                        let (segments, assigned) = diarize_project(&dir).await?;
+                        let _ = speakers::clear_proposal(&dir)?;
+                        emit!(
+                            json,
+                            serde_json::json!({"pid": pid, "segments": segments, "assigned": assigned, "applied": true}),
+                            "✓ speakers re-run {pid}: segments={segments} speakers={assigned}"
+                        );
+                    }
+                }
+                SpeakersCmd::Proposals => {
+                    match speakers::load_proposal(&dir)? {
+                        Some(set) => {
+                            emit!(
+                                json,
+                                &set,
+                                "✓ speakers proposals {pid}: {} (changed={} unassigned={})",
+                                set.id,
+                                set.changed,
+                                set.unassigned
+                            );
+                        }
+                        None => {
+                            emit!(
+                                json,
+                                serde_json::json!({"pid": pid, "proposals": null}),
+                                "✓ speakers proposals {pid}: (none)"
+                            );
+                        }
+                    }
+                }
+                SpeakersCmd::Apply { changed_only, all } => {
+                    let set = speakers::load_proposal(&dir)?.ok_or_else(|| {
+                        AppError::Schema(
+                            "no stored speaker proposal; run `speakers reidentify --review` first"
+                                .into(),
+                        )
+                    })?;
+                    let use_changed_only = changed_only && !all;
+                    let mut doc = Doc::load(&dir)?;
+                    let applied =
+                        speakers::apply_proposals(&mut doc, &set.proposals, use_changed_only)?;
+                    doc.save(&dir)?;
+                    let _ = speakers::clear_proposal(&dir)?;
+                    emit!(
+                        json,
+                        serde_json::json!({
+                            "pid": pid,
+                            "proposalId": set.id,
+                            "applied": applied,
+                            "changedOnly": use_changed_only,
+                        }),
+                        "✓ speakers apply {pid}: {applied} paragraph(s) from {}",
+                        set.id
                     );
                 }
                 SpeakersCmd::Rename { sid, name } => {
                     let mut doc = Doc::load(&dir)?;
                     let n = speakers::rename(&mut doc, &sid, &name);
                     doc.save(&dir)?;
+                    let _ = speakers::clear_proposal(&dir)?;
                     emit!(
                         json,
                         serde_json::json!({"from": sid, "to": name, "changed": n}),
@@ -1381,6 +1571,7 @@ async fn run_cli() -> AppResult<()> {
                     let mut doc = Doc::load(&dir)?;
                     let n = speakers::merge(&mut doc, &from, &into);
                     doc.save(&dir)?;
+                    let _ = speakers::clear_proposal(&dir)?;
                     emit!(
                         json,
                         serde_json::json!({"from": from, "into": into, "changed": n}),
@@ -2420,6 +2611,93 @@ async fn diarize_project(dir: &Path) -> AppResult<(usize, usize)> {
     Ok((out.segments.len(), assigned))
 }
 
+/// Non-destructive re-identification: store a reviewable proposal without
+/// mutating paragraph speakers.
+async fn diarize_project_review(
+    dir: &Path,
+) -> AppResult<lumen_cut::data::speakers::SpeakerProposalSet> {
+    use lumen_cut::data::speakers::{self, SpeakerProposalSet};
+
+    let mut doc = Doc::load(dir)?;
+    lumen_cut::diarize::normalize_speaker_paragraphs(&mut doc);
+    let wav = locate_project_wav(dir)?;
+    if std::env::var_os("HF_TOKEN").is_none()
+        && std::env::var_os("HUGGING_FACE_HUB_TOKEN").is_none()
+    {
+        warn!("HF_TOKEN not set; gated pyannote models may require `hf auth login`");
+    }
+    let model = lumen_cut::data::modelconfig::load().diarize_model;
+    let out = diarize_file_with_model_progress(&wav, &model, Some(cli_diarize_progress())).await?;
+    let (proposals, unassigned) = proposals_from_segments(&doc, &out.segments);
+    let changed = proposals
+        .iter()
+        .filter(|proposal| proposal.current.as_deref() != Some(proposal.proposed.as_str()))
+        .count();
+    let set = SpeakerProposalSet {
+        id: format!("sp-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        segments: out.segments.len(),
+        changed,
+        unassigned,
+        proposals,
+    };
+    speakers::save_proposal(dir, &set)?;
+    Ok(set)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectOpenSummary {
+    pid: String,
+    path: String,
+    url: String,
+    queued_for_desktop: bool,
+    revealed: bool,
+}
+
+fn project_open(
+    pid: &str,
+    root: &Path,
+    reveal: bool,
+    desktop: bool,
+) -> AppResult<ProjectOpenSummary> {
+    let dir = root.join(pid);
+    if !dir.join("doc.json").exists() {
+        return Err(AppError::ProjectNotFound(dir));
+    }
+    let path = dir
+        .canonicalize()
+        .unwrap_or_else(|_| dir.clone())
+        .display()
+        .to_string();
+    let url = format!("lumencut://project/{pid}");
+    let mut revealed = false;
+    if reveal {
+        let status = std::process::Command::new("open")
+            .arg(&path)
+            .status()
+            .map_err(|error| AppError::Schema(format!("failed to reveal project: {error}")))?;
+        if !status.success() {
+            return Err(AppError::Schema(
+                "failed to reveal project in the file manager".into(),
+            ));
+        }
+        revealed = true;
+    }
+    let mut queued_for_desktop = false;
+    if desktop {
+        lumen_cut::commands::queue_desktop_project_open(pid, &path)?;
+        queued_for_desktop = true;
+    }
+    Ok(ProjectOpenSummary {
+        pid: pid.to_string(),
+        path,
+        url,
+        queued_for_desktop,
+        revealed,
+    })
+}
+
 /// `audio.wav` lives either inside the project dir or next to it (`lumen-cut
 /// auto` writes it into the out-dir, beside `<pid>/`). Missing audio is a
 /// clear error, not a panic.
@@ -3288,6 +3566,102 @@ mod tests {
                 assert!(add);
                 assert_eq!(words.as_deref(), Some("w1..w3"));
                 assert_eq!(note.as_deref(), Some("manual"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speakers_parses_assign_review_and_apply() {
+        let assign = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "speakers",
+            "demo",
+            "assign",
+            "--speaker",
+            "Host",
+            "--paragraph",
+            "2",
+        ])
+        .unwrap();
+        match assign.cmd {
+            Cmd::Speakers {
+                action:
+                    SpeakersCmd::Assign {
+                        speaker,
+                        clear,
+                        paragraph,
+                        cue,
+                        start,
+                        end,
+                    },
+                ..
+            } => {
+                assert_eq!(speaker.as_deref(), Some("Host"));
+                assert!(!clear);
+                assert_eq!(paragraph, Some(2));
+                assert!(cue.is_none());
+                assert!(start.is_none());
+                assert!(end.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let review = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "speakers",
+            "demo",
+            "reidentify",
+            "--review",
+        ])
+        .unwrap();
+        match review.cmd {
+            Cmd::Speakers {
+                action: SpeakersCmd::Reidentify { review },
+                ..
+            } => assert!(review),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let apply = Cli::try_parse_from(["lumen-cut-cli", "speakers", "demo", "apply", "--all"])
+            .unwrap();
+        match apply.cmd {
+            Cmd::Speakers {
+                action: SpeakersCmd::Apply { changed_only, all },
+                ..
+            } => {
+                assert!(changed_only);
+                assert!(all);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_open_parses_reveal_and_desktop_flags() {
+        let cli = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "project",
+            "open",
+            "demo",
+            "--root",
+            "/tmp/projects",
+            "--reveal",
+            "--desktop",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Project {
+                action:
+                    ProjectCmd::Open {
+                        pid,
+                        root,
+                        reveal,
+                        desktop,
+                    },
+            } => {
+                assert_eq!(pid, "demo");
+                assert_eq!(root, PathBuf::from("/tmp/projects"));
+                assert!(reveal);
+                assert!(desktop);
             }
             other => panic!("unexpected command: {other:?}"),
         }
