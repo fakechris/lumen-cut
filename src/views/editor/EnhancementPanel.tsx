@@ -15,33 +15,33 @@ interface Props {
 const TASKS = [
   {
     kind: "polish",
-    zh: ["轻度润色", "尽量保持原意，修正明显口误、重复和不自然表达。"],
-    en: ["Light polish", "Preserve meaning while fixing slips, repetition, and awkward phrasing."],
+    zh: ["让口播更顺", "改口误和重复，尽量不改原意。"],
+    en: ["Smooth the speech", "Fix slips and repetition without changing meaning."],
   },
   {
     kind: "repunct",
-    zh: ["修复标点与断句", "只调整标点和句子边界，不改写内容。"],
-    en: ["Repair punctuation", "Adjust punctuation and sentence boundaries without rewriting."],
+    zh: ["修好断句标点", "只动标点和句子边界。"],
+    en: ["Fix punctuation", "Boundaries only — no rewrites."],
   },
   {
     kind: "cleanup",
-    zh: ["清理口播", "识别填充词、重录片段和过长停顿，生成可恢复的建议切口。"],
-    en: ["Clean up speech", "Find fillers, retakes, and long pauses as reversible suggested cuts."],
+    zh: ["找出可剪的口癖", "填充词、重录、长停顿 → 可恢复切口。"],
+    en: ["Find speech to cut", "Fillers, retakes, long pauses as reversible cuts."],
   },
   {
     kind: "chapters",
-    zh: ["生成章节", "按主题为较长内容生成章节标题和起点。"],
-    en: ["Generate chapters", "Create chapter titles and starting points for longer content."],
+    zh: ["加章节标题", "按主题标出段落起点。"],
+    en: ["Add chapters", "Title the main sections by topic."],
   },
   {
     kind: "broll",
-    zh: ["B-roll 建议", "标记适合补充画面的片段；不会自动添加素材。"],
-    en: ["Suggest B-roll", "Mark moments that could use supporting visuals; no media is added automatically."],
+    zh: ["建议补画面", "标出适合 B-roll 的位置，不自动塞素材。"],
+    en: ["Suggest B-roll spots", "Mark moments only — nothing is inserted automatically."],
   },
   {
     kind: "align",
-    zh: ["优化翻译排版", "只处理字幕过长的翻译句，使其更适合单行显示。"],
-    en: ["Fit translated subtitles", "Review only translated cues that are too long for a single line."],
+    zh: ["拆开过长译文", "只处理超长翻译行，不重翻。"],
+    en: ["Split long translations", "Fit over-long lines only — no re-translation."],
   },
 ] as const;
 

@@ -3395,6 +3395,47 @@ export function TranscriptView({
 
       {activeTab === "review" && (
         <div className="review-layout">
+          <section className="review-starters" aria-label={lang === "zh" ? "常用操作" : "Starter actions"}>
+            <p className="eyebrow">{lang === "zh" ? "先从这里开始" : "Start here"}</p>
+            <div className="setup-quick-grid">
+              <button
+                type="button"
+                className="setup-quick-card"
+                disabled={operation !== null}
+                onClick={() => runSpeechCleanup("silence")}
+              >
+                <strong>{lang === "zh" ? "去掉静音" : "Remove silence"}</strong>
+                <small>{lang === "zh" ? "收紧停顿，一次可撤销" : "Tighten pauses in one undo"}</small>
+              </button>
+              <button
+                type="button"
+                className="setup-quick-card"
+                disabled={operation !== null}
+                onClick={() => runSpeechCleanup("fillers")}
+              >
+                <strong>{lang === "zh" ? "去掉嗯啊" : "Remove fillers"}</strong>
+                <small>{lang === "zh" ? "um / 呃 / 嗯" : "um / uh / 嗯"}</small>
+              </button>
+              <button
+                type="button"
+                className="setup-quick-card"
+                disabled={operation !== null}
+                onClick={scanCuts}
+              >
+                <strong>{lang === "zh" ? "扫描建议切口" : "Scan suggested cuts"}</strong>
+                <small>{lang === "zh" ? "填充词、重录、停顿" : "Fillers, retakes, pauses"}</small>
+              </button>
+              <button
+                type="button"
+                className="setup-quick-card"
+                disabled={operation !== null}
+                onClick={() => setActiveTab("export")}
+              >
+                <strong>{lang === "zh" ? "去导出" : "Go to export"}</strong>
+                <small>{lang === "zh" ? "交付检查与成片" : "Delivery check and render"}</small>
+              </button>
+            </div>
+          </section>
           <EnhancementPanel
             busy={operation !== null}
             configured={agentConfigured}
@@ -3468,7 +3509,8 @@ export function TranscriptView({
       )}
 
       {activeTab === "export" && (
-        <div className="export-layout">
+        <div className="export-layout export-layout-split">
+          <div className="export-pane export-pane-settings">
           <div className="export-intro">
             <p className="eyebrow">{c.export}</p>
             <h2>{lang === "zh" ? "交付你的作品" : "Deliver your work"}</h2>
@@ -3624,8 +3666,7 @@ export function TranscriptView({
               </label>
             )}
           </section>
-          <div className="export-actions">
-            <fieldset className="video-export-settings" disabled={isVideoExporting || operation !== null}>
+          <fieldset className="video-export-settings" disabled={isVideoExporting || operation !== null}>
               <legend>{lang === "zh" ? "视频交付规格" : "Video delivery settings"}</legend>
               <div className="video-export-settings-grid">
                 <label>
@@ -3849,6 +3890,19 @@ export function TranscriptView({
                   : ""}
               </p>
             </fieldset>
+          </div>
+          <div className="export-pane export-pane-queue">
+            <div className="export-queue-header">
+              <p className="eyebrow">{lang === "zh" ? "导出队列" : "Export queue"}</p>
+              <h3>{lang === "zh" ? "选择输出并开始" : "Choose outputs and start"}</h3>
+              {exportPreflightReport && (
+                <p className="export-queue-summary">
+                  {Math.round(exportPreflightReport.summary.durationSeconds)}s ·{" "}
+                  {exportPreflightReport.summary.estimatedMinMb}–{exportPreflightReport.summary.estimatedMaxMb} MB
+                </p>
+              )}
+            </div>
+            <div className="export-actions">
             <button
               className="export-action"
               disabled={operation !== null || !subtitleExportAllowed}
@@ -3955,6 +4009,7 @@ export function TranscriptView({
             >
               {c.revealExports}
             </button>
+          </div>
           </div>
         </div>
       )}
