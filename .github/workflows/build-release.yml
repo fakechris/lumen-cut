@@ -127,8 +127,8 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
         shell: bash
         run: |
-          brew list --versions ffmpeg >/dev/null 2>&1 || brew install ffmpeg
-          ffmpeg_bin="$(brew --prefix ffmpeg)/bin"
+          brew list --versions ffmpeg-full >/dev/null 2>&1 || brew install ffmpeg-full
+          ffmpeg_bin="$(brew --prefix ffmpeg-full)/bin"
           echo "$ffmpeg_bin" >> "$GITHUB_PATH"
           "$ffmpeg_bin/ffmpeg" -hide_banner -filters 2>&1 \
             | grep -Eq '(^|[[:space:]])ass[[:space:]]'
