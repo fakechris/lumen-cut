@@ -125,7 +125,13 @@ jobs:
       - name: Install native test dependencies
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
-        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+        shell: bash
+        run: |
+          brew list --versions ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+          ffmpeg_bin="$(brew --prefix ffmpeg)/bin"
+          echo "$ffmpeg_bin" >> "$GITHUB_PATH"
+          "$ffmpeg_bin/ffmpeg" -hide_banner -filters 2>&1 \
+            | grep -Eq '(^|[[:space:]])ass[[:space:]]'
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
