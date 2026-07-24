@@ -2144,7 +2144,7 @@ async fn launch_prepared_task(
         .await;
         let terminal_state = match &result {
             Ok(_) => "completed",
-            Err(error) if error.to_string().contains("paused after waiting") => "paused",
+            Err(error) if crate::agent::task::is_task_pause_error(error) => "paused",
             Err(_) => "failed",
         };
         let terminal_error = result.as_ref().err().map(ToString::to_string);

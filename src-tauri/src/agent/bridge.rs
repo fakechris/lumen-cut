@@ -219,14 +219,7 @@ impl AgentBridge {
         prompt: &str,
         call: &BridgeCall,
     ) -> Result<BridgeAnswer, BridgeError> {
-        let body = serde_json::json!({
-            "model": self.cfg.model,
-            "messages": [
-                { "role": "user", "content": prompt },
-            ],
-            "max_tokens": call.max_tokens,
-            "stream": true,
-        });
+        let body = self.openai_request_body(prompt, call);
         let mut req = self
             .client
             .post(&self.cfg.endpoint)
@@ -278,6 +271,39 @@ impl AgentBridge {
             prompt_tokens: 0,
             completion_tokens: 0,
         })
+    }
+
+    fn openai_request_body(&self, prompt: &str, call: &BridgeCall) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.cfg.model,
+            "messages": [
+                { "role": "user", "content": prompt },
+            ],
+            "max_tokens": call.max_tokens,
+            "stream": true,
+        });
+        let endpoint = self.cfg.endpoint.to_ascii_lowercase();
+        let is_minimax = endpoint.contains("minimax.io") || endpoint.contains("minimaxi.com");
+        if is_minimax {
+            let object = body
+                .as_object_mut()
+                .expect("OpenAI request body is always an object");
+            object.remove("max_tokens");
+            object.insert(
+                "max_completion_tokens".into(),
+                serde_json::json!(call.max_tokens),
+            );
+            object.insert("reasoning_split".into(), serde_json::json!(true));
+            if self
+                .cfg
+                .model
+                .to_ascii_lowercase()
+                .starts_with("minimax-m3")
+            {
+                object.insert("thinking".into(), serde_json::json!({ "type": "disabled" }));
+            }
+        }
+        body
     }
 
     async fn stream_anthropic(
@@ -378,5 +404,30 @@ mod tests {
         let line = drain_sse_line(&mut buf, idx);
         assert_eq!(line, "data: hello");
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn minimax_m3_structured_request_disables_thinking() {
+        let bridge = AgentBridge::new(BridgeConfig {
+            endpoint: "https://api.minimaxi.com/v1/chat/completions".into(),
+            api_key: None,
+            model: "MiniMax-M3".into(),
+            provider: Provider::OpenAi,
+            max_attempts: 3,
+        });
+        let body = bridge.openai_request_body(
+            "Return JSON",
+            &BridgeCall {
+                prompt: "Return JSON".into(),
+                system: None,
+                max_tokens: 4096,
+                validator_feedback: vec![],
+            },
+        );
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["reasoning_split"], true);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
     }
 }

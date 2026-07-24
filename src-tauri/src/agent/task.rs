@@ -17,6 +17,8 @@ use crate::pipeline::{
     REQUEST_OVERHEAD_BUDGET,
 };
 
+const TRANSLATE_PAYLOAD_VERSION: u32 = 2;
+
 #[derive(Debug, Clone)]
 pub struct PreparedCall {
     pub call: PendingCall,
@@ -68,10 +70,20 @@ struct StoredTask {
     groups: Vec<String>,
     #[serde(default)]
     align_fit: Option<usize>,
+    #[serde(default)]
+    payload_version: u32,
 }
 
 fn stored_task_running() -> String {
     "running".into()
+}
+
+fn task_payload_version(kind: &str) -> u32 {
+    if kind == "translate" {
+        TRANSLATE_PAYLOAD_VERSION
+    } else {
+        1
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +238,7 @@ pub fn prepare_task_with_task_options(
             "staleOnly": options.stale_only,
             "groups": &options.groups,
             "alignFit": options.align_fit,
+            "payloadVersion": task_payload_version(kind),
             "calls": payloads.len(),
             "startedAt": started_at,
         }),
@@ -266,6 +279,7 @@ pub fn prepare_task_with_task_options(
             "staleOnly": options.stale_only,
             "groups": &options.groups,
             "alignFit": options.align_fit,
+            "payloadVersion": task_payload_version(kind),
             "calls": calls.len(),
             "startedAt": started_at,
         }),
@@ -294,6 +308,22 @@ pub fn load_recoverable_task(project_dir: &Path, kind: &str) -> AppResult<Option
             "stored task kind `{}` does not match directory `{kind}`",
             stored.kind
         )));
+    }
+    if kind == "translate" && stored.payload_version != TRANSLATE_PAYLOAD_VERSION {
+        if let Some(run_id) = stored.run_id.as_deref() {
+            remove_task_run_files(&ai_dir, kind, run_id)?;
+        }
+        return prepare_task_with_task_options(
+            project_dir,
+            kind,
+            stored.lang.as_deref(),
+            TaskOptions {
+                stale_only: true,
+                groups: stored.groups,
+                align_fit: stored.align_fit,
+            },
+        )
+        .map(Some);
     }
     if stored.state == "preparing" {
         if let Some(run_id) = stored.run_id.as_deref() {
@@ -1091,7 +1121,8 @@ pub fn validate_call_answer(call: &PendingCall, answer: &str) -> Result<(), Vec<
 
 fn parse_answer_value(kind: &str, answer: &str) -> Result<serde_json::Value, Vec<String>> {
     if kind != "chapters" {
-        return serde_json::from_str(answer.trim()).map_err(|e| vec![format!("not JSON: {e}")]);
+        return serde_json::from_str(normalized_json_answer_text(answer))
+            .map_err(|e| vec![format!("not JSON: {e}")]);
     }
     let mut chapters = Vec::new();
     for (index, line) in answer
@@ -1110,6 +1141,23 @@ fn parse_answer_value(kind: &str, answer: &str) -> Result<serde_json::Value, Vec
         return Err(vec!["zero lines".into()]);
     }
     Ok(serde_json::json!({"chapters": chapters}))
+}
+
+pub(crate) fn normalized_json_answer_text(answer: &str) -> &str {
+    let trimmed = answer.trim();
+    let Some(fenced) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some(body) = fenced.strip_suffix("```") else {
+        return trimmed;
+    };
+    let body = body.trim();
+    let body = body
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("json"))
+        .map(|_| &body[4..])
+        .unwrap_or(body);
+    body.trim()
 }
 
 fn marker_ids(text: &str) -> Vec<&str> {
@@ -1805,6 +1853,16 @@ pub async fn wait_and_apply_with_lock_and_pause(
         Some(pause),
     )
     .await
+}
+
+pub fn is_task_pause_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Schema(message)
+            if message.starts_with("task ")
+                && (message.contains(" paused by user")
+                    || message.contains(" paused after waiting"))
+    )
 }
 
 async fn wait_and_apply_inner(
@@ -2895,6 +2953,18 @@ mod tests {
     }
 
     #[test]
+    fn translation_accepts_a_single_json_code_fence_from_compatible_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        let raw = r#"```json
+{"summary":"x","terms":[],"namedEntities":[],"translations":{"s1":"你好世界"}}
+```"#;
+
+        assert!(validate_call_answer(&task.calls[0].call, raw).is_ok());
+    }
+
+    #[test]
     fn translation_batches_large_projects_in_bounded_context_windows() {
         let tmp = tempfile::tempdir().unwrap();
         doc_with_sentences(800).save(tmp.path()).unwrap();
@@ -2914,6 +2984,83 @@ mod tests {
         assert_eq!(payloads[0]["contextAfter"].as_array().unwrap().len(), 3);
         assert_eq!(payloads[1]["contextBefore"].as_array().unwrap().len(), 3);
         assert_eq!(payloads[24]["contextAfter"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn legacy_single_line_translation_run_is_regenerated_as_context_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = doc_with_sentences(40);
+        doc.save(tmp.path()).unwrap();
+        let ai_dir = tmp.path().join("ai/translate");
+        for phase in ["pending", "submitted", "done", "failed"] {
+            std::fs::create_dir_all(ai_dir.join(phase)).unwrap();
+        }
+        let run_id = "legacy-single-line";
+        crate::data::storage::write_json(
+            &ai_dir.join("task.json"),
+            &serde_json::json!({
+                "kind": "translate",
+                "lang": "zh",
+                "state": "failed",
+                "runId": run_id,
+                "calls": 40,
+            }),
+        )
+        .unwrap();
+        for sentence in doc
+            .paragraphs
+            .iter()
+            .flat_map(|paragraph| paragraph.sentences.iter())
+        {
+            crate::data::storage::write_json(
+                &ai_dir
+                    .join("pending")
+                    .join(format!("translate-{run_id}-{}.json", sentence.id)),
+                &serde_json::json!({
+                    "lang": "zh",
+                    "lines": [{
+                        "id": sentence.id,
+                        "source": sentence.text,
+                        "maxChars": 22,
+                        "rt": [],
+                    }],
+                }),
+            )
+            .unwrap();
+        }
+
+        let task = load_matching_recoverable_task(tmp.path(), "translate", Some("zh"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(task.calls.len(), 2);
+        assert!(task.calls.iter().all(|call| {
+            let payload: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&call.pending_path).unwrap())
+                    .unwrap();
+            payload["lines"].as_array().unwrap().len() > 1
+        }));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(ai_dir.join("task.json")).unwrap()
+            )
+            .unwrap()["payloadVersion"],
+            2
+        );
+    }
+
+    #[test]
+    fn task_pause_errors_are_distinct_from_provider_failures() {
+        assert!(is_task_pause_error(&AppError::Schema(
+            "task translate paused by user; completed batches were saved".into()
+        )));
+        assert!(is_task_pause_error(&AppError::Schema(
+            "task translate paused after waiting for incomplete calls; completed batches were saved"
+                .into()
+        )));
+        assert!(!is_task_pause_error(&AppError::Schema(
+            "task call translate-1 failed: validation".into()
+        )));
     }
 
     #[tokio::test]
