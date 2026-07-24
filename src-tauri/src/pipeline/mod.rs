@@ -18,8 +18,8 @@ pub use broll::{
     BrollSuggestionsArtifact, StructuralProblem,
 };
 pub use cleanup::{
-    apply, apply_with, cut_from_hit, cut_from_hit_with, detect, detect_with, CleanupHit,
-    CleanupKind, DetectOptions,
+    apply, apply_kinds, apply_with, cut_from_hit, cut_from_hit_with, cuts_from_word_ids, detect,
+    detect_with, CleanupAggressiveness, CleanupHit, CleanupKind, DetectOptions,
 };
 pub use polish::apply_polish;
 pub use transcribe::re_transcribe;

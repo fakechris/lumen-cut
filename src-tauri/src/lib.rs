@@ -94,6 +94,8 @@ pub fn run() {
             commands::finish_check_pid,
             commands::translation_auto_fit,
             commands::cut_auto,
+            commands::cut_speech_cleanup,
+            commands::cut_words,
             commands::cut_manual,
             commands::cut_manual_many,
             commands::cut_restore,

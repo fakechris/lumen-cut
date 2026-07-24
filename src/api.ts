@@ -659,6 +659,25 @@ export async function cutAuto(pid: string): Promise<number> {
   return invoke("cut_auto", { pid, root: null });
 }
 
+/** One-click silence / filler cleanup. mode: silence | fillers | both */
+export async function cutSpeechCleanup(
+  pid: string,
+  mode: "silence" | "fillers" | "both",
+  aggressiveness: "tight" | "balanced" | "loose" = "balanced",
+): Promise<number> {
+  return invoke("cut_speech_cleanup", {
+    pid,
+    mode,
+    aggressiveness,
+    root: null,
+  });
+}
+
+/** Cut one or more transcript words (adjacent words merge into one cut). */
+export async function cutWords(pid: string, wordIds: string[]): Promise<number> {
+  return invoke("cut_words", { pid, wordIds, root: null });
+}
+
 export async function cutManual(pid: string, cueId: string): Promise<boolean> {
   return invoke("cut_manual", { pid, cueId, root: null });
 }

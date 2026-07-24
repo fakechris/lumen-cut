@@ -9,6 +9,13 @@ export interface TranscriptDraft {
   text: string;
 }
 
+export type TranscriptWord = {
+  id: string;
+  text: string;
+  start: number;
+  end: number;
+};
+
 interface Props {
   busy: boolean;
   currentTime: number;
@@ -19,18 +26,36 @@ interface Props {
   mode: "subtitle" | "transcript";
   nextCueById: Record<string, string>;
   rows: SubtitleRow[];
-  wordsByCue: Record<string, string[]>;
+  /** Timed words per cue. Strings are accepted for older call sites. */
+  wordsByCue: Record<string, TranscriptWord[] | string[]>;
+  /** Word ids already covered by soft-cuts (shown struck through). */
+  cutWordIds?: Set<string>;
   onMerge: (id1: string, id2: string) => Promise<void>;
   onDraftsChange: (update: (
     current: Record<string, TranscriptDraft>,
   ) => Record<string, TranscriptDraft>) => void;
   onReplace: (query: string, replacement: string) => Promise<number>;
+  /** Descript-style: remove selected words from the edited timeline. */
+  onRemoveWords?: (wordIds: string[]) => Promise<void>;
   onSave: (id: string, text: string) => Promise<void>;
   onSaveMany: (updates: Array<{ id: string; text: string }>) => Promise<void>;
   onSeek: (seconds: number, autoplay?: boolean) => void;
   onSplit: (id: string, at: number) => Promise<void>;
   onTiming: (id: string, start: number, end: number) => Promise<void>;
   onVisibility: (id: string, hidden: boolean) => Promise<void>;
+}
+
+function normalizeWords(raw: TranscriptWord[] | string[] | undefined): TranscriptWord[] {
+  if (!raw?.length) return [];
+  if (typeof raw[0] === "string") {
+    return (raw as string[]).map((text, index) => ({
+      id: `legacy-${index}`,
+      text,
+      start: 0,
+      end: 0,
+    }));
+  }
+  return raw as TranscriptWord[];
 }
 
 function timecode(seconds: number) {
@@ -66,9 +91,11 @@ export function TranscriptEditor({
   nextCueById,
   rows,
   wordsByCue,
+  cutWordIds,
   onDraftsChange,
   onMerge,
   onReplace,
+  onRemoveWords,
   onSave,
   onSaveMany,
   onSeek,
@@ -298,7 +325,7 @@ export function TranscriptEditor({
         renderItem={(row, index) => {
           const draft = drafts[row.id]?.text ?? row.text;
           const dirty = draft.trim() !== row.text;
-          const words = wordsByCue[row.id] ?? [];
+          const words = normalizeWords(wordsByCue[row.id]);
           const metrics = captionMetrics(row, draft);
           const nextCueId = nextCueById[row.id];
           const structureOpen = structureId === row.id;
@@ -350,6 +377,38 @@ export function TranscriptEditor({
                     <span>{lang === "zh" ? "导出时隐藏" : "Hidden from export"}</span>
                   )}
                 </div>
+                {mode === "transcript" && words.length > 0 && onRemoveWords && (
+                  <div
+                    className="transcript-word-stream"
+                    aria-label={lang === "zh" ? "点击词语可从成片去掉" : "Click a word to remove it from the edit"}
+                  >
+                    {words.map((word) => {
+                      const cut = cutWordIds?.has(word.id) ?? false;
+                      return (
+                        <button
+                          key={word.id}
+                          type="button"
+                          className={`transcript-word${cut ? " is-cut" : ""}`}
+                          disabled={busy || cut || !word.id || word.id.startsWith("legacy-")}
+                          title={
+                            cut
+                              ? (lang === "zh" ? "已从成片去掉" : "Already removed from the edit")
+                              : (lang === "zh"
+                                ? `点击去掉「${word.text}」对应的画面和声音`
+                                : `Click to remove “${word.text}” from the edit`)
+                          }
+                          onClick={() => {
+                            if (cut) return;
+                            onSeek(word.start, false);
+                            void onRemoveWords([word.id]);
+                          }}
+                        >
+                          {word.text}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
                 <textarea
                   aria-label={`${lang === "zh" ? "字幕" : "Subtitle"} ${index + 1}`}
                   rows={Math.max(2, Math.ceil(draft.length / 36))}
@@ -449,14 +508,14 @@ export function TranscriptEditor({
                         </div>
                         <div className="split-word-stream">
                           {words.map((word, wordIndex) => (
-                            <Fragment key={`${row.id}-${wordIndex}`}>
-                              <span>{word}</span>
+                            <Fragment key={word.id || `${row.id}-${wordIndex}`}>
+                              <span>{word.text}</span>
                               {wordIndex < words.length - 1 && (
                                 <button
                                   aria-label={
                                     lang === "zh"
-                                      ? `在“${word}”后拆分`
-                                      : `Split after “${word}”`
+                                      ? `在“${word.text}”后拆分`
+                                      : `Split after “${word.text}”`
                                   }
                                   disabled={busy}
                                   onClick={async () => {
@@ -465,8 +524,8 @@ export function TranscriptEditor({
                                   }}
                                   title={
                                     lang === "zh"
-                                      ? `在“${word}”后拆分`
-                                      : `Split after “${word}”`
+                                      ? `在“${word.text}”后拆分`
+                                      : `Split after “${word.text}”`
                                   }
                                 >
                                   <i aria-hidden="true" />

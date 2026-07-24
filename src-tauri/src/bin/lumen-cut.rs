@@ -3038,6 +3038,8 @@ fn run_cut_command(cmd: CutCommand<'_>) -> AppResult<()> {
         max_gap: cmd.max_gap,
         fillers: !cmd.no_fillers,
         pauses: !cmd.no_pauses,
+        soft_fillers: false,
+        structure: true,
     };
     if cmd.dry_run {
         let hits = lumen_cut::pipeline::detect_with(&doc, detect_options);

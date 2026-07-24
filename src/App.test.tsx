@@ -551,6 +551,10 @@ beforeEach(() => {
         return cutListState;
       case "cut_manual_many":
         return 2;
+      case "cut_speech_cleanup":
+        return 2;
+      case "cut_words":
+        return 1;
       case "edit_history_status":
         return {
           canUndo: true,

@@ -28,6 +28,8 @@ import {
   cutAuto,
   cutList,
   cutManualMany,
+  cutSpeechCleanup,
+  cutWords,
   cutRestore,
   editHistoryStatus,
   editRedo,
@@ -703,6 +705,8 @@ export function TranscriptView({
     }
   });
   const [resizingPanes, setResizingPanes] = useState(false);
+  const [cleanupAggressiveness, setCleanupAggressiveness] =
+    useState<"tight" | "balanced" | "loose">("balanced");
   const [previewTranslationLanguage, setPreviewTranslationLanguage] = useState<string | null>(null);
   const previousPending = useRef(0);
   const wasActive = useRef(active);
@@ -878,18 +882,39 @@ export function TranscriptView({
     () => sourceToEditedTime(workbenchTime, timelineCutIntervals),
     [timelineCutIntervals, workbenchTime],
   );
-  const { wordsByCue, nextCueById } = useMemo(() => {
-    const words: Record<string, string[]> = {};
+  const { wordsByCue, nextCueById, cutWordIds } = useMemo(() => {
+    const words: Record<string, Array<{ id: string; text: string; start: number; end: number }>> = {};
     const nextCues: Record<string, string> = {};
     for (const paragraph of doc?.paragraphs ?? []) {
       paragraph.sentences.forEach((sentence, index) => {
-        words[sentence.id] = sentence.words.map((word) => word.text);
+        words[sentence.id] = sentence.words.map((word) => ({
+          id: word.id,
+          text: word.text,
+          start: word.start,
+          end: word.end,
+        }));
         const next = paragraph.sentences[index + 1];
         if (next) nextCues[sentence.id] = next.id;
       });
     }
-    return { wordsByCue: words, nextCueById: nextCues };
-  }, [doc?.paragraphs]);
+    const removed = new Set<string>();
+    if (doc) {
+      const allWords = doc.paragraphs.flatMap((p) =>
+        p.sentences.flatMap((s) => s.words),
+      );
+      for (const cut of cuts) {
+        const a = allWords.find((w) => w.id === cut.a_word);
+        const b = allWords.find((w) => w.id === cut.b_word);
+        if (!a || !b) continue;
+        const lo = Math.min(a.start, b.start);
+        const hi = Math.max(a.end, b.end);
+        for (const word of allWords) {
+          if (word.start < hi && word.end > lo) removed.add(word.id);
+        }
+      }
+    }
+    return { wordsByCue: words, nextCueById: nextCues, cutWordIds: removed };
+  }, [cuts, doc, doc?.paragraphs]);
 
   const seekWorkbench = useCallback((seconds: number, autoplay = false) => {
     if (!doc) return;
@@ -2378,9 +2403,56 @@ export function TranscriptView({
       if (added > 0) await refreshEditHistory();
       setFeedback({
         tone: "success",
-        text: lang === "zh" ? `新增 ${added} 个建议切口。` : `Added ${added} suggested cuts.`,
+        text: lang === "zh"
+          ? added > 0
+            ? `已添加 ${added} 个建议切口（可撤销）。`
+            : "没有发现新的建议切口。"
+          : added > 0
+            ? `Added ${added} suggested cut(s). Undoable.`
+            : "No new suggested cuts.",
       });
     });
+
+  const runSpeechCleanup = (mode: "silence" | "fillers" | "both") =>
+    perform(`cleanup-${mode}`, async () => {
+      const added = await cutSpeechCleanup(pid, mode, cleanupAggressiveness);
+      setCuts(await cutList(pid));
+      if (added > 0) await refreshEditHistory();
+      const labels = {
+        silence: lang === "zh" ? "静音/停顿" : "silence",
+        fillers: lang === "zh" ? "填充词" : "filler words",
+        both: lang === "zh" ? "静音和填充词" : "silence and fillers",
+      } as const;
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? added > 0
+            ? `已去掉 ${added} 处${labels[mode]}（可一次撤销）。`
+            : `没有发现可去掉的${labels[mode]}。`
+          : added > 0
+            ? `Removed ${added} ${labels[mode]} region(s). One undo restores all.`
+            : `No ${labels[mode]} to remove.`,
+      });
+    });
+
+  const removeWords = async (wordIds: string[]) => {
+    if (wordIds.length === 0) return;
+    await perform("cut-words", async () => {
+      const added = await cutWords(pid, wordIds);
+      setCuts(await cutList(pid));
+      if (added > 0) await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? added > 0
+            ? `已从成片去掉选中的词（可撤销）。`
+            : "这些词已在切口中，或无法去掉。"
+          : added > 0
+            ? "Removed selected word(s) from the edit. Undoable."
+            : "Those words are already cut or could not be removed.",
+      });
+    });
+  };
 
   const runReview = () =>
     perform("audit", async () => {
@@ -3014,18 +3086,80 @@ export function TranscriptView({
                     : lang === "zh" ? "打开工作区后再决定是否开始识别" : "Open the workspace before starting identification"}
               </p>
             </section>
+            <section className="speech-cleanup-panel" aria-labelledby="speech-cleanup-title">
+              <h2 id="speech-cleanup-title">
+                {lang === "zh" ? "口播清理" : "Speech cleanup"}
+              </h2>
+              <p className="editor-action-status">
+                {lang === "zh"
+                  ? "一键去掉停顿或「嗯啊」；点转写稿里的词也可从成片删除。全部可撤销。"
+                  : "One-click silence or filler removal; click words in the transcript to cut them. All actions are undoable."}
+              </p>
+              <label className="speech-cleanup-agg">
+                <span>{lang === "zh" ? "力度" : "Aggressiveness"}</span>
+                <select
+                  value={cleanupAggressiveness}
+                  disabled={operation !== null}
+                  onChange={(event) =>
+                    setCleanupAggressiveness(
+                      event.target.value as "tight" | "balanced" | "loose",
+                    )
+                  }
+                >
+                  <option value="tight">{lang === "zh" ? "紧 · 少留停顿" : "Tight"}</option>
+                  <option value="balanced">{lang === "zh" ? "中 · 推荐" : "Balanced"}</option>
+                  <option value="loose">{lang === "zh" ? "松 · 多留节奏" : "Loose"}</option>
+                </select>
+              </label>
+              <div className="speech-cleanup-actions">
+                <button
+                  type="button"
+                  className="button-primary"
+                  disabled={operation !== null}
+                  onClick={() => runSpeechCleanup("silence")}
+                >
+                  {operation === "cleanup-silence"
+                    ? <span className="spinner" />
+                    : null}
+                  {lang === "zh" ? "去掉静音" : "Remove silence"}
+                </button>
+                <button
+                  type="button"
+                  className="button-quiet"
+                  disabled={operation !== null}
+                  onClick={() => runSpeechCleanup("fillers")}
+                >
+                  {operation === "cleanup-fillers"
+                    ? <span className="spinner" />
+                    : null}
+                  {lang === "zh" ? "去掉嗯啊" : "Remove fillers"}
+                </button>
+                <button
+                  type="button"
+                  className="button-quiet"
+                  disabled={operation !== null}
+                  onClick={() => runSpeechCleanup("both")}
+                >
+                  {operation === "cleanup-both"
+                    ? <span className="spinner" />
+                    : null}
+                  {lang === "zh" ? "静音+嗯啊" : "Silence + fillers"}
+                </button>
+              </div>
+            </section>
             <section className="editor-help">
               <h2>{lang === "zh" ? "编辑提示" : "Editing tip"}</h2>
               <p>
                 {lang === "zh"
-                  ? "逐句修改后按 ⌘↵ 保存。修改会重新绑定词级时码。"
-                  : "Edit a cue and press ⌘↵ to save. Word timing is rebound automatically."}
+                  ? "点词去掉画面；改文字后按 ⌘↵ 保存。批量操作可一次撤销。"
+                  : "Click a word to cut its media; press ⌘↵ to save text edits. Batch cuts undo as one step."}
               </p>
             </section>
           </aside>
           <TranscriptEditor
             busy={operation !== null}
             currentTime={workbenchTime}
+            cutWordIds={cutWordIds}
             drafts={transcriptDrafts}
             duration={doc.media.durationSeconds}
             isPlaying={workbenchPlaying}
@@ -3036,6 +3170,7 @@ export function TranscriptView({
             wordsByCue={wordsByCue}
             onDraftsChange={onTranscriptDraftsChange}
             onMerge={mergeSubtitleLines}
+            onRemoveWords={removeWords}
             onReplace={replaceSubtitles}
             onSave={saveSubtitle}
             onSaveMany={saveSubtitles}
@@ -3051,6 +3186,7 @@ export function TranscriptView({
         <div className="subtitle-layout">
           <TranscriptEditor
             busy={operation !== null}
+            cutWordIds={cutWordIds}
             currentTime={workbenchTime}
             drafts={transcriptDrafts}
             duration={doc.media.durationSeconds}
