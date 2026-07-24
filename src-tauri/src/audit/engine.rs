@@ -751,24 +751,24 @@ pub fn audit(doc: &Doc) -> Report {
                     "translation source range does not end at a cue boundary".into(),
                 );
             }
-            let chars = group
-                .text
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .count();
-            if chars > hard {
+            // Measure the longest display line (newlines separate lines), using
+            // the same projected-cell model as Phase-2 align — not the raw
+            // character total of a multi-line caption.
+            let line_cells = crate::pipeline::align::max_line_cells(&group.text);
+            let line_cells_i = line_cells.ceil() as usize;
+            if line_cells > hard as f64 {
                 push(
                     &mut r,
                     Code::TargetWidth,
                     format!("{lang}/{id}"),
-                    format!("target width {chars} exceeds hard capacity {hard}"),
+                    format!("target width {line_cells_i} exceeds hard capacity {hard}"),
                 );
-            } else if chars > aim {
+            } else if line_cells > aim as f64 {
                 push(
                     &mut r,
                     Code::TargetWidthAim,
                     format!("{lang}/{id}"),
-                    format!("target width {chars} exceeds aim {aim}"),
+                    format!("target width {line_cells_i} exceeds aim {aim}"),
                 );
                 if group
                     .text
@@ -796,7 +796,21 @@ pub fn audit(doc: &Doc) -> Report {
             }
             let start = owners.first().map(|owner| owner.3).unwrap_or_default();
             let end = owners.last().map(|owner| owner.4).unwrap_or(start);
-            let cps = chars as f64 / (end - start).max(0.001);
+            // Reading speed is total content over the cue's media span.
+            let content_cells = group
+                .text
+                .chars()
+                .map(|character| {
+                    if character.is_whitespace() || character.is_ascii_punctuation() {
+                        0.0
+                    } else if character.is_ascii() {
+                        0.5
+                    } else {
+                        1.0
+                    }
+                })
+                .sum::<f64>();
+            let cps = content_cells / (end - start).max(0.001);
             if cps > 9.0 {
                 push(
                     &mut r,

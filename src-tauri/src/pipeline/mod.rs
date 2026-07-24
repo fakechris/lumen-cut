@@ -9,8 +9,9 @@ pub mod transcribe;
 pub mod translate;
 
 pub use align::{
-    align_list, align_targeted, fingerprint_words, project_end_times, AlignCandidate, AlignList,
-    AlignOutcome, AlignSpec, RebindReadingMerge, RebindSeam, TranslateRebindArtifact,
+    align_list, align_targeted, auto_fit_translations, fingerprint_words, max_line_cells,
+    project_end_times, wrap_display_lines, AlignCandidate, AlignList, AlignOutcome, AlignSpec,
+    FitFixReport, RebindReadingMerge, RebindSeam, TranslateRebindArtifact,
 };
 pub use broll::{
     lint as lint_broll, load_artifact as load_broll_suggestions, BrollMode, BrollSuggestion,
