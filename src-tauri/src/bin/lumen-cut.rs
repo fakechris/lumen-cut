@@ -271,6 +271,21 @@ enum Cmd {
         /// With `--auto`/`--detect`, only print proposals without writing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Minimum pause (seconds) treated as compressible silence.
+        #[arg(long, default_value_t = 0.8)]
+        min_pause: f64,
+        /// Surviving pause length for an intra-sentence silence (seconds).
+        #[arg(long, default_value_t = 0.3)]
+        compress_to: f64,
+        /// Gaps longer than this (seconds) are protected as deliberate beats.
+        #[arg(long, default_value_t = 3.0)]
+        max_gap: f64,
+        /// Skip Category-1 filler hard cuts.
+        #[arg(long, default_value_t = false)]
+        no_fillers: bool,
+        /// Skip silence-compression proposals.
+        #[arg(long, default_value_t = false)]
+        no_pauses: bool,
     },
     /// Version control: list / 3-way merge / dump.
     Version {
@@ -313,6 +328,12 @@ enum Cmd {
         /// Output path for a single selected format, or directory for multi.
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
+        /// Clip export to this source-timeline start (seconds).
+        #[arg(long)]
+        start: Option<f64>,
+        /// Clip export to this source-timeline end (seconds).
+        #[arg(long)]
+        end: Option<f64>,
     },
     /// Speaker diarization: pyannote sidecar → doc.json `speaker` fields.
     Diarize { pid: String },
@@ -432,6 +453,29 @@ enum TaskCmd {
         pid: String,
         #[arg(long, default_value = ".")]
         root: PathBuf,
+    },
+    /// Enqueue a task and keep the local claim/submit HTTP server up until
+    /// the run completes (or forever with `--hold`). External workers can
+    /// claim via `GET /agent/next` and submit via `POST /agent/submit`.
+    Serve {
+        kind: String,
+        pid: String,
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(long)]
+        stale_only: bool,
+        #[arg(long, value_delimiter = ',')]
+        groups: Vec<String>,
+        #[arg(long)]
+        align_fit: Option<usize>,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// TCP port (0 = ephemeral).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Keep listening after the task reaches a terminal state.
+        #[arg(long, default_value_t = false)]
+        hold: bool,
     },
 }
 
@@ -874,6 +918,39 @@ async fn run_cli() -> AppResult<()> {
                     }
                 }
             }
+            TaskCmd::Serve {
+                kind,
+                pid,
+                lang,
+                stale_only,
+                groups,
+                align_fit,
+                root,
+                port,
+                hold,
+            } => {
+                let result = task_serve(
+                    &kind,
+                    &pid,
+                    lang.as_deref(),
+                    stale_only,
+                    groups,
+                    align_fit,
+                    &root,
+                    port,
+                    hold,
+                    json,
+                )
+                .await?;
+                if json {
+                    println!("{}", serde_json::to_string(&result)?);
+                } else {
+                    println!(
+                        "✓ task serve {kind} {pid}: pending={} applied={} url={}",
+                        result.pending, result.applied, result.url
+                    );
+                }
+            }
         },
         Cmd::Align { action } => match action {
             AlignCmd::List {
@@ -968,6 +1045,11 @@ async fn run_cli() -> AppResult<()> {
             restore,
             restore_all,
             dry_run,
+            min_pause,
+            compress_to,
+            max_gap,
+            no_fillers,
+            no_pauses,
         } => {
             run_cut_command(CutCommand {
                 pid: &pid,
@@ -982,6 +1064,11 @@ async fn run_cli() -> AppResult<()> {
                 restore: restore.as_deref(),
                 restore_all,
                 dry_run,
+                min_pause,
+                compress_to,
+                max_gap,
+                no_fillers,
+                no_pauses,
                 json,
             })?;
         }
@@ -1019,6 +1106,8 @@ async fn run_cli() -> AppResult<()> {
             lang,
             speakers,
             output,
+            start,
+            end,
         } => {
             run_export_command(ExportCommand {
                 pid: &pid,
@@ -1033,6 +1122,8 @@ async fn run_cli() -> AppResult<()> {
                 lang: lang.as_deref(),
                 speakers,
                 output: output.as_deref(),
+                start,
+                end,
                 json,
             })
             .await?;
@@ -1793,6 +1884,11 @@ struct CutCommand<'a> {
     restore: Option<&'a str>,
     restore_all: bool,
     dry_run: bool,
+    min_pause: f64,
+    compress_to: f64,
+    max_gap: f64,
+    no_fillers: bool,
+    no_pauses: bool,
     json: bool,
 }
 
@@ -1809,7 +1905,107 @@ struct ExportCommand<'a> {
     lang: Option<&'a str>,
     speakers: bool,
     output: Option<&'a Path>,
+    start: Option<f64>,
+    end: Option<f64>,
     json: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskServeResult {
+    pending: usize,
+    applied: usize,
+    url: String,
+    held: bool,
+}
+
+async fn task_serve(
+    kind: &str,
+    pid: &str,
+    lang: Option<&str>,
+    stale_only: bool,
+    groups: Vec<String>,
+    align_fit: Option<usize>,
+    root: &Path,
+    port: u16,
+    hold: bool,
+    json: bool,
+) -> AppResult<TaskServeResult> {
+    let dir = root.join(pid);
+    let task = if let Some(task) = lumen_cut::agent::task::load_recoverable_task(&dir, kind)? {
+        task
+    } else {
+        lumen_cut::agent::task::prepare_task_with_task_options(
+            &dir,
+            kind,
+            lang,
+            lumen_cut::agent::task::TaskOptions {
+                stale_only,
+                groups,
+                align_fit,
+            },
+        )?
+    };
+    let pending = task.calls.len();
+    let capacity = lumen_cut::data::modelconfig::load().worker_count.max(1) as usize;
+    let allocator = std::sync::Arc::new(lumen_cut::agent::Allocator::new(capacity));
+    let pool = std::sync::Arc::new(std::sync::Mutex::new(
+        lumen_cut::agent::pool::WorkerPool::new_workers(capacity),
+    ));
+    let (addr, router) = lumen_cut::agent::http::bind(port, allocator.clone(), pool).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    let url = format!("http://127.0.0.1:{}", local_addr.port());
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::error!(%error, "agent server stopped");
+        }
+    });
+    if lumen_cut::agent::runtime::load_bridge_config().is_some() {
+        lumen_cut::agent::runtime::spawn_workers(allocator.clone(), capacity).await;
+    } else if !json {
+        eprintln!(
+            "agent claim/submit listening on {url} (GET /agent/next, POST /agent/submit)"
+        );
+        eprintln!("no built-in LLM workers — external workers must claim work");
+    }
+    let recovered = lumen_cut::agent::task::restore_or_enqueue(&allocator, &task)?;
+    info!(kind, pid, recovered, "restored durable task submissions");
+    let applied = match lumen_cut::agent::task::wait_and_apply(
+        allocator.clone(),
+        task.clone(),
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .await
+    {
+        Ok(applied) => {
+            lumen_cut::agent::task::set_task_state(&task, "completed", None)?;
+            applied
+        }
+        Err(error) => {
+            let message = error.to_string();
+            lumen_cut::agent::task::set_task_state(&task, "failed", Some(&message))?;
+            if !hold {
+                return Err(error);
+            }
+            warn!(%error, "task serve wait failed; holding server because --hold");
+            0
+        }
+    };
+    if hold {
+        if !json {
+            eprintln!("holding agent server on {url} (Ctrl-C to exit)");
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    }
+    Ok(TaskServeResult {
+        pending,
+        applied,
+        url,
+        held: hold,
+    })
 }
 
 async fn task_start(
@@ -2503,11 +2699,21 @@ fn run_cut_command(cmd: CutCommand<'_>) -> AppResult<()> {
     }
 
     // --auto / --detect
+    let detect_options = lumen_cut::pipeline::DetectOptions {
+        min_pause: cmd.min_pause,
+        compress_to: cmd.compress_to,
+        sentence_end_retain: cmd.compress_to.max(0.4),
+        max_gap: cmd.max_gap,
+        fillers: !cmd.no_fillers,
+        pauses: !cmd.no_pauses,
+    };
     if cmd.dry_run {
-        let hits = lumen_cut::pipeline::cleanup::detect(&doc);
+        let hits = lumen_cut::pipeline::detect_with(&doc, detect_options);
         let proposals: Vec<_> = hits
             .iter()
-            .filter_map(|hit| lumen_cut::pipeline::cleanup::cut_from_hit(&doc, hit))
+            .filter_map(|hit| {
+                lumen_cut::pipeline::cut_from_hit_with(&doc, hit, detect_options)
+            })
             .map(|cut| {
                 serde_json::json!({
                     "id": cut.id,
@@ -2526,6 +2732,13 @@ fn run_cut_command(cmd: CutCommand<'_>) -> AppResult<()> {
                 "dryRun": true,
                 "proposed": proposals.len(),
                 "cuts": proposals,
+                "options": {
+                    "minPause": detect_options.min_pause,
+                    "compressTo": detect_options.compress_to,
+                    "maxGap": detect_options.max_gap,
+                    "fillers": detect_options.fillers,
+                    "pauses": detect_options.pauses,
+                },
             }),
             "✓ cut detect dry-run {}: proposed={}",
             cmd.pid,
@@ -2534,7 +2747,7 @@ fn run_cut_command(cmd: CutCommand<'_>) -> AppResult<()> {
         return Ok(());
     }
 
-    let added = lumen_cut::pipeline::cleanup::apply(&doc, &mut cuts);
+    let added = lumen_cut::pipeline::apply_with(&doc, &mut cuts, detect_options);
     lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
     emit!(
         cmd.json,
@@ -2652,12 +2865,30 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     }
 
     let dir = PathBuf::from(cmd.pid);
-    let doc = Doc::load(&dir)?;
+    let full_doc = Doc::load(&dir)?;
     let cuts_path = dir.join("cuts.json");
-    let cuts: ClipCuts = if cuts_path.exists() {
+    let full_cuts: ClipCuts = if cuts_path.exists() {
         serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
     } else {
         ClipCuts::new()
+    };
+    let (doc, cuts) = match (cmd.start, cmd.end) {
+        (Some(start), Some(end)) if end > start => {
+            let clipped_doc = lumen_cut::export::clip_doc_window(&full_doc, start, end);
+            let clipped_cuts = lumen_cut::export::clip_cuts_window(
+                &full_doc,
+                &full_cuts.cuts,
+                start,
+                end,
+            );
+            (clipped_doc, ClipCuts { cuts: clipped_cuts })
+        }
+        (None, None) => (full_doc, full_cuts),
+        _ => {
+            return Err(AppError::Schema(
+                "export --start and --end must both be set, with end > start".into(),
+            ));
+        }
     };
     let export_settings = lumen_cut::data::export_settings::load(&dir)?;
     let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
@@ -2808,6 +3039,10 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
                 "lang": caption_lang,
                 "translated": cmd.translated,
                 "bilingual": bilingual && !cmd.translated,
+                "window": match (cmd.start, cmd.end) {
+                    (Some(start), Some(end)) => serde_json::json!({"start": start, "end": end}),
+                    _ => serde_json::Value::Null,
+                },
                 "artifacts": artifacts,
             }))?
         );

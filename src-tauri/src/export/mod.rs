@@ -16,7 +16,10 @@ pub use fcp::{
     write_fcp_with, write_fcp_with_broll, write_fcp_with_broll_titles,
 };
 pub use markdown::{to_md, to_md_with, write_md, write_md_with, write_md_with_chapters};
-pub use project::{cut_intervals, fully_cut, kept_intervals, removed_duration, retime};
+pub use project::{
+    clip_cuts_window, clip_doc_window, cut_intervals, fully_cut, kept_intervals, removed_duration,
+    retime,
+};
 pub use srt_vtt::{
     to_srt, to_srt_with, to_vtt, to_vtt_with, write_srt, write_srt_with, write_vtt, write_vtt_with,
 };

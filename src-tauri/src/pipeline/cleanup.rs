@@ -85,12 +85,53 @@ pub const MAX_SILENCE_GAP: f64 = 3.0;
 
 /// Seconds to remove from a silence gap under the default cleanup policy.
 pub fn compressed_silence_duration(gap: f64, sentence_end: bool) -> f64 {
+    compressed_silence_duration_with(gap, sentence_end, SILENCE_COMPRESS_TO, SENTENCE_END_RETAIN)
+}
+
+/// Seconds removed when the surviving pause length is configured.
+pub fn compressed_silence_duration_with(
+    gap: f64,
+    sentence_end: bool,
+    compress_to: f64,
+    sentence_end_retain: f64,
+) -> f64 {
     let retain = if sentence_end {
-        SENTENCE_END_RETAIN
+        sentence_end_retain
     } else {
-        SILENCE_COMPRESS_TO
+        compress_to
     };
-    (gap - retain).max(0.0)
+    (gap - retain.max(0.0)).max(0.0)
+}
+
+/// Tunables for the deterministic detect pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetectOptions {
+    /// Minimum inter-word gap treated as compressible silence (seconds).
+    pub min_pause: f64,
+    /// Surviving pause for an intra-sentence silence (seconds).
+    pub compress_to: f64,
+    /// Surviving pause at a sentence boundary (seconds). Defaults to
+    /// `max(compress_to, 0.4)` when left as the module default.
+    pub sentence_end_retain: f64,
+    /// Gaps longer than this are protected as deliberate beats (seconds).
+    pub max_gap: f64,
+    /// When false, skip Category-1 filler hard cuts.
+    pub fillers: bool,
+    /// When false, skip silence compression proposals.
+    pub pauses: bool,
+}
+
+impl Default for DetectOptions {
+    fn default() -> Self {
+        Self {
+            min_pause: MIN_PAUSE,
+            compress_to: SILENCE_COMPRESS_TO,
+            sentence_end_retain: SENTENCE_END_RETAIN,
+            max_gap: MAX_SILENCE_GAP,
+            fillers: true,
+            pauses: true,
+        }
+    }
 }
 
 /// Hard-delete filler list. Context-sensitive words such as 嗯 / 啊 / 那个 /
@@ -106,8 +147,13 @@ fn normalize_word(text: &str) -> String {
         .to_lowercase()
 }
 
-/// Run all three detectors. Pure — does not mutate `doc` or `cuts`.
+/// Run all detectors with default talking-head thresholds.
 pub fn detect(doc: &Doc) -> Vec<CleanupHit> {
+    detect_with(doc, DetectOptions::default())
+}
+
+/// Run detectors with explicit thresholds. Pure — does not mutate `doc` or cuts.
+pub fn detect_with(doc: &Doc, options: DetectOptions) -> Vec<CleanupHit> {
     let mut out = Vec::new();
     let all_sents: Vec<&Sentence> = doc
         .paragraphs
@@ -131,12 +177,12 @@ pub fn detect(doc: &Doc) -> Vec<CleanupHit> {
         }
     }
 
-    // (2) falseStart — short trailing fragment after a >0.8s gap.
+    // (2) falseStart — short trailing fragment after a pause.
     for w in all_sents.windows(2) {
         let prev_end = w[0].words.last().map(|x| x.end).unwrap_or(0.0);
         let next_start = w[1].words.first().map(|x| x.start).unwrap_or(0.0);
         let gap = next_start - prev_end;
-        if gap > 0.8 && w[1].words.len() <= 3 {
+        if gap > options.min_pause && w[1].words.len() <= 3 {
             out.push(CleanupHit {
                 kind: CleanupKind::FalseStart,
                 a_sentence: w[0].id.clone(),
@@ -148,55 +194,56 @@ pub fn detect(doc: &Doc) -> Vec<CleanupHit> {
         }
     }
 
-    // (3) filler — word level: any word in the sentence that normalises
-    // onto the hard list is flagged individually.
-    for s in &all_sents {
-        for word in &s.words {
-            let norm = normalize_word(&word.text);
-            if !norm.is_empty() && HARD_FILLERS.contains(&norm.as_str()) {
-                out.push(CleanupHit {
-                    kind: CleanupKind::Filler,
-                    a_sentence: s.id.clone(),
-                    b_sentence: s.id.clone(),
-                    word_id: Some(word.id.clone()),
-                    word_id2: None,
-                    note: format!("filler word {:?}", word.text),
-                });
+    // (3) filler — word level hard list only.
+    if options.fillers {
+        for s in &all_sents {
+            for word in &s.words {
+                let norm = normalize_word(&word.text);
+                if !norm.is_empty() && HARD_FILLERS.contains(&norm.as_str()) {
+                    out.push(CleanupHit {
+                        kind: CleanupKind::Filler,
+                        a_sentence: s.id.clone(),
+                        b_sentence: s.id.clone(),
+                        word_id: Some(word.id.clone()),
+                        word_id2: None,
+                        note: format!("filler word {:?}", word.text),
+                    });
+                }
             }
         }
     }
 
-    // (4) silence — adjacent words whose inter-word gap is within the
-    // default 0.8s..=3.0s window. The pause is compressed at export while
-    // both flanking words are kept. Longer gaps are protected as likely
-    // chapter boundaries.
-    let flat: Vec<(&str, &crate::data::Word)> = doc
-        .paragraphs
-        .iter()
-        .flat_map(|p| {
-            p.sentences
-                .iter()
-                .flat_map(|s| s.words.iter().map(|w| (s.id.as_str(), w)))
-        })
-        .collect();
-    for pair in flat.windows(2) {
-        let (sa, wa) = pair[0];
-        let (sb, wb) = pair[1];
-        let gap = wb.start - wa.end;
-        if (MIN_PAUSE..=MAX_SILENCE_GAP).contains(&gap) {
-            let retained = if sa != sb {
-                SENTENCE_END_RETAIN
-            } else {
-                SILENCE_COMPRESS_TO
-            };
-            out.push(CleanupHit {
-                kind: CleanupKind::Silence,
-                a_sentence: sa.into(),
-                b_sentence: sb.into(),
-                word_id: Some(wa.id.clone()),
-                word_id2: Some(wb.id.clone()),
-                note: format!("silence gap {gap:.2}s, retain {retained:.1}s"),
-            });
+    // (4) silence — adjacent words whose inter-word gap is within
+    // [min_pause, max_gap]. Longer gaps are protected as deliberate beats.
+    if options.pauses {
+        let flat: Vec<(&str, &crate::data::Word)> = doc
+            .paragraphs
+            .iter()
+            .flat_map(|p| {
+                p.sentences
+                    .iter()
+                    .flat_map(|s| s.words.iter().map(|w| (s.id.as_str(), w)))
+            })
+            .collect();
+        for pair in flat.windows(2) {
+            let (sa, wa) = pair[0];
+            let (sb, wb) = pair[1];
+            let gap = wb.start - wa.end;
+            if gap >= options.min_pause && gap <= options.max_gap {
+                let retained = if sa != sb {
+                    options.sentence_end_retain
+                } else {
+                    options.compress_to
+                };
+                out.push(CleanupHit {
+                    kind: CleanupKind::Silence,
+                    a_sentence: sa.into(),
+                    b_sentence: sb.into(),
+                    word_id: Some(wa.id.clone()),
+                    word_id2: Some(wb.id.clone()),
+                    note: format!("silence gap {gap:.2}s, retain {retained:.1}s"),
+                });
+            }
         }
     }
 
@@ -214,6 +261,15 @@ pub fn detect(doc: &Doc) -> Vec<CleanupHit> {
 /// * falseStart cuts only the short trailing fragment (sentence `b`).
 /// * filler cuts exactly the flagged word (`a_word == b_word`).
 pub fn cut_from_hit(doc: &Doc, hit: &CleanupHit) -> Option<Cut> {
+    cut_from_hit_with(doc, hit, DetectOptions::default())
+}
+
+/// Convert a hit using the same compress thresholds that produced it.
+pub fn cut_from_hit_with(
+    doc: &Doc,
+    hit: &CleanupHit,
+    options: DetectOptions,
+) -> Option<Cut> {
     let (a_word, b_word, kind) = match hit.kind {
         CleanupKind::Retake => {
             let a = find_sentence(doc, &hit.a_sentence)?;
@@ -246,14 +302,17 @@ pub fn cut_from_hit(doc: &Doc, hit: &CleanupHit) -> Option<Cut> {
         .into_iter()
         .map(|w| (w.id.as_str(), (w.start, w.end)))
         .collect();
-    // Silence excises the gap between the two flanking words; every other
-    // kind cuts the inclusive word span.
     let dur = match kind {
         CutKind::Silence => word_at
             .get(a_word.as_str())
             .zip(word_at.get(b_word.as_str()))
             .map(|((_, e0), (s1, _))| {
-                compressed_silence_duration((s1 - e0).max(0.0), hit.a_sentence != hit.b_sentence)
+                compressed_silence_duration_with(
+                    (s1 - e0).max(0.0),
+                    hit.a_sentence != hit.b_sentence,
+                    options.compress_to,
+                    options.sentence_end_retain,
+                )
             })
             .unwrap_or(0.0),
         _ => word_at
@@ -282,9 +341,14 @@ fn find_sentence<'a>(doc: &'a Doc, id: &str) -> Option<&'a Sentence> {
 /// Convenience: run `detect` and append non-conflicting cuts to `cuts`.
 /// Returns the number of cuts added.
 pub fn apply(doc: &Doc, cuts: &mut ClipCuts) -> usize {
+    apply_with(doc, cuts, DetectOptions::default())
+}
+
+/// Like [`apply`] with explicit detect thresholds.
+pub fn apply_with(doc: &Doc, cuts: &mut ClipCuts, options: DetectOptions) -> usize {
     let mut added = 0;
-    for hit in detect(doc) {
-        if let Some(cut) = cut_from_hit(doc, &hit) {
+    for hit in detect_with(doc, options) {
+        if let Some(cut) = cut_from_hit_with(doc, &hit, options) {
             let id = cut.id.clone();
             if !cuts.cuts.iter().any(|c| c.id == id) {
                 cuts.add(cut);
@@ -589,6 +653,75 @@ mod tests {
             sent("s2", "there", vec![("w1", "there", 0.7, 1.1)]), // gap 0.2s
         ]);
         assert!(!detect(&d).iter().any(|h| h.kind == CleanupKind::Silence));
+    }
+
+    #[test]
+    fn detect_with_higher_min_pause_skips_short_gaps() {
+        let doc = fixture_two_words_with_gap(0.9);
+        let default_hits = detect(&doc);
+        assert!(
+            default_hits
+                .iter()
+                .any(|hit| matches!(hit.kind, CleanupKind::Silence)),
+            "default 0.8s min should catch 0.9s gap"
+        );
+        let strict = detect_with(
+            &doc,
+            DetectOptions {
+                min_pause: 1.0,
+                ..DetectOptions::default()
+            },
+        );
+        assert!(
+            !strict
+                .iter()
+                .any(|hit| matches!(hit.kind, CleanupKind::Silence)),
+            "min_pause 1.0 should skip 0.9s gap"
+        );
+    }
+
+    fn fixture_two_words_with_gap(gap: f64) -> Doc {
+        use crate::data::doc::*;
+        Doc {
+            id: "p".into(),
+            schema: 1,
+            media: MediaRef {
+                path: std::path::PathBuf::from("m.mp4"),
+                duration_seconds: 5.0,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: "t".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            paragraphs: vec![Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![Sentence {
+                    id: "s1".into(),
+                    text: "hello world".into(),
+                    words: vec![
+                        Word {
+                            id: "w1".into(),
+                            text: "hello".into(),
+                            start: 0.0,
+                            end: 0.5,
+                        },
+                        Word {
+                            id: "w2".into(),
+                            text: "world".into(),
+                            start: 0.5 + gap,
+                            end: 0.5 + gap + 0.4,
+                        },
+                    ],
+                }],
+            }],
+            translations: Default::default(),
+        }
     }
 
     #[test]
