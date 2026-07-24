@@ -299,6 +299,7 @@ fn real_media_workflow_persists_ai_edits_and_exports_playable_video() {
             .args(["--json", "export"])
             .arg(&project)
             .arg("--video")
+            .env("LUMEN_CUT_VIDEO_ENCODER", "libx264")
             .output()
             .expect("export project"),
         "video export",
