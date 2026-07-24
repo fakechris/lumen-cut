@@ -161,7 +161,8 @@ pub fn validate_answer(kind: &str, answer: &str) -> Result<(), Vec<String>> {
     match kind {
         "translate" => {
             let v: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|e| vec![format!("not JSON: {e}")])?;
+                serde_json::from_str(crate::agent::task::normalized_json_answer_text(trimmed))
+                    .map_err(|e| vec![format!("not JSON: {e}")])?;
             if v.get("translations").is_none() {
                 return Err(vec!["missing `translations` object".into()]);
             }
@@ -172,7 +173,8 @@ pub fn validate_answer(kind: &str, answer: &str) -> Result<(), Vec<String>> {
             // which the worker carries in the payload; here we only check
             // the answer parses as the page/retry shape.
             let v: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|e| vec![format!("not JSON: {e}")])?;
+                serde_json::from_str(crate::agent::task::normalized_json_answer_text(trimmed))
+                    .map_err(|e| vec![format!("not JSON: {e}")])?;
             if v.get("paragraphs").is_none() && v.get("sentences").is_none() {
                 return Err(vec!["missing `paragraphs`/`sentences`".into()]);
             }
@@ -180,7 +182,8 @@ pub fn validate_answer(kind: &str, answer: &str) -> Result<(), Vec<String>> {
         }
         "align" => {
             let v: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|e| vec![format!("not JSON: {e}")])?;
+                serde_json::from_str(crate::agent::task::normalized_json_answer_text(trimmed))
+                    .map_err(|e| vec![format!("not JSON: {e}")])?;
             let pairs = v
                 .get("pairs")
                 .and_then(serde_json::Value::as_array)
