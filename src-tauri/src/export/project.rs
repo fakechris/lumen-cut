@@ -84,10 +84,164 @@ pub fn kept_intervals(doc: &Doc, cuts: &[Cut]) -> Vec<(f64, f64)> {
     kept
 }
 
+/// Slice a document to `[start, end)` on the source timeline and rebase times
+/// so the window starts at 0. Words that do not overlap the window are dropped;
+/// remaining word/sentence timings are shifted by `-start`. Translations whose
+/// source words are all outside the window are dropped.
+pub fn clip_doc_window(doc: &Doc, start: f64, end: f64) -> Doc {
+    use crate::data::doc::{Paragraph, Sentence, Word};
+    let start = start.max(0.0);
+    let end = end.max(start);
+    let mut paragraphs = Vec::new();
+    for paragraph in &doc.paragraphs {
+        let mut sentences = Vec::new();
+        for sentence in &paragraph.sentences {
+            let words: Vec<Word> = sentence
+                .words
+                .iter()
+                .filter(|word| word.end > start && word.start < end)
+                .map(|word| Word {
+                    id: word.id.clone(),
+                    text: word.text.clone(),
+                    start: (word.start - start).max(0.0),
+                    end: (word.end - start).max(0.0).min(end - start),
+                })
+                .collect();
+            if words.is_empty() {
+                continue;
+            }
+            let text = words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            sentences.push(Sentence {
+                id: sentence.id.clone(),
+                text,
+                words,
+            });
+        }
+        if sentences.is_empty() {
+            continue;
+        }
+        paragraphs.push(Paragraph {
+            id: paragraph.id,
+            speaker: paragraph.speaker.clone(),
+            sentences,
+        });
+    }
+
+    let kept_word_ids: std::collections::BTreeSet<String> = paragraphs
+        .iter()
+        .flat_map(|paragraph| {
+            paragraph
+                .sentences
+                .iter()
+                .flat_map(|sentence| sentence.words.iter().map(|word| word.id.clone()))
+        })
+        .collect();
+
+    let mut translations = doc.translations.clone();
+    for groups in translations.values_mut() {
+        groups.retain(|_, group| {
+            group.source_words.is_empty()
+                || group
+                    .source_words
+                    .iter()
+                    .any(|word_id| kept_word_ids.contains(word_id))
+        });
+    }
+
+    let mut clipped = doc.clone();
+    clipped.paragraphs = paragraphs;
+    clipped.translations = translations;
+    clipped.media.duration_seconds = (end - start).max(0.0);
+    clipped
+}
+
+/// Keep only soft-cuts that fall inside `[start, end)` and rebase their
+/// durations onto the clipped timeline. Word ids are preserved.
+pub fn clip_cuts_window(doc: &Doc, cuts: &[Cut], start: f64, end: f64) -> Vec<Cut> {
+    cuts.iter()
+        .filter_map(|cut| {
+            let (cs, ce) = cut.resolved_interval(doc)?;
+            if ce <= start || cs >= end {
+                return None;
+            }
+            Some(Cut {
+                id: cut.id.clone(),
+                note: cut.note.clone(),
+                a_word: cut.a_word.clone(),
+                b_word: cut.b_word.clone(),
+                kind: cut.kind,
+                duration: cut.duration,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::soft_cut::{ClipCuts, CutKind};
+
+    #[test]
+    fn clip_doc_window_rebases_and_drops_outside_words() {
+        use crate::data::doc::*;
+        let doc = Doc {
+            id: "p".into(),
+            schema: 1,
+            media: MediaRef {
+                path: std::path::PathBuf::from("/tmp/x.mp4"),
+                duration_seconds: 10.0,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: "t".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            paragraphs: vec![Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![Sentence {
+                    id: "s1".into(),
+                    text: "a b c".into(),
+                    words: vec![
+                        Word {
+                            id: "w1".into(),
+                            text: "a".into(),
+                            start: 0.0,
+                            end: 1.0,
+                        },
+                        Word {
+                            id: "w2".into(),
+                            text: "b".into(),
+                            start: 2.0,
+                            end: 3.0,
+                        },
+                        Word {
+                            id: "w3".into(),
+                            text: "c".into(),
+                            start: 5.0,
+                            end: 6.0,
+                        },
+                    ],
+                }],
+            }],
+            translations: Default::default(),
+        };
+        let clipped = clip_doc_window(&doc, 1.5, 4.0);
+        assert!((clipped.media.duration_seconds - 2.5).abs() < 1e-9);
+        let words = clipped.all_words();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].id, "w2");
+        assert!((words[0].start - 0.5).abs() < 1e-9);
+        assert!((words[0].end - 1.5).abs() < 1e-9);
+    }
 
     fn doc_with_words(words: &[(&str, f64, f64)]) -> Doc {
         use crate::data::doc::*;

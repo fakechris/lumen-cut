@@ -40,6 +40,15 @@ lumen-cut-cli cut ./projects/talk --list --kind filler
 lumen-cut-cli export ./projects/talk --srt --bilingual --lang zh -o talk.zh.srt
 lumen-cut-cli align list talk --lang zh --fit 16 --root ./projects
 lumen-cut-cli task start align talk --lang zh --groups g1,g2 --align-fit 16 --root ./projects
+
+# Soft-cut detect knobs + export a time window
+lumen-cut-cli cut ./projects/talk --auto --min-pause 1.0 --compress-to 0.5
+lumen-cut-cli export ./projects/talk --srt --start 10 --end 90 -o clip.srt
+
+# Keep a claim/submit HTTP endpoint for external workers
+lumen-cut-cli task serve translate talk --lang zh --root ./projects --port 0
+# Workers: GET http://127.0.0.1:<port>/agent/next
+#          POST http://127.0.0.1:<port>/agent/submit  { "lease_id", "answer": { "text": "..." } }
 ```
 
 ## Requirements

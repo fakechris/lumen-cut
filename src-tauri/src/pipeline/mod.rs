@@ -16,7 +16,10 @@ pub use broll::{
     lint as lint_broll, load_artifact as load_broll_suggestions, BrollMode, BrollSuggestion,
     BrollSuggestionsArtifact, StructuralProblem,
 };
-pub use cleanup::{apply, cut_from_hit, detect, CleanupHit, CleanupKind};
+pub use cleanup::{
+    apply, apply_with, cut_from_hit, cut_from_hit_with, detect, detect_with, CleanupHit,
+    CleanupKind, DetectOptions,
+};
 pub use polish::apply_polish;
 pub use transcribe::re_transcribe;
 pub use translate::{
