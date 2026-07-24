@@ -110,6 +110,13 @@ let setupJobStatusState: {
   kind: string;
   state: string;
   phase: string;
+  startedAt?: number;
+  progress?: number;
+  detail?: string;
+  current?: number;
+  total?: number;
+  unit?: string;
+  bytesPerSecond?: number;
   error: string | null;
 };
 let brollPreviewHasExistingJob: boolean;
@@ -1922,7 +1929,7 @@ test("a project load failure offers retry and recovers without a permanent spinn
   expect(screen.queryByRole("heading", { name: "项目数据暂时无法读取" })).not.toBeInTheDocument();
 });
 
-test("runtime setup runs as a cancellable background job with explicit indeterminate progress", async () => {
+test("runtime setup keeps unknown progress honest and remains cancellable", async () => {
   asrReady = false;
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: "设置" }));
@@ -1932,9 +1939,34 @@ test("runtime setup runs as a cancellable background job with explicit indetermi
     kind: "asr-runtime",
   }));
   expect(screen.getByRole("progressbar", { name: "环境准备进度" })).not.toHaveAttribute("value");
-  expect(screen.getByText(/没有提供可信的总字节数/)).toBeVisible();
+  expect(screen.getByText(/有可靠字节总量时会同时显示大小与实时速度/)).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("setup_job_cancel"));
+});
+
+test("model setup renders determinate file and transfer progress", async () => {
+  asrReady = false;
+  setupJobHasExistingJob = true;
+  setupJobStatusState = {
+    kind: "asr-models",
+    state: "running",
+    phase: "downloading",
+    startedAt: Date.now() / 1000 - 65,
+    progress: 42,
+    detail: "mlx-community/Qwen3-ASR · model.safetensors",
+    current: 512 * 1024 * 1024,
+    total: 2 * 1024 * 1024 * 1024,
+    unit: "bytes",
+    bytesPerSecond: 16 * 1024 * 1024,
+    error: null,
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+
+  const progress = await screen.findByRole("progressbar", { name: "环境准备进度" });
+  expect(progress).toHaveAttribute("value", "42");
+  expect(screen.getByText(/model\.safetensors/)).toBeVisible();
+  expect(screen.getByText(/512 MB \/ 2\.0 GB · 16\.0 MB\/s/)).toBeVisible();
 });
 
 test("advanced diagnostics cannot imply that users must start a server", async () => {

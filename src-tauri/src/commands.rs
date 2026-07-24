@@ -2416,11 +2416,71 @@ pub struct TaskStatus {
     pub polish_quality: Option<crate::pipeline::polish::PolishQualityArtifact>,
 }
 
-#[tauri::command]
-pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> {
+fn live_task_activity(
+    state: &AgentServerState,
+    project_dir: &std::path::Path,
+) -> HashMap<String, crate::agent::allocate::CallActivity> {
+    let tasks = state
+        .active_tasks
+        .lock()
+        .expect("state poisoned")
+        .values()
+        .filter(|active| active.task.project_dir == project_dir)
+        .map(|active| {
+            (
+                active.task.kind.clone(),
+                active
+                    .task
+                    .calls
+                    .iter()
+                    .map(|prepared| prepared.call.id.clone())
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let allocator = state
+        .allocator
+        .lock()
+        .expect("state poisoned")
+        .as_ref()
+        .map(|handle| handle.allocator.clone());
+    let Some(allocator) = allocator else {
+        return HashMap::new();
+    };
+    tasks
+        .into_iter()
+        .map(|(kind, call_ids)| (kind, allocator.activity_for(&call_ids)))
+        .collect()
+}
+
+fn apply_live_task_activity(
+    kinds: &mut [crate::agent::task::TaskKindStatus],
+    live: &HashMap<String, crate::agent::allocate::CallActivity>,
+) {
+    for status in kinds {
+        let Some(activity) = live.get(&status.kind) else {
+            continue;
+        };
+        status.queued = Some(activity.queued);
+        status.in_flight = Some(activity.in_flight);
+        status.retrying = Some(activity.retrying);
+        status.attempt = activity.attempt;
+        status.max_attempts = activity.max_attempts;
+    }
+}
+
+async fn task_status_impl(
+    pid: String,
+    root: Option<PathBuf>,
+    state: Option<&AgentServerState>,
+) -> AppResult<TaskStatus> {
     let project_dir = resolve_project_dir(&pid, root)?;
+    let live = state
+        .map(|state| live_task_activity(state, &project_dir))
+        .unwrap_or_default();
     run_blocking("task status", move || {
-        let kinds = crate::agent::task::task_kind_statuses(&project_dir);
+        let mut kinds = crate::agent::task::task_kind_statuses(&project_dir);
+        apply_live_task_activity(&mut kinds, &live);
         let pending = kinds.iter().map(|status| status.pending).sum();
         let done = kinds.iter().map(|status| status.done).sum();
         let failed = kinds.iter().map(|status| status.failed).sum();
@@ -2437,6 +2497,15 @@ pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskSt
         })
     })
     .await
+}
+
+#[tauri::command]
+pub async fn task_status(
+    state: tauri::State<'_, AgentServerState>,
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<TaskStatus> {
+    task_status_impl(pid, root, Some(&state)).await
 }
 
 // ============================================================================
@@ -6514,6 +6583,18 @@ pub struct SetupJobStatus {
     pub started_at: Option<u64>,
     #[serde(default)]
     pub updated_at: Option<u64>,
+    #[serde(default)]
+    pub progress: Option<u8>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub current: Option<u64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub bytes_per_second: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -6565,13 +6646,28 @@ fn setup_phase(kind: &str) -> Option<&'static str> {
     }
 }
 
+fn apply_setup_progress(status: &mut SetupJobStatus, update: crate::asr::SetupProgressUpdate) {
+    if status.state != "running" {
+        return;
+    }
+    status.phase = update.phase.into();
+    if let Some(progress) = update.progress {
+        status.progress = Some(status.progress.unwrap_or(0).max(progress.min(100)));
+    }
+    status.detail = Some(update.detail);
+    status.current = update.current;
+    status.total = update.total;
+    status.unit = update.unit.map(str::to_string);
+    status.bytes_per_second = update.bytes_per_second;
+    status.updated_at = Some(unix_timestamp_seconds());
+}
+
 #[tauri::command]
 pub async fn setup_job_start(
     kind: String,
     state: tauri::State<'_, SetupJobState>,
 ) -> AppResult<SetupJobStatus> {
-    let phase =
-        setup_phase(&kind).ok_or_else(|| AppError::Schema(format!("unknown setup job: {kind}")))?;
+    setup_phase(&kind).ok_or_else(|| AppError::Schema(format!("unknown setup job: {kind}")))?;
     let cancel = Arc::new(AtomicBool::new(false));
     let now = unix_timestamp_seconds();
     let status = SetupJobStatus {
@@ -6580,6 +6676,12 @@ pub async fn setup_job_start(
         phase: "waiting".into(),
         started_at: Some(now),
         updated_at: Some(now),
+        progress: Some(0),
+        detail: Some("Waiting for compute capacity".into()),
+        current: None,
+        total: None,
+        unit: None,
+        bytes_per_second: None,
         error: None,
     };
     {
@@ -6613,16 +6715,38 @@ pub async fn setup_job_start(
 
     let job = state.job.clone();
     tauri::async_runtime::spawn(async move {
-        if let Some(active) = job.lock().expect("setup job state poisoned").as_mut() {
-            active.status.phase = phase.into();
-            active.status.updated_at = Some(unix_timestamp_seconds());
-        }
+        let progress_job = job.clone();
+        let progress: crate::asr::SetupProgressCallback = Arc::new(move |update| {
+            if let Some(active) = progress_job
+                .lock()
+                .expect("setup job state poisoned")
+                .as_mut()
+            {
+                apply_setup_progress(&mut active.status, update);
+            }
+        });
         let work = async {
             match kind.as_str() {
-                "asr-runtime" => crate::asr::install_asr_runtime().await.map(|_| ()),
-                "asr-models" => crate::asr::download_asr_models().await.map(|_| ()),
-                "speaker-runtime" => crate::asr::install_diarize_runtime().await.map(|_| ()),
-                "speaker-model" => crate::asr::download_diarize_model().await.map(|_| ()),
+                "asr-runtime" => {
+                    crate::asr::install_asr_runtime_with_progress(Some(progress.clone()))
+                        .await
+                        .map(|_| ())
+                }
+                "asr-models" => {
+                    crate::asr::download_asr_models_with_progress(Some(progress.clone()))
+                        .await
+                        .map(|_| ())
+                }
+                "speaker-runtime" => {
+                    crate::asr::install_diarize_runtime_with_progress(Some(progress.clone()))
+                        .await
+                        .map(|_| ())
+                }
+                "speaker-model" => {
+                    crate::asr::download_diarize_model_with_progress(Some(progress.clone()))
+                        .await
+                        .map(|_| ())
+                }
                 _ => unreachable!("setup kind was validated"),
             }
         };
@@ -6637,6 +6761,8 @@ pub async fn setup_job_start(
                 Ok(()) => {
                     status.state = "completed".into();
                     status.phase = "completed".into();
+                    status.progress = Some(100);
+                    status.detail = Some("Setup completed".into());
                     status.error = None;
                 }
                 Err(AppError::Cancelled) => {
@@ -8013,28 +8139,76 @@ mod video_export_status_tests {
 
 #[cfg(test)]
 mod setup_job_status_tests {
-    use super::{load_recovered_setup_status, save_setup_status, SetupJobStatus};
+    use super::{
+        apply_setup_progress, load_recovered_setup_status, save_setup_status, SetupJobStatus,
+    };
+
+    fn status() -> SetupJobStatus {
+        SetupJobStatus {
+            kind: "asr-models".into(),
+            state: "running".into(),
+            phase: "downloading".into(),
+            started_at: Some(10),
+            updated_at: Some(20),
+            progress: Some(25),
+            detail: None,
+            current: None,
+            total: None,
+            unit: None,
+            bytes_per_second: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn interrupted_setup_becomes_a_retryable_failure() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("setup.json");
-        save_setup_status(
-            &path,
-            &SetupJobStatus {
-                kind: "asr-models".into(),
-                state: "running".into(),
-                phase: "downloading".into(),
-                started_at: Some(10),
-                updated_at: Some(20),
-                error: None,
-            },
-        )
-        .unwrap();
+        save_setup_status(&path, &status()).unwrap();
         let recovered = load_recovered_setup_status(&path).unwrap();
         assert_eq!(recovered.state, "failed");
+        assert_eq!(recovered.progress, Some(25));
         assert!(recovered.updated_at.unwrap() > 20);
         assert!(recovered.error.unwrap().contains("start it again"));
+    }
+
+    #[test]
+    fn live_setup_progress_never_moves_backwards_and_keeps_real_transfer_units() {
+        let mut status = status();
+        apply_setup_progress(
+            &mut status,
+            crate::asr::SetupProgressUpdate {
+                phase: "downloading",
+                progress: Some(18),
+                detail: "model.safetensors".into(),
+                current: Some(128),
+                total: Some(1024),
+                unit: Some("bytes"),
+                bytes_per_second: Some(64),
+            },
+        );
+        assert_eq!(status.progress, Some(25));
+        assert_eq!(status.current, Some(128));
+        assert_eq!(status.total, Some(1024));
+        assert_eq!(status.unit.as_deref(), Some("bytes"));
+        assert_eq!(status.bytes_per_second, Some(64));
+
+        status.state = "cancelling".into();
+        status.phase = "cancelling".into();
+        apply_setup_progress(
+            &mut status,
+            crate::asr::SetupProgressUpdate {
+                phase: "downloading",
+                progress: Some(90),
+                detail: "late subprocess event".into(),
+                current: Some(900),
+                total: Some(1024),
+                unit: Some("bytes"),
+                bytes_per_second: Some(128),
+            },
+        );
+        assert_eq!(status.phase, "cancelling");
+        assert_eq!(status.progress, Some(25));
     }
 }
 
@@ -10629,6 +10803,65 @@ mod tests {
     }
 
     #[test]
+    fn task_activity_snapshot_joins_active_task_ids_to_the_live_allocator() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let state = AgentServerState::default();
+        let allocator = Arc::new(Allocator::new(2));
+        let pool = Arc::new(Mutex::new(crate::agent::pool::WorkerPool::new_workers(2)));
+        *state.allocator.lock().unwrap() = Some(AllocatorHandle {
+            allocator: allocator.clone(),
+            addr: "127.0.0.1:9".parse().unwrap(),
+            pool,
+        });
+        let prepared = (1..=2)
+            .map(|index| {
+                let id = format!("translate-run-{index}");
+                let call = crate::agent::PendingCall {
+                    id: id.clone(),
+                    kind: "translate".into(),
+                    word_count: 10,
+                    char_count: 20,
+                    payload_ref: "/tmp/payload".into(),
+                    submission_ref: None,
+                    problems: vec![],
+                    contract: None,
+                };
+                allocator.enqueue(call.clone());
+                crate::agent::task::PreparedCall {
+                    call,
+                    pending_path: project.join(format!("pending/{id}.json")),
+                    submitted_path: project.join(format!("submitted/{id}.json")),
+                    done_path: project.join(format!("done/{id}.json")),
+                    failed_path: project.join(format!("failed/{id}.json")),
+                }
+            })
+            .collect::<Vec<_>>();
+        state.active_tasks.lock().unwrap().insert(
+            "project::translate".into(),
+            ActiveAgentTask {
+                pause: Arc::new(AtomicBool::new(false)),
+                task: crate::agent::task::PreparedTask {
+                    project_dir: project.clone(),
+                    kind: "translate".into(),
+                    lang: Some("zh".into()),
+                    ai_dir: project.join("ai/translate"),
+                    calls: prepared,
+                },
+            },
+        );
+        let (claimed, _) = allocator.allocate().unwrap();
+        allocator.record_attempt(&claimed.id, 1, 3, false);
+
+        let live = live_task_activity(&state, &project);
+        let activity = live.get("translate").unwrap();
+        assert_eq!(activity.queued, 1);
+        assert_eq!(activity.in_flight, 1);
+        assert_eq!(activity.attempt, Some(1));
+        assert_eq!(activity.max_attempts, Some(3));
+    }
+
+    #[test]
     fn payload_char_count_counts_chars_and_tolerates_missing_files() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("prompt.json");
@@ -10660,7 +10893,7 @@ mod tests {
             .save(&project.join("ai/polish-quality.json"))
             .unwrap();
 
-        let status = task_status("p1".into(), Some(tmp.path().to_path_buf()))
+        let status = task_status_impl("p1".into(), Some(tmp.path().to_path_buf()), None)
             .await
             .unwrap();
         assert_eq!(
@@ -10691,7 +10924,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = task_status("p1".into(), Some(tmp.path().to_path_buf()))
+        let status = task_status_impl("p1".into(), Some(tmp.path().to_path_buf()), None)
             .await
             .unwrap();
         assert_eq!(status.kinds.len(), 1);
@@ -10730,7 +10963,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = task_status("p1".into(), Some(tmp.path().to_path_buf()))
+        let status = task_status_impl("p1".into(), Some(tmp.path().to_path_buf()), None)
             .await
             .unwrap();
 

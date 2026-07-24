@@ -113,7 +113,26 @@ struct Inner {
     leased: Vec<(Lease, PendingCall)>,
     /// call id → submitted outcome, for the orchestrator to pick up.
     completed: HashMap<String, CompletedSubmission>,
+    /// Live provider-attempt metadata for built-in workers. External workers
+    /// still contribute queued/in-flight counts without inventing attempt data.
+    attempts: HashMap<String, RequestAttempt>,
     capacity: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallActivity {
+    pub queued: usize,
+    pub in_flight: usize,
+    pub retrying: usize,
+    pub attempt: Option<u32>,
+    pub max_attempts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestAttempt {
+    attempt: u32,
+    max_attempts: u32,
+    retrying: bool,
 }
 
 impl Allocator {
@@ -142,6 +161,51 @@ impl Allocator {
 
     pub fn pending_count(&self) -> usize {
         self.inner.lock().expect("allocator poisoned").queue.len()
+    }
+
+    /// Return truthful live activity for one durable task. This is process
+    /// state only: durable completion/failure remains sourced from project
+    /// artifacts so a restart never fabricates progress.
+    pub fn activity_for(&self, call_ids: &HashSet<String>) -> CallActivity {
+        let inner = self.inner.lock().expect("allocator poisoned");
+        let queued = inner
+            .queue
+            .iter()
+            .filter(|call| call_ids.contains(&call.id))
+            .count();
+        let in_flight = inner
+            .leased
+            .iter()
+            .filter(|(_, call)| call_ids.contains(&call.id))
+            .count();
+        let attempts = inner
+            .attempts
+            .iter()
+            .filter(|(call_id, _)| call_ids.contains(*call_id))
+            .map(|(_, attempt)| *attempt)
+            .collect::<Vec<_>>();
+        CallActivity {
+            queued,
+            in_flight,
+            retrying: attempts.iter().filter(|attempt| attempt.retrying).count(),
+            attempt: attempts.iter().map(|attempt| attempt.attempt).max(),
+            max_attempts: attempts.iter().map(|attempt| attempt.max_attempts).max(),
+        }
+    }
+
+    pub fn record_attempt(&self, call_id: &str, attempt: u32, max_attempts: u32, retrying: bool) {
+        self.inner
+            .lock()
+            .expect("allocator poisoned")
+            .attempts
+            .insert(
+                call_id.to_string(),
+                RequestAttempt {
+                    attempt,
+                    max_attempts,
+                    retrying,
+                },
+            );
     }
 
     pub fn contains_call(&self, call_id: &str) -> bool {
@@ -218,6 +282,14 @@ impl Allocator {
     /// construction (one lease per worker per round-trip).
     pub fn release(&self, lease_id: &str) {
         let mut g = self.inner.lock().expect("allocator poisoned");
+        if let Some(call_id) = g
+            .leased
+            .iter()
+            .find(|(lease, _)| lease.lease_id == lease_id)
+            .map(|(_, call)| call.id.clone())
+        {
+            g.attempts.remove(&call_id);
+        }
         g.leased.retain(|(l, _)| l.lease_id != lease_id);
     }
 
@@ -250,6 +322,7 @@ impl Allocator {
         }
         let (_, call) = g.leased.remove(idx);
         let call_id = call.id;
+        g.attempts.remove(&call_id);
         g.completed.insert(call_id.clone(), submission);
         Ok(call_id)
     }
@@ -307,6 +380,7 @@ impl Allocator {
         while i < g.leased.len() {
             if g.leased[i].0.is_expired() {
                 let (_, call) = g.leased.remove(i);
+                g.attempts.remove(&call.id);
                 expired.push(call);
             } else {
                 i += 1;
@@ -384,6 +458,31 @@ mod tests {
         assert_eq!(allocator.allocate().unwrap().0.id, "task-b-1");
         assert!(!allocator.contains_call("task-a-2"));
         assert!(allocator.contains_call("task-a-1"));
+    }
+
+    #[test]
+    fn activity_separates_queue_in_flight_and_retry_attempts() {
+        let allocator = Allocator::new(2);
+        allocator.enqueue(call("task-a-1", 10));
+        allocator.enqueue(call("task-a-2", 10));
+        allocator.enqueue(call("task-b-1", 10));
+        let (_, lease) = allocator.allocate().unwrap();
+        allocator.record_attempt("task-a-1", 2, 3, true);
+
+        let ids = HashSet::from(["task-a-1".to_string(), "task-a-2".to_string()]);
+        assert_eq!(
+            allocator.activity_for(&ids),
+            CallActivity {
+                queued: 1,
+                in_flight: 1,
+                retrying: 1,
+                attempt: Some(2),
+                max_attempts: Some(3),
+            }
+        );
+
+        allocator.release(&lease.lease_id);
+        assert_eq!(allocator.activity_for(&ids).attempt, None);
     }
 
     #[test]

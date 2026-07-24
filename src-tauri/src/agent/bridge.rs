@@ -80,6 +80,15 @@ pub struct BridgeAnswer {
     pub completion_tokens: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeAttemptEvent {
+    /// One-based attempt number shown to the user.
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// True while waiting to start this attempt after a failed request.
+    pub retrying: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum BridgeError {
     Transport(String),
@@ -126,17 +135,31 @@ impl AgentBridge {
     /// Execute one call, with retry + validation-feedback injection.
     /// The `validate` closure decides whether the assembled answer is
     /// acceptable; rejections trigger the in-place retry budget.
-    pub async fn call<F>(
+    pub async fn call<F>(&self, call: BridgeCall, validate: F) -> Result<BridgeAnswer, BridgeError>
+    where
+        F: Fn(&str) -> Result<(), Vec<String>>,
+    {
+        self.call_observed(call, validate, |_| {}).await
+    }
+
+    pub async fn call_observed<F, O>(
         &self,
         mut call: BridgeCall,
         validate: F,
+        observe: O,
     ) -> Result<BridgeAnswer, BridgeError>
     where
         F: Fn(&str) -> Result<(), Vec<String>>,
+        O: Fn(BridgeAttemptEvent),
     {
         let max = self.cfg.max_attempts.max(1);
         let mut last_err = Vec::<String>::new();
         for attempt in 0..max {
+            observe(BridgeAttemptEvent {
+                attempt: attempt + 1,
+                max_attempts: max,
+                retrying: false,
+            });
             call.validator_feedback = last_err.clone();
             let mut attempt_call = call.clone();
             // The very first attempt has no feedback; the prompt is plain.
@@ -153,6 +176,13 @@ impl AgentBridge {
                             "validation failed: {} errors; retrying with feedback",
                             last_err.len()
                         );
+                        if attempt + 1 < max {
+                            observe(BridgeAttemptEvent {
+                                attempt: attempt + 2,
+                                max_attempts: max,
+                                retrying: true,
+                            });
+                        }
                         continue;
                     }
                     return Ok(ans);
@@ -160,6 +190,13 @@ impl AgentBridge {
                 Err(BridgeError::Transport(msg)) => {
                     let backoff = Duration::from_millis(250 * (1u64 << attempt));
                     tracing::warn!(attempt, "transport error: {msg}; backing off {backoff:?}");
+                    if attempt + 1 < max {
+                        observe(BridgeAttemptEvent {
+                            attempt: attempt + 2,
+                            max_attempts: max,
+                            retrying: true,
+                        });
+                    }
                     tokio::time::sleep(backoff).await;
                     continue;
                 }

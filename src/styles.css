@@ -1541,6 +1541,17 @@ input::placeholder {
   margin-top: 8px;
 }
 
+.setup-job-progress .setup-job-detail {
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.setup-job-progress .setup-job-transfer {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
 .setup-job-progress button {
   margin-top: 10px;
 }
@@ -7950,6 +7961,11 @@ pre.out {
 
 .task-inline-error {
   color: var(--danger) !important;
+}
+
+.task-live-activity {
+  color: var(--accent) !important;
+  font-variant-numeric: tabular-nums;
 }
 
 .task-status-read-error {

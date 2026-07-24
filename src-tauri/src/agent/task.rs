@@ -510,6 +510,16 @@ pub struct TaskKindStatus {
     pub last_error: Option<String>,
     pub started_at: Option<u64>,
     pub updated_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrying: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
 }
 
 /// Build one durable status row per task kind. Only files belonging to the
@@ -635,6 +645,11 @@ pub fn task_kind_statuses(project_dir: &Path) -> Vec<TaskKindStatus> {
                 last_error,
                 started_at,
                 updated_at,
+                queued: None,
+                in_flight: None,
+                retrying: None,
+                attempt: None,
+                max_attempts: None,
             })
         })
         .collect::<Vec<_>>();

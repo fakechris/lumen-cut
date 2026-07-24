@@ -88,10 +88,21 @@ async fn worker_loop(allocator: Arc<Allocator>, name: String) {
                 .flatten();
             let result = match latest_config {
                 Some(config) => {
+                    let attempt_allocator = allocator.clone();
+                    let call_id = call.id.clone();
                     AgentBridge::new(config)
-                        .call(bc, |ans| {
-                            crate::agent::task::validate_call_answer(&call, ans)
-                        })
+                        .call_observed(
+                            bc,
+                            |ans| crate::agent::task::validate_call_answer(&call, ans),
+                            move |event| {
+                                attempt_allocator.record_attempt(
+                                    &call_id,
+                                    event.attempt,
+                                    event.max_attempts,
+                                    event.retrying,
+                                );
+                            },
+                        )
                         .await
                 }
                 None => Err(crate::agent::bridge::BridgeError::Transport(

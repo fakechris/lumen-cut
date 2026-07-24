@@ -22,6 +22,49 @@ const DIARIZE_PACKAGE: &str = "pyannote.audio==3.4.0";
 const TORCH_PACKAGE: &str = "torch==2.5.1";
 const TORCHAUDIO_PACKAGE: &str = "torchaudio==2.5.1";
 const HUGGING_FACE_HUB_PACKAGE: &str = "huggingface-hub==0.36.2";
+const DOWNLOAD_PROGRESS_PREFIX: &str = "LUMEN_CUT_DOWNLOAD_PROGRESS ";
+const SNAPSHOT_DOWNLOAD_SCRIPT: &str = r#"
+import json
+import sys
+import time
+from huggingface_hub import snapshot_download
+from tqdm.auto import tqdm
+
+class LumenProgress(tqdm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_emit = 0.0
+        self._emit(force=True)
+
+    def _emit(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_emit < 0.25:
+            return
+        self._last_emit = now
+        data = self.format_dict
+        print(
+            "LUMEN_CUT_DOWNLOAD_PROGRESS " + json.dumps({
+                "current": int(data.get("n") or 0),
+                "total": int(data.get("total") or 0) or None,
+                "rate": float(data.get("rate") or 0.0) or None,
+                "unit": str(data.get("unit") or "files"),
+                "detail": str(data.get("prefix") or data.get("desc") or ""),
+            }, ensure_ascii=False),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def update(self, n=1):
+        result = super().update(n)
+        self._emit()
+        return result
+
+    def close(self):
+        self._emit(force=True)
+        return super().close()
+
+snapshot_download(sys.argv[1], tqdm_class=LumenProgress)
+"#;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +87,38 @@ pub struct RuntimeStatus {
     pub hugging_face_token_set: bool,
     pub diarize_ready: bool,
     pub ready: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetupProgressUpdate {
+    pub phase: &'static str,
+    pub progress: Option<u8>,
+    pub detail: String,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub unit: Option<&'static str>,
+    pub bytes_per_second: Option<u64>,
+}
+
+pub type SetupProgressCallback = Arc<dyn Fn(SetupProgressUpdate) + Send + Sync>;
+
+fn report_setup(
+    progress: Option<&SetupProgressCallback>,
+    phase: &'static str,
+    percent: Option<u8>,
+    detail: impl Into<String>,
+) {
+    if let Some(progress) = progress {
+        progress(SetupProgressUpdate {
+            phase,
+            progress: percent,
+            detail: detail.into(),
+            current: None,
+            total: None,
+            unit: None,
+            bytes_per_second: None,
+        });
+    }
 }
 
 pub fn managed_python(home: &Path) -> PathBuf {
@@ -258,21 +333,159 @@ async fn install_packages(
     python: &Path,
     packages: &[&str],
     sidecar: &'static str,
+    progress: Option<SetupProgressCallback>,
 ) -> AppResult<()> {
     let python = python.display().to_string();
     let mut args = vec!["pip", "install", "--python", python.as_str()];
     args.extend_from_slice(packages);
-    proc::run(&uv.to_string_lossy(), &args)
-        .await
-        .map_err(|error| AppError::Sidecar {
-            sidecar,
-            message: error.to_string(),
-        })?;
+    let on_line = progress.map(|progress| {
+        Arc::new(move |line: String| {
+            let detail = line.trim();
+            if !detail.is_empty() {
+                progress(SetupProgressUpdate {
+                    phase: "installing",
+                    progress: Some(35),
+                    detail: detail.chars().take(240).collect(),
+                    current: None,
+                    total: None,
+                    unit: None,
+                    bytes_per_second: None,
+                });
+            }
+        }) as proc::ProgressLineCallback
+    });
+    let result = if let Some(on_line) = on_line {
+        proc::run_with_progress(&uv.to_string_lossy(), &args, on_line).await
+    } else {
+        proc::run(&uv.to_string_lossy(), &args).await
+    };
+    result.map_err(|error| AppError::Sidecar {
+        sidecar,
+        message: error.to_string(),
+    })?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadProgressLine {
+    current: u64,
+    total: Option<u64>,
+    rate: Option<f64>,
+    unit: String,
+    detail: String,
+}
+
+fn snapshot_progress_callback(
+    progress: Option<SetupProgressCallback>,
+    model_id: String,
+    model_index: usize,
+    model_count: usize,
+) -> proc::ProgressLineCallback {
+    Arc::new(move |line: String| {
+        let Some(progress) = progress.as_ref() else {
+            return;
+        };
+        let Some(raw) = line.strip_prefix(DOWNLOAD_PROGRESS_PREFIX) else {
+            return;
+        };
+        let Ok(event) = serde_json::from_str::<DownloadProgressLine>(raw) else {
+            return;
+        };
+        let is_bytes = event.unit.eq_ignore_ascii_case("b")
+            || event.unit.to_ascii_lowercase().contains("byte");
+        let model_span = 90.0 / model_count.max(1) as f64;
+        let model_start = 5.0 + model_span * model_index as f64;
+        let overall = if is_bytes {
+            None
+        } else {
+            event
+                .total
+                .filter(|total| *total > 0)
+                .map(|total| {
+                    model_start + model_span * (event.current as f64 / total as f64).clamp(0.0, 1.0)
+                })
+                .map(|value| value.round().clamp(0.0, 99.0) as u8)
+        };
+        let detail = if event.detail.trim().is_empty() {
+            model_id.clone()
+        } else {
+            format!("{model_id} · {}", event.detail.trim())
+        };
+        progress(SetupProgressUpdate {
+            phase: "downloading",
+            progress: overall,
+            detail,
+            current: Some(event.current),
+            total: event.total,
+            unit: Some(if is_bytes { "bytes" } else { "files" }),
+            bytes_per_second: if is_bytes {
+                event.rate.map(|rate| rate.max(0.0).round() as u64)
+            } else {
+                None
+            },
+        });
+    })
+}
+
+async fn download_snapshot(
+    python: &str,
+    model_id: &str,
+    model_index: usize,
+    model_count: usize,
+    environment: &[(&str, &str)],
+    progress: Option<SetupProgressCallback>,
+) -> AppResult<()> {
+    let model_span = 90.0 / model_count.max(1) as f64;
+    let model_start = (5.0 + model_span * model_index as f64).round() as u8;
+    report_setup(
+        progress.as_ref(),
+        "downloading",
+        Some(model_start),
+        format!(
+            "Preparing model {} of {} · {model_id}",
+            model_index + 1,
+            model_count
+        ),
+    );
+    proc::run_with_env_progress(
+        python,
+        &["-c", SNAPSHOT_DOWNLOAD_SCRIPT, model_id],
+        environment,
+        snapshot_progress_callback(
+            progress.clone(),
+            model_id.to_string(),
+            model_index,
+            model_count,
+        ),
+    )
+    .await?;
+    report_setup(
+        progress.as_ref(),
+        "downloading",
+        Some((5.0 + model_span * (model_index + 1) as f64).round() as u8),
+        format!(
+            "Downloaded model {} of {} · {model_id}",
+            model_index + 1,
+            model_count
+        ),
+    );
     Ok(())
 }
 
 pub async fn install_asr_runtime() -> AppResult<RuntimeStatus> {
+    install_asr_runtime_with_progress(None).await
+}
+
+pub async fn install_asr_runtime_with_progress(
+    progress: Option<SetupProgressCallback>,
+) -> AppResult<RuntimeStatus> {
     let _heavy_work = crate::performance::acquire_heavy("install-asr-runtime").await?;
+    report_setup(
+        progress.as_ref(),
+        "preparing",
+        Some(5),
+        "Checking the managed Python environment",
+    );
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -282,7 +495,26 @@ pub async fn install_asr_runtime() -> AppResult<RuntimeStatus> {
             .into(),
     })?;
     let python = ensure_managed_runtime(&home, &uv).await?;
-    install_packages(&uv, &python, &[ASR_PACKAGE], "lumen_cut_asr").await?;
+    report_setup(
+        progress.as_ref(),
+        "installing",
+        Some(20),
+        "Resolving and installing transcription packages",
+    );
+    install_packages(
+        &uv,
+        &python,
+        &[ASR_PACKAGE],
+        "lumen_cut_asr",
+        progress.clone(),
+    )
+    .await?;
+    report_setup(
+        progress.as_ref(),
+        "verifying",
+        Some(92),
+        "Verifying the transcription runtime",
+    );
     proc::run(&python.to_string_lossy(), &["-c", "import mlx_qwen3_asr"])
         .await
         .map_err(|error| AppError::Sidecar {
@@ -293,7 +525,19 @@ pub async fn install_asr_runtime() -> AppResult<RuntimeStatus> {
 }
 
 pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
+    install_diarize_runtime_with_progress(None).await
+}
+
+pub async fn install_diarize_runtime_with_progress(
+    progress: Option<SetupProgressCallback>,
+) -> AppResult<RuntimeStatus> {
     let _heavy_work = crate::performance::acquire_heavy("install-speaker-runtime").await?;
+    report_setup(
+        progress.as_ref(),
+        "preparing",
+        Some(5),
+        "Checking the managed Python environment",
+    );
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -303,6 +547,12 @@ pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
             .into(),
     })?;
     let python = ensure_managed_runtime(&home, &uv).await?;
+    report_setup(
+        progress.as_ref(),
+        "installing",
+        Some(20),
+        "Resolving and installing speaker packages",
+    );
     install_packages(
         &uv,
         &python,
@@ -313,8 +563,15 @@ pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
             HUGGING_FACE_HUB_PACKAGE,
         ],
         "lumen_cut_diarize",
+        progress.clone(),
     )
     .await?;
+    report_setup(
+        progress.as_ref(),
+        "verifying",
+        Some(92),
+        "Verifying the speaker runtime",
+    );
     proc::run(
         &python.to_string_lossy(),
         &[
@@ -331,21 +588,38 @@ pub async fn install_diarize_runtime() -> AppResult<RuntimeStatus> {
 }
 
 pub async fn download_asr_models() -> AppResult<RuntimeStatus> {
+    download_asr_models_with_progress(None).await
+}
+
+pub async fn download_asr_models_with_progress(
+    progress: Option<SetupProgressCallback>,
+) -> AppResult<RuntimeStatus> {
     let _heavy_work = crate::performance::acquire_heavy("download-asr-models").await?;
     let status = runtime_status();
     let python = status.python_path.ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_asr",
         message: "install the local transcription runtime before downloading models".into(),
     })?;
-    let script =
-        "from huggingface_hub import snapshot_download; import sys; snapshot_download(sys.argv[1])";
-    for model in [&status.model_id, &status.aligner_id] {
-        proc::run(&python, &["-c", script, model]).await?;
+    let models = [&status.model_id, &status.aligner_id];
+    for (index, model) in models.iter().enumerate() {
+        download_snapshot(&python, model, index, models.len(), &[], progress.clone()).await?;
     }
+    report_setup(
+        progress.as_ref(),
+        "verifying",
+        Some(97),
+        "Verifying complete model snapshots",
+    );
     Ok(runtime_status())
 }
 
 pub async fn download_diarize_model() -> AppResult<RuntimeStatus> {
+    download_diarize_model_with_progress(None).await
+}
+
+pub async fn download_diarize_model_with_progress(
+    progress: Option<SetupProgressCallback>,
+) -> AppResult<RuntimeStatus> {
     let _heavy_work = crate::performance::acquire_heavy("download-speaker-model").await?;
     let status = runtime_status();
     if status.diarize_model_cached {
@@ -374,6 +648,32 @@ pub async fn download_diarize_model() -> AppResult<RuntimeStatus> {
             message: "set a Hugging Face token and accept the speaker-diarization-3.1 model terms before downloading"
                 .into(),
         })?;
+    let models = if status.diarize_model_id == "pyannote/speaker-diarization-3.1" {
+        vec![
+            status.diarize_model_id.clone(),
+            "pyannote/segmentation-3.0".into(),
+            "pyannote/wespeaker-voxceleb-resnet34-LM".into(),
+        ]
+    } else {
+        vec![status.diarize_model_id.clone()]
+    };
+    for (index, model) in models.iter().enumerate() {
+        download_snapshot(
+            &python,
+            model,
+            index,
+            models.len(),
+            &[("HF_TOKEN", token.as_str())],
+            progress.clone(),
+        )
+        .await?;
+    }
+    report_setup(
+        progress.as_ref(),
+        "verifying",
+        Some(97),
+        "Loading and verifying the speaker pipeline",
+    );
     let diarize_script =
         "from pyannote.audio import Pipeline; import sys; Pipeline.from_pretrained(sys.argv[1])";
     proc::run_with_env(
@@ -636,6 +936,44 @@ fn locate_sidecar(rel: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_structured_snapshot_progress_with_real_transfer_units() {
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = updates.clone();
+        let progress: SetupProgressCallback = Arc::new(move |update| {
+            sink.lock().unwrap().push(update);
+        });
+        let callback = snapshot_progress_callback(Some(progress), "org/model".into(), 0, 2);
+        callback(
+            r#"LUMEN_CUT_DOWNLOAD_PROGRESS {"current":524288,"total":1048576,"rate":262144.0,"unit":"B","detail":"model.safetensors"}"#
+                .into(),
+        );
+
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].phase, "downloading");
+        assert_eq!(updates[0].progress, None);
+        assert_eq!(updates[0].current, Some(524_288));
+        assert_eq!(updates[0].total, Some(1_048_576));
+        assert_eq!(updates[0].unit, Some("bytes"));
+        assert_eq!(updates[0].bytes_per_second, Some(262_144));
+        assert!(updates[0].detail.contains("model.safetensors"));
+    }
+
+    #[test]
+    fn snapshot_progress_sidecar_is_valid_python() {
+        let status = Command::new("python3")
+            .args([
+                "-c",
+                "import sys; compile(sys.argv[1], '<snapshot-progress>', 'exec')",
+                SNAPSHOT_DOWNLOAD_SCRIPT,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn parses_structured_sidecar_progress_without_accepting_log_noise() {
