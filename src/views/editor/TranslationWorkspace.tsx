@@ -58,6 +58,31 @@ const translationRowKey = (
 ) => sentence.id;
 const EMPTY_TRACK: Record<string, { text: string }> = {};
 
+export function translationActivityLabel(
+  task: TaskStatus["kinds"][number] | undefined,
+  lang: Lang,
+) {
+  if (!task || (task.queued === undefined && task.inFlight === undefined)) return null;
+  const parts: string[] = [];
+  if ((task.inFlight ?? 0) > 0) {
+    parts.push(lang === "zh" ? `${task.inFlight} 个请求正在等待模型返回` : `${task.inFlight} request(s) awaiting the model`);
+  }
+  if ((task.queued ?? 0) > 0) {
+    parts.push(lang === "zh" ? `${task.queued} 个批次排队中` : `${task.queued} batch(es) queued`);
+  }
+  if ((task.retrying ?? 0) > 0 && task.attempt && task.maxAttempts) {
+    parts.push(
+      lang === "zh"
+        ? `重试第 ${task.attempt}/${task.maxAttempts} 次`
+        : `retry attempt ${task.attempt}/${task.maxAttempts}`,
+    );
+  }
+  if (parts.length === 0 && task.pending > 0) {
+    return lang === "zh" ? "正在校验并保存模型结果" : "Validating and saving model results";
+  }
+  return parts.join(" · ");
+}
+
 export function TranslationWorkspace({
   configured,
   currentTime,
@@ -142,6 +167,7 @@ export function TranslationWorkspace({
     ? translateTask.calls ?? translateTask.pending + translateTask.done + translateTask.failed
     : 0;
   const taskStopped = translateTask?.state === "paused" || translateTask?.state === "failed";
+  const liveActivity = translationActivityLabel(translateTask, lang);
   const visibleSentences = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) return sentences;
@@ -373,6 +399,7 @@ export function TranslationWorkspace({
                 : `${translateTask.done} / ${batchTotal} batches completed`}
               {translateTask.failed > 0 && ` · ${translateTask.failed} ${lang === "zh" ? "失败" : "failed"}`}
             </span>
+            {liveActivity && <small className="task-live-activity">{liveActivity}</small>}
             <progress
               aria-label={lang === "zh" ? "翻译进度" : "Translation progress"}
               max={Math.max(batchTotal, 1)}

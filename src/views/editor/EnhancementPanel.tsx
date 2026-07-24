@@ -113,6 +113,18 @@ export function EnhancementPanel({
                 {failed && taskState?.lastError && (
                   <small className="task-inline-error">{taskState.lastError}</small>
                 )}
+                {running && taskState?.inFlight !== undefined && (
+                  <small className="task-live-activity">
+                    {lang === "zh"
+                      ? `${taskState.inFlight} 个请求在途 · ${taskState.queued ?? 0} 个等待`
+                      : `${taskState.inFlight} in flight · ${taskState.queued ?? 0} queued`}
+                    {(taskState.retrying ?? 0) > 0 && taskState.attempt && taskState.maxAttempts
+                      ? lang === "zh"
+                        ? ` · 重试 ${taskState.attempt}/${taskState.maxAttempts}`
+                        : ` · retry ${taskState.attempt}/${taskState.maxAttempts}`
+                      : ""}
+                  </small>
+                )}
               </div>
               <span
                 className={

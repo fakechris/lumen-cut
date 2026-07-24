@@ -176,6 +176,55 @@ const COPY = {
   },
 } as const;
 
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+export function setupTransferLabel(job: SetupJobStatus, lang: Lang) {
+  const parts: string[] = [];
+  if (job.current !== null && job.current !== undefined) {
+    if (job.unit === "bytes") {
+      parts.push(
+        job.total
+          ? `${formatBytes(job.current)} / ${formatBytes(job.total)}`
+          : formatBytes(job.current),
+      );
+    } else if (job.unit === "files") {
+      parts.push(
+        job.total
+          ? lang === "zh"
+            ? `${job.current} / ${job.total} 个文件`
+            : `${job.current} / ${job.total} files`
+          : lang === "zh"
+            ? `${job.current} 个文件`
+            : `${job.current} files`,
+      );
+    }
+  }
+  if (job.bytesPerSecond) {
+    parts.push(`${formatBytes(job.bytesPerSecond)}/s`);
+  }
+  if (job.startedAt) {
+    const seconds = Math.max(0, Math.round(Date.now() / 1000 - job.startedAt));
+    parts.push(
+      seconds < 60
+        ? lang === "zh" ? `${seconds} 秒` : `${seconds} sec`
+        : lang === "zh"
+          ? `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+          : `${Math.floor(seconds / 60)}m ${seconds % 60}s`,
+    );
+  }
+  return parts.join(" · ");
+}
+
 export function SettingsView({ lang }: Props) {
   const c = COPY[lang];
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
@@ -764,19 +813,40 @@ export function SettingsView({ lang }: Props) {
                 <strong>
                   {setupJob.phase === "waiting"
                     ? lang === "zh" ? "正在等待计算资源" : "Waiting for compute capacity"
+                    : setupJob.phase === "preparing"
+                      ? lang === "zh" ? "正在准备本地环境" : "Preparing the local environment"
                     : setupJob.phase === "downloading"
                       ? lang === "zh" ? "正在下载模型文件" : "Downloading model files"
                       : setupJob.phase === "installing"
                         ? lang === "zh" ? "正在安装本地运行环境" : "Installing local runtime"
+                        : setupJob.phase === "verifying"
+                          ? lang === "zh" ? "正在验证安装完整性" : "Verifying setup integrity"
                         : lang === "zh" ? "正在安全停止" : "Stopping safely"}
                 </strong>
-                <span>{setupJob.kind}</span>
+                <span>
+                  {setupJob.kind}
+                  {setupJob.progress !== null && setupJob.progress !== undefined
+                    ? ` · ${setupJob.progress}%`
+                    : ""}
+                </span>
               </div>
-              <progress aria-label={lang === "zh" ? "环境准备进度" : "Setup progress"} />
+              {setupJob.progress !== null && setupJob.progress !== undefined ? (
+                <progress
+                  aria-label={lang === "zh" ? "环境准备进度" : "Setup progress"}
+                  max={100}
+                  value={setupJob.progress}
+                />
+              ) : (
+                <progress aria-label={lang === "zh" ? "环境准备进度" : "Setup progress"} />
+              )}
+              {setupJob.detail && <small className="setup-job-detail">{setupJob.detail}</small>}
+              {setupTransferLabel(setupJob, lang) && (
+                <small className="setup-job-transfer">{setupTransferLabel(setupJob, lang)}</small>
+              )}
               <small>
                 {lang === "zh"
-                  ? "当前工具没有提供可信的总字节数，因此这里明确显示不定进度；详细失败输出会保留末尾日志。"
-                  : "This tool does not expose a trustworthy total byte count, so progress is explicitly indeterminate; failure output keeps a bounded log tail."}
+                  ? "百分比表示可验证的安装阶段和模型文件进度；有可靠字节总量时会同时显示大小与实时速度。"
+                  : "Percent reflects verified setup stages and model-file progress. Size and live throughput appear when trustworthy byte totals are available."}
               </small>
               <PipelineFreshness
                 state={setupJob.state}

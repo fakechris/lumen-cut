@@ -138,6 +138,37 @@ function phaseLabel(phase: string, lang: Lang) {
   return labels[phase]?.[lang === "zh" ? 0 : 1] ?? phase;
 }
 
+export function agentActivityLabel(
+  task: TaskStatus["kinds"][number],
+  lang: Lang,
+) {
+  if (task.queued === undefined && task.inFlight === undefined) return null;
+  const queued = task.queued ?? 0;
+  const inFlight = task.inFlight ?? 0;
+  const retrying = task.retrying ?? 0;
+  const parts: string[] = [];
+  if (inFlight > 0) {
+    parts.push(lang === "zh" ? `${inFlight} 个请求在途` : `${inFlight} in flight`);
+  }
+  if (queued > 0) {
+    parts.push(lang === "zh" ? `${queued} 个等待发送` : `${queued} queued`);
+  }
+  if (retrying > 0) {
+    parts.push(lang === "zh" ? `${retrying} 个正在重试` : `${retrying} retrying`);
+  }
+  if (task.attempt && task.maxAttempts && task.attempt > 1) {
+    parts.push(
+      lang === "zh"
+        ? `当前第 ${task.attempt}/${task.maxAttempts} 次尝试`
+        : `attempt ${task.attempt}/${task.maxAttempts}`,
+    );
+  }
+  if (parts.length === 0 && task.pending > 0) {
+    return lang === "zh" ? "模型已返回，正在校验并保存结果" : "Validating and saving returned results";
+  }
+  return parts.join(" · ");
+}
+
 function freshnessLabel(
   state: string,
   phase: string,
@@ -563,6 +594,7 @@ export function TaskCenterView({ lang, projects, onOpenProject }: Props) {
                           task.updatedAt,
                           lang,
                         );
+                        const activity = agentActivityLabel(task, lang);
                         return (
                           <div className="task-agent-job" key={`${task.kind}-${task.lang || ""}`}>
                             <span>
@@ -575,6 +607,7 @@ export function TaskCenterView({ lang, projects, onOpenProject }: Props) {
                                     : zh ? "完成" : "done"}
                                 {eta ? ` · ${eta}` : ""}
                               </small>
+                              {activity && <small className="task-live-activity">{activity}</small>}
                               {freshness && (
                                 <small className={freshness.stale ? "task-stale-warning" : "task-update-age"}>
                                   {freshness.text}

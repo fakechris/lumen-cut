@@ -248,9 +248,15 @@ export interface VideoExportSettings {
 export interface SetupJobStatus {
   kind: "asr-runtime" | "asr-models" | "speaker-runtime" | "speaker-model";
   state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
-  phase: "waiting" | "installing" | "downloading" | "completed" | "cancelling" | "cancelled" | "failed";
+  phase: "waiting" | "preparing" | "installing" | "downloading" | "verifying" | "completed" | "cancelling" | "cancelled" | "failed";
   startedAt?: number | null;
   updatedAt?: number | null;
+  progress?: number | null;
+  detail?: string | null;
+  current?: number | null;
+  total?: number | null;
+  unit?: "bytes" | "files" | null;
+  bytesPerSecond?: number | null;
   error: string | null;
 }
 
@@ -285,6 +291,11 @@ export interface TaskStatus {
     pending: number;
     done: number;
     failed: number;
+    queued?: number;
+    inFlight?: number;
+    retrying?: number;
+    attempt?: number;
+    maxAttempts?: number;
     lastError?: string | null;
     startedAt?: number | null;
     updatedAt?: number | null;
