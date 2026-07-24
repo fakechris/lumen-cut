@@ -25,6 +25,23 @@ The CLI additionally exposes automation-oriented audit, task, MCP, and HTTP
 interfaces. Desktop features have discoverable UI paths with progress and
 recovery states; lower-level automation remains available to advanced users.
 
+One-shot CLI examples:
+
+```bash
+# ASR-only (default)
+lumen-cut-cli auto talk.mp4 --source-lang en --out ./projects
+
+# Transcribe → translate → align (skip polish)
+lumen-cut-cli auto talk.mp4 --source-lang en --lang zh --no-polish --out ./projects
+
+# Soft-cut detect / list / restore
+lumen-cut-cli cut ./projects/talk --auto
+lumen-cut-cli cut ./projects/talk --list --kind filler
+lumen-cut-cli export ./projects/talk --srt --bilingual --lang zh -o talk.zh.srt
+lumen-cut-cli align list talk --lang zh --fit 16 --root ./projects
+lumen-cut-cli task start align talk --lang zh --groups g1,g2 --align-fit 16 --root ./projects
+```
+
 ## Requirements
 
 - macOS 14 or newer on Apple silicon

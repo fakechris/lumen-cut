@@ -3,13 +3,19 @@
 //! Stage 4 surface — `auto` + `task`/`align`/`diarize`/`finish-check`/`cut`/`version`/`audit`.
 //!
 //! Examples:
-//!   lumen-cut auto samples/demo.mp4 --lang zh
+//!   lumen-cut auto samples/demo.mp4 --source-lang en
+//!   lumen-cut auto samples/demo.mp4 --source-lang en --lang zh --no-polish
+//!   lumen-cut auto samples/demo.mp4 --lang zh --rough-cut
 //!   lumen-cut project create demo --from samples/demo.mp4
 //!   lumen-cut task start translate demo --lang en
-//!   lumen-cut align list demo --lang zh
+//!   lumen-cut task start align demo --lang zh --groups g1,g2 --align-fit 16
+//!   lumen-cut align list demo --lang zh --fit 16
 //!   lumen-cut diarize demo
 //!   lumen-cut finish-check demo --strict
 //!   lumen-cut cut demo --auto
+//!   lumen-cut cut demo --list --kind filler
+//!   lumen-cut cut demo --add --start 1.0 --end 2.5 --note "manual"
+//!   lumen-cut export demo --srt --bilingual --lang zh -o out.srt
 //!   lumen-cut version demo list
 //!   lumen-cut audit demo
 
@@ -35,8 +41,8 @@ use lumen_cut::diarize::{
 };
 use lumen_cut::error::{AppError, AppResult};
 use lumen_cut::export::{
-    write_ass, write_ass_with_style, write_md, write_md_with_chapters, write_srt, write_srt_with,
-    write_vtt, write_vtt_with,
+    write_ass, write_ass_with_style, write_md, write_md_with_chapters, write_srt_with,
+    write_vtt_with,
 };
 use lumen_cut::media::{extract_audio_wav, probe};
 use lumen_cut::media_url::download;
@@ -177,17 +183,41 @@ enum Cmd {
         #[command(subcommand)]
         action: ProjectCmd,
     },
-    /// Pipeline: media → audio → ASR → doc.json → srt/vtt.
+    /// Pipeline: media → audio → ASR → doc → optional polish/translate/align/cleanup.
+    ///
+    /// ASR-only (default): `auto media [--source-lang|--lang L]`.
+    /// With translation: set `--lang` as the target together with either
+    /// `--source-lang`, `--no-polish`, or `--rough-cut` so the one-shot
+    /// agent stages run after transcription.
     Auto {
         media: String,
+        /// Translate target language when multi-stage pipeline is enabled.
+        /// For ASR-only runs (no translate/rough-cut intent), also used as
+        /// the transcription language for backward compatibility.
         #[arg(long)]
         lang: Option<String>,
+        /// Transcription / source language (preferred over `--lang` for ASR).
+        #[arg(long)]
+        source_lang: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
         out: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
+        /// Skip polish before translate/cleanup stages (polish runs by default
+        /// whenever those stages are selected).
+        #[arg(long, default_value_t = false)]
+        no_polish: bool,
+        /// After optional polish/translate, run soft-cut detection and apply.
+        #[arg(long, default_value_t = false)]
+        rough_cut: bool,
+        /// Override one-line fit capacity for the align stage (8..32).
+        #[arg(long)]
+        align_fit: Option<usize>,
+        /// Translate only groups whose source text changed.
+        #[arg(long, default_value_t = false)]
+        stale_only: bool,
     },
     /// Drive one of the eight agent task contracts.
     Task {
@@ -205,13 +235,42 @@ enum Cmd {
         #[arg(long)]
         strict: bool,
     },
-    /// Soft-cut apply / restore.
+    /// Soft-cut detect / list / add / restore.
+    ///
+    /// Requires exactly one action: `--auto`/`--detect`, `--list`, `--add`,
+    /// or `--restore` / `--restore-all`.
     Cut {
         pid: String,
-        #[arg(long)]
+        /// Apply deterministic detect (alias of `--detect`).
+        #[arg(long, alias = "detect")]
         auto: bool,
+        /// List cuts (optionally filter with `--kind`).
+        #[arg(long, default_value_t = false)]
+        list: bool,
+        /// Filter `--list` by kind: silence|filler|retake|falsestart|badtake|manual.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Add a manual cut from `--start/--end` seconds or `--words a..b`.
+        #[arg(long, default_value_t = false)]
+        add: bool,
+        #[arg(long)]
+        start: Option<f64>,
+        #[arg(long)]
+        end: Option<f64>,
+        /// Inclusive word-id span, e.g. `w1..w4` or `w1,w4`.
+        #[arg(long)]
+        words: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// Restore (remove) one cut by id.
         #[arg(long)]
         restore: Option<String>,
+        /// Remove every cut.
+        #[arg(long, default_value_t = false)]
+        restore_all: bool,
+        /// With `--auto`/`--detect`, only print proposals without writing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Version control: list / 3-way merge / dump.
     Version {
@@ -220,14 +279,40 @@ enum Cmd {
     },
     /// Run the project delivery audit.
     Audit { pid: String },
-    /// Export subtitles with soft-cut retime applied (srt/vtt/ass/md),
-    /// or burn-in video with `--video`.
+    /// Export subtitles with soft-cut retime applied, and optional video/FCP.
+    ///
+    /// Format flags (`--srt/--vtt/--ass/--markdown/--video/--fcp`) select
+    /// outputs. With none set, all timed-text formats are written under the
+    /// project directory (legacy default).
     Export {
         pid: String,
         #[arg(long)]
         video: bool,
         #[arg(long)]
         fcp: bool,
+        #[arg(long)]
+        srt: bool,
+        #[arg(long)]
+        vtt: bool,
+        #[arg(long)]
+        ass: bool,
+        #[arg(long)]
+        markdown: bool,
+        /// Translation-only captions (requires `--lang`).
+        #[arg(long, default_value_t = false)]
+        translated: bool,
+        /// Source + translation captions (requires `--lang`).
+        #[arg(long, default_value_t = false)]
+        bilingual: bool,
+        /// Caption language for translated/bilingual modes.
+        #[arg(long)]
+        lang: Option<String>,
+        /// Include speaker labels in markdown when available.
+        #[arg(long, default_value_t = false)]
+        speakers: bool,
+        /// Output path for a single selected format, or directory for multi.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
     },
     /// Speaker diarization: pyannote sidecar → doc.json `speaker` fields.
     Diarize { pid: String },
@@ -692,25 +777,38 @@ async fn run_cli() -> AppResult<()> {
         Cmd::Auto {
             media,
             lang,
+            source_lang,
             title,
             out,
             model,
+            no_polish,
+            rough_cut,
+            align_fit,
+            stale_only,
         } => {
-            let result = run_auto(
-                &media,
-                lang.as_deref(),
-                title.as_deref(),
-                out.as_deref(),
-                model.as_deref(),
-            )
+            let result = run_auto(AutoOptions {
+                media: &media,
+                lang: lang.as_deref(),
+                source_lang: source_lang.as_deref(),
+                title: title.as_deref(),
+                out_dir: out.as_deref(),
+                model: model.as_deref(),
+                no_polish,
+                rough_cut,
+                align_fit,
+                stale_only,
+            })
             .await?;
             emit!(
                 json,
                 &result,
-                "✓ {}: words={} paragraphs={} → srt + vtt + ass + md",
+                "✓ {}: words={} paragraphs={} polish={} translate={} cuts={} → srt + vtt + ass + md",
                 result.pid_dir.display(),
                 result.words,
-                result.paragraphs
+                result.paragraphs,
+                result.polished,
+                result.translated.as_deref().unwrap_or("-"),
+                result.cuts_added
             );
         }
         Cmd::Task { action } => match action {
@@ -857,49 +955,35 @@ async fn run_cli() -> AppResult<()> {
                 return Err(AppError::Schema("finish-check strict mode failed".into()));
             }
         }
-        Cmd::Cut { pid, auto, restore } => {
-            let dir = PathBuf::from(&pid);
-            let doc = Doc::load(&dir)?;
-            let cuts_path = dir.join("cuts.json");
-            let mut cuts: ClipCuts = if cuts_path.exists() {
-                serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-            } else {
-                ClipCuts::new()
-            };
-            if let Some(id) = restore {
-                if cuts.restore(&id) {
-                    lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
-                    emit!(
-                        json,
-                        serde_json::json!({"id": id, "restored": true, "total": cuts.cuts.len()}),
-                        "✓ cut restore {id}"
-                    );
-                } else {
-                    emit!(
-                        json,
-                        serde_json::json!({"id": id, "restored": false, "total": cuts.cuts.len()}),
-                        "(no-op) cut {id} not found"
-                    );
-                }
-                return Ok(());
-            }
-            if auto {
-                // Auto-detect filler/silence by adding a single filler
-                // cut per detected filler word. Stage 4 ships the
-                // minimal `pipeline::cleanup::detect` + apply path.
-                let added = lumen_cut::pipeline::cleanup::apply(&doc, &mut cuts);
-                lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
-                emit!(
-                    json,
-                    serde_json::json!({"pid": pid, "added": added, "total": cuts.cuts.len()}),
-                    "✓ cut auto {pid}: added={added} total={}",
-                    cuts.cuts.len()
-                );
-                return Ok(());
-            }
-            return Err(AppError::Schema(
-                "cut requires either --auto or --restore <cut-id>".into(),
-            ));
+        Cmd::Cut {
+            pid,
+            auto,
+            list,
+            kind,
+            add,
+            start,
+            end,
+            words,
+            note,
+            restore,
+            restore_all,
+            dry_run,
+        } => {
+            run_cut_command(CutCommand {
+                pid: &pid,
+                auto,
+                list,
+                kind: kind.as_deref(),
+                add,
+                start,
+                end,
+                words: words.as_deref(),
+                note: note.as_deref(),
+                restore: restore.as_deref(),
+                restore_all,
+                dry_run,
+                json,
+            })?;
         }
         Cmd::Audit { pid } => {
             let dir = PathBuf::from(&pid);
@@ -922,83 +1006,36 @@ async fn run_cli() -> AppResult<()> {
                 std::process::exit(code);
             }
         }
-        Cmd::Export { pid, video, fcp } => {
-            let dir = PathBuf::from(&pid);
-            let doc = Doc::load(&dir)?;
-            let cuts_path = dir.join("cuts.json");
-            let cuts: ClipCuts = if cuts_path.exists() {
-                serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-            } else {
-                ClipCuts::new()
-            };
-            let export_settings = lumen_cut::data::export_settings::load(&dir)?;
-            let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
-            let caption_doc = lumen_cut::data::export_settings::project_caption_doc_with_hidden(
-                &doc,
-                export_settings.subtitle_language.as_deref(),
-                export_settings.bilingual_subtitles,
-                &hidden,
-            )?;
-            write_srt_with(&caption_doc, &cuts.cuts, &dir.join("export.srt"))?;
-            write_vtt_with(&caption_doc, &cuts.cuts, &dir.join("export.vtt"))?;
-            let style = lumen_cut::data::substyle::SubStyle::load(&dir)?;
-            write_ass_with_style(
-                &caption_doc,
-                &cuts.cuts,
-                &style,
-                &dir.join("export.ass"),
-                1920,
-                1080,
-            )?;
-            write_md_with_chapters(&doc, &cuts.cuts, &dir, &dir.join("export.md"))?;
-            // Also write the portable flat `cues[]` view.
-            lumen_cut::data::cues::save(&dir, &lumen_cut::data::cues::to_cues(&doc, None))?;
-            let broll = lumen_cut::data::broll::load(&dir)?;
-            if fcp {
-                let fcp_path = dir.join("export.fcpxml");
-                lumen_cut::export::write_fcp_with_broll(
-                    &doc, &cuts.cuts, &broll, &fcp_path, 1920, 1080,
-                )?;
-                if !json {
-                    println!("✓ export fcp → {}", fcp_path.display());
-                }
-            }
-            if video {
-                let ass_path = dir.join("export.ass");
-                let mp4 = dir.join("export.mp4");
-                lumen_cut::export::render_video_with_broll(
-                    &doc, &cuts.cuts, &ass_path, &mp4, &broll,
-                )
-                .await?;
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "pid": pid,
-                        "cuts": cuts.cuts.len(),
-                        "srt": dir.join("export.srt"),
-                        "vtt": dir.join("export.vtt"),
-                        "ass": dir.join("export.ass"),
-                        "markdown": dir.join("export.md"),
-                        "cues": dir.join("cues.json"),
-                        "video": video.then(|| dir.join("export.mp4")),
-                        "fcp": fcp.then(|| dir.join("export.fcpxml")),
-                    }))?
-                );
-            } else if video {
-                println!(
-                    "✓ export {pid}: {} cut(s) → export.srt/vtt/ass/md + cut-aware {}",
-                    cuts.cuts.len(),
-                    dir.join("export.mp4").display()
-                );
-            } else {
-                println!(
-                    "✓ export {}: applied {} cut(s) → export.srt/vtt/ass/md",
-                    pid,
-                    cuts.cuts.len()
-                );
-            }
+        Cmd::Export {
+            pid,
+            video,
+            fcp,
+            srt,
+            vtt,
+            ass,
+            markdown,
+            translated,
+            bilingual,
+            lang,
+            speakers,
+            output,
+        } => {
+            run_export_command(ExportCommand {
+                pid: &pid,
+                video,
+                fcp,
+                srt,
+                vtt,
+                ass,
+                markdown,
+                translated,
+                bilingual,
+                lang: lang.as_deref(),
+                speakers,
+                output: output.as_deref(),
+                json,
+            })
+            .await?;
         }
         Cmd::Diarize { pid } => {
             let dir = PathBuf::from(&pid);
@@ -1716,6 +1753,7 @@ struct TaskStatus {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AutoSummary {
     pid_dir: PathBuf,
     words: usize,
@@ -1724,6 +1762,54 @@ struct AutoSummary {
     vtt: PathBuf,
     ass: PathBuf,
     markdown: PathBuf,
+    polished: bool,
+    translated: Option<String>,
+    cuts_added: usize,
+}
+
+struct AutoOptions<'a> {
+    media: &'a str,
+    lang: Option<&'a str>,
+    source_lang: Option<&'a str>,
+    title: Option<&'a str>,
+    out_dir: Option<&'a Path>,
+    model: Option<&'a str>,
+    no_polish: bool,
+    rough_cut: bool,
+    align_fit: Option<usize>,
+    stale_only: bool,
+}
+
+struct CutCommand<'a> {
+    pid: &'a str,
+    auto: bool,
+    list: bool,
+    kind: Option<&'a str>,
+    add: bool,
+    start: Option<f64>,
+    end: Option<f64>,
+    words: Option<&'a str>,
+    note: Option<&'a str>,
+    restore: Option<&'a str>,
+    restore_all: bool,
+    dry_run: bool,
+    json: bool,
+}
+
+struct ExportCommand<'a> {
+    pid: &'a str,
+    video: bool,
+    fcp: bool,
+    srt: bool,
+    vtt: bool,
+    ass: bool,
+    markdown: bool,
+    translated: bool,
+    bilingual: bool,
+    lang: Option<&'a str>,
+    speakers: bool,
+    output: Option<&'a Path>,
+    json: bool,
 }
 
 async fn task_start(
@@ -2149,26 +2235,35 @@ fn project_show(pid: &str, root: &Path) -> AppResult<()> {
     Ok(())
 }
 
-async fn run_auto(
-    media: &str,
-    lang: Option<&str>,
-    title: Option<&str>,
-    out_dir: Option<&Path>,
-    model: Option<&str>,
-) -> AppResult<AutoSummary> {
-    let out_dir = out_dir
+async fn run_auto(opts: AutoOptions<'_>) -> AppResult<AutoSummary> {
+    let out_dir = opts
+        .out_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&out_dir)?;
 
-    let media_path = if media.starts_with("http://") || media.starts_with("https://") {
+    // Multi-stage intent: translate target needs source-lang, --no-polish, or
+    // --rough-cut so plain `auto media --lang zh` stays ASR-only (compat).
+    let wants_translate = opts.lang.is_some()
+        && (opts.source_lang.is_some() || opts.no_polish || opts.rough_cut);
+    let translate_lang = if wants_translate {
+        opts.lang
+    } else {
+        None
+    };
+    let asr_lang = opts
+        .source_lang
+        .or(if wants_translate { None } else { opts.lang });
+    let wants_polish = (wants_translate || opts.rough_cut) && !opts.no_polish;
+
+    let media_path = if opts.media.starts_with("http://") || opts.media.starts_with("https://") {
         report_cli_phase("downloading", 0);
         let tmpl = out_dir.join("source.%(ext)s");
-        let path = download(media, &tmpl).await?;
+        let path = download(opts.media, &tmpl).await?;
         report_cli_phase("downloading", 15);
         path
     } else {
-        PathBuf::from(media)
+        PathBuf::from(opts.media)
     };
     if !media_path.exists() {
         return Err(AppError::ProjectNotFound(media_path));
@@ -2188,11 +2283,11 @@ async fn run_auto(
     std::fs::create_dir_all(&pid_dir)?;
 
     let model_config = lumen_cut::data::modelconfig::load();
-    let model = model.unwrap_or(&model_config.asr_model);
+    let model = opts.model.unwrap_or(&model_config.asr_model);
     let asr = transcribe_file_with_aligner_progress(
         &wav,
         model,
-        lang,
+        asr_lang,
         Some(&model_config.asr_aligner),
         Some(cli_asr_progress()),
     )
@@ -2207,18 +2302,74 @@ async fn run_auto(
         sample_rate: info.sample_rate,
         channels: info.channels,
     };
-    doc.meta.title = title.unwrap_or(&pid_stem).to_string();
+    doc.meta.title = opts.title.unwrap_or(&pid_stem).to_string();
+    if let Some(source) = asr_lang {
+        doc.meta.language = Some(source.to_string());
+    }
     doc.meta.updated_at = Utc::now();
     lumen_cut::pipeline::timing::repair(&mut doc);
     doc.save(&pid_dir)?;
+
+    let mut polished = false;
+    let mut translated: Option<String> = None;
+    let mut cuts_added = 0usize;
+
+    if wants_polish || wants_translate || opts.rough_cut {
+        report_cli_phase("enhancing", 92);
+        if wants_polish {
+            let _ = task_start("polish", &pid_stem, None, false, Vec::new(), None, &out_dir)
+                .await?;
+            polished = true;
+        }
+        if let Some(target) = translate_lang {
+            let _ = task_start(
+                "translate",
+                &pid_stem,
+                Some(target),
+                opts.stale_only,
+                Vec::new(),
+                None,
+                &out_dir,
+            )
+            .await?;
+            let _ = task_start(
+                "align",
+                &pid_stem,
+                Some(target),
+                false,
+                Vec::new(),
+                opts.align_fit,
+                &out_dir,
+            )
+            .await?;
+            translated = Some(target.to_string());
+        }
+        if opts.rough_cut {
+            let doc = Doc::load(&pid_dir)?;
+            let cuts_path = pid_dir.join("cuts.json");
+            let mut cuts: ClipCuts = if cuts_path.exists() {
+                serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+            } else {
+                ClipCuts::new()
+            };
+            cuts_added = lumen_cut::pipeline::cleanup::apply(&doc, &mut cuts);
+            lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
+        }
+        // Reload for export so polish/translate mutations are reflected.
+        doc = Doc::load(&pid_dir)?;
+    }
 
     report_cli_phase("exporting", 95);
     let srt_path = pid_dir.join("out.srt");
     let vtt_path = pid_dir.join("out.vtt");
     let ass_path = pid_dir.join("out.ass");
     let md_path = pid_dir.join("out.md");
-    write_srt(&doc, &srt_path)?;
-    write_vtt(&doc, &vtt_path)?;
+    let cuts: ClipCuts = std::fs::read_to_string(pid_dir.join("cuts.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    write_srt_with(&doc, &cuts.cuts, &srt_path)?;
+    write_vtt_with(&doc, &cuts.cuts, &vtt_path)?;
     write_ass(&doc, &ass_path, 1920, 1080)?;
     write_md(&doc, &md_path)?;
     report_cli_phase("completed", 100);
@@ -2231,7 +2382,448 @@ async fn run_auto(
         vtt: vtt_path,
         ass: ass_path,
         markdown: md_path,
+        polished,
+        translated,
+        cuts_added,
     })
+}
+
+fn run_cut_command(cmd: CutCommand<'_>) -> AppResult<()> {
+    let actions = usize::from(cmd.auto)
+        + usize::from(cmd.list)
+        + usize::from(cmd.add)
+        + usize::from(cmd.restore.is_some())
+        + usize::from(cmd.restore_all);
+    if actions != 1 {
+        return Err(AppError::Schema(
+            "cut requires exactly one of --auto/--detect, --list, --add, --restore <id>, or --restore-all"
+                .into(),
+        ));
+    }
+
+    let dir = PathBuf::from(cmd.pid);
+    let doc = Doc::load(&dir)?;
+    let cuts_path = dir.join("cuts.json");
+    let mut cuts: ClipCuts = if cuts_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+    } else {
+        ClipCuts::new()
+    };
+
+    if let Some(id) = cmd.restore {
+        let restored = cuts.restore(id);
+        if restored {
+            lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
+            emit!(
+                cmd.json,
+                serde_json::json!({"id": id, "restored": true, "total": cuts.cuts.len()}),
+                "✓ cut restore {id}"
+            );
+        } else {
+            emit!(
+                cmd.json,
+                serde_json::json!({"id": id, "restored": false, "total": cuts.cuts.len()}),
+                "(no-op) cut {id} not found"
+            );
+        }
+        return Ok(());
+    }
+
+    if cmd.restore_all {
+        let removed = cuts.cuts.len();
+        cuts.cuts.clear();
+        lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
+        emit!(
+            cmd.json,
+            serde_json::json!({"restoredAll": true, "removed": removed, "total": 0}),
+            "✓ cut restore-all: removed={removed}"
+        );
+        return Ok(());
+    }
+
+    if cmd.list {
+        let filter = cmd.kind.map(normalize_cut_kind_filter).transpose()?;
+        let rows: Vec<_> = cuts
+            .cuts
+            .iter()
+            .filter(|cut| filter.map(|kind| cut.kind == kind).unwrap_or(true))
+            .map(|cut| {
+                serde_json::json!({
+                    "id": cut.id,
+                    "kind": format!("{:?}", cut.kind).to_lowercase(),
+                    "aWord": cut.a_word,
+                    "bWord": cut.b_word,
+                    "duration": cut.duration,
+                    "note": cut.note,
+                })
+            })
+            .collect();
+        if cmd.json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "pid": cmd.pid,
+                    "cuts": rows,
+                    "total": rows.len(),
+                }))?
+            );
+        } else {
+            for cut in &cuts.cuts {
+                if let Some(kind) = filter {
+                    if cut.kind != kind {
+                        continue;
+                    }
+                }
+                println!(
+                    "{} {:?} {}..{} ({:.2}s) {}",
+                    cut.id,
+                    cut.kind,
+                    cut.a_word,
+                    cut.b_word,
+                    cut.duration,
+                    cut.note.as_deref().unwrap_or("")
+                );
+            }
+            println!("({} cut(s))", rows.len());
+        }
+        return Ok(());
+    }
+
+    if cmd.add {
+        let cut = manual_cut_from_args(&doc, cmd.start, cmd.end, cmd.words, cmd.note)?;
+        let id = cut.id.clone();
+        cuts.add(cut);
+        lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
+        emit!(
+            cmd.json,
+            serde_json::json!({"id": id, "added": true, "total": cuts.cuts.len()}),
+            "✓ cut add {id}"
+        );
+        return Ok(());
+    }
+
+    // --auto / --detect
+    if cmd.dry_run {
+        let hits = lumen_cut::pipeline::cleanup::detect(&doc);
+        let proposals: Vec<_> = hits
+            .iter()
+            .filter_map(|hit| lumen_cut::pipeline::cleanup::cut_from_hit(&doc, hit))
+            .map(|cut| {
+                serde_json::json!({
+                    "id": cut.id,
+                    "kind": format!("{:?}", cut.kind).to_lowercase(),
+                    "aWord": cut.a_word,
+                    "bWord": cut.b_word,
+                    "duration": cut.duration,
+                    "note": cut.note,
+                })
+            })
+            .collect();
+        emit!(
+            cmd.json,
+            serde_json::json!({
+                "pid": cmd.pid,
+                "dryRun": true,
+                "proposed": proposals.len(),
+                "cuts": proposals,
+            }),
+            "✓ cut detect dry-run {}: proposed={}",
+            cmd.pid,
+            proposals.len()
+        );
+        return Ok(());
+    }
+
+    let added = lumen_cut::pipeline::cleanup::apply(&doc, &mut cuts);
+    lumen_cut::data::storage::write_json(&cuts_path, &cuts)?;
+    emit!(
+        cmd.json,
+        serde_json::json!({"pid": cmd.pid, "added": added, "total": cuts.cuts.len()}),
+        "✓ cut auto {}: added={} total={}",
+        cmd.pid,
+        added,
+        cuts.cuts.len()
+    );
+    Ok(())
+}
+
+fn normalize_cut_kind_filter(raw: &str) -> AppResult<lumen_cut::data::CutKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "silence" => Ok(lumen_cut::data::CutKind::Silence),
+        "filler" => Ok(lumen_cut::data::CutKind::Filler),
+        "retake" => Ok(lumen_cut::data::CutKind::Retake),
+        "falsestart" | "false_start" | "false-start" => Ok(lumen_cut::data::CutKind::FalseStart),
+        "badtake" | "bad_take" | "bad-take" => Ok(lumen_cut::data::CutKind::BadTake),
+        "manual" => Ok(lumen_cut::data::CutKind::Manual),
+        other => Err(AppError::Schema(format!(
+            "unknown cut kind `{other}` (expected silence|filler|retake|falsestart|badtake|manual)"
+        ))),
+    }
+}
+
+fn manual_cut_from_args(
+    doc: &Doc,
+    start: Option<f64>,
+    end: Option<f64>,
+    words: Option<&str>,
+    note: Option<&str>,
+) -> AppResult<lumen_cut::data::Cut> {
+    let all = doc.all_words();
+    let (a_word, b_word) = if let Some(spec) = words {
+        parse_word_span(spec, &all)?
+    } else {
+        let start = start.ok_or_else(|| {
+            AppError::Schema("cut --add requires --words a..b or --start/--end".into())
+        })?;
+        let end = end.ok_or_else(|| {
+            AppError::Schema("cut --add requires --words a..b or --start/--end".into())
+        })?;
+        if end <= start {
+            return Err(AppError::Schema(
+                "cut --add requires --end greater than --start".into(),
+            ));
+        }
+        let a = all
+            .iter()
+            .find(|w| w.end > start)
+            .or_else(|| all.last())
+            .ok_or_else(|| AppError::Schema("document has no words to cut".into()))?;
+        let b = all
+            .iter()
+            .rev()
+            .find(|w| w.start < end)
+            .or_else(|| all.first())
+            .ok_or_else(|| AppError::Schema("document has no words to cut".into()))?;
+        (a.id.clone(), b.id.clone())
+    };
+    let word_at: std::collections::BTreeMap<&str, (f64, f64)> = all
+        .iter()
+        .map(|w| (w.id.as_str(), (w.start, w.end)))
+        .collect();
+    let dur = word_at
+        .get(a_word.as_str())
+        .zip(word_at.get(b_word.as_str()))
+        .map(|((s, _), (_, e))| (e - s).max(0.0))
+        .unwrap_or(0.0);
+    Ok(lumen_cut::data::Cut {
+        id: format!("c-manual-{a_word}-{b_word}"),
+        note: note.map(str::to_string),
+        a_word,
+        b_word,
+        kind: lumen_cut::data::CutKind::Manual,
+        duration: dur,
+    })
+}
+
+fn parse_word_span(
+    spec: &str,
+    words: &[&lumen_cut::data::Word],
+) -> AppResult<(String, String)> {
+    let parts: Vec<&str> = if spec.contains("..") {
+        spec.split("..").map(str::trim).collect()
+    } else {
+        spec.split(',').map(str::trim).collect()
+    };
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(AppError::Schema(
+            "cut --words expects `wA..wB` or `wA,wB`".into(),
+        ));
+    }
+    let ids: std::collections::BTreeSet<&str> = words.iter().map(|w| w.id.as_str()).collect();
+    if !ids.contains(parts[0]) || !ids.contains(parts[1]) {
+        return Err(AppError::Schema(format!(
+            "cut --words references unknown id(s): {} / {}",
+            parts[0], parts[1]
+        )));
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
+    if cmd.translated && cmd.bilingual {
+        return Err(AppError::Schema(
+            "export accepts only one of --translated or --bilingual".into(),
+        ));
+    }
+    if (cmd.translated || cmd.bilingual) && cmd.lang.is_none() {
+        return Err(AppError::Schema(
+            "export --translated/--bilingual requires --lang".into(),
+        ));
+    }
+
+    let dir = PathBuf::from(cmd.pid);
+    let doc = Doc::load(&dir)?;
+    let cuts_path = dir.join("cuts.json");
+    let cuts: ClipCuts = if cuts_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+    } else {
+        ClipCuts::new()
+    };
+    let export_settings = lumen_cut::data::export_settings::load(&dir)?;
+    let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
+    let caption_lang = cmd
+        .lang
+        .or(export_settings.subtitle_language.as_deref());
+    let bilingual = if cmd.translated {
+        false
+    } else if cmd.bilingual {
+        true
+    } else {
+        export_settings.bilingual_subtitles && cmd.lang.is_none()
+    };
+    let use_translation = cmd.translated || cmd.bilingual || caption_lang.is_some();
+    let caption_doc = if use_translation {
+        lumen_cut::data::export_settings::project_caption_doc_with_hidden(
+            &doc,
+            caption_lang,
+            bilingual && !cmd.translated,
+            &hidden,
+        )?
+    } else {
+        lumen_cut::data::export_settings::project_caption_doc_with_hidden(
+            &doc,
+            None,
+            false,
+            &hidden,
+        )?
+    };
+
+    let any_format = cmd.srt || cmd.vtt || cmd.ass || cmd.markdown || cmd.video || cmd.fcp;
+    let write_all_text = !any_format;
+    let want_srt = write_all_text || cmd.srt;
+    let want_vtt = write_all_text || cmd.vtt;
+    let want_ass = write_all_text || cmd.ass || cmd.video; // video burn-in needs ASS
+    let want_md = write_all_text || cmd.markdown;
+
+    let single_text = [cmd.srt, cmd.vtt, cmd.ass, cmd.markdown, cmd.video, cmd.fcp]
+        .into_iter()
+        .filter(|f| *f)
+        .count()
+        == 1;
+    let output = cmd.output.map(PathBuf::from);
+    if output.is_some() && !single_text && any_format {
+        // Allow -o as a directory for multi-format.
+        if let Some(path) = &output {
+            if path.extension().is_some() {
+                return Err(AppError::Schema(
+                    "export -o with multiple formats must be a directory path".into(),
+                ));
+            }
+        }
+    }
+
+    let resolve = |default_name: &str, force_ext: &str| -> PathBuf {
+        match &output {
+            Some(path) if single_text => {
+                if path.is_dir() || path.extension().is_none() {
+                    path.join(default_name)
+                } else {
+                    path.clone()
+                }
+            }
+            Some(path) => {
+                if path.extension().is_none() {
+                    path.join(default_name)
+                } else {
+                    // Multi-format with file -o already rejected; fallback.
+                    path.with_extension(force_ext)
+                }
+            }
+            None => dir.join(default_name),
+        }
+    };
+
+    let mut artifacts = serde_json::Map::new();
+    if want_srt {
+        let path = resolve("export.srt", "srt");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_srt_with(&caption_doc, &cuts.cuts, &path)?;
+        artifacts.insert("srt".into(), serde_json::json!(path));
+    }
+    if want_vtt {
+        let path = resolve("export.vtt", "vtt");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_vtt_with(&caption_doc, &cuts.cuts, &path)?;
+        artifacts.insert("vtt".into(), serde_json::json!(path));
+    }
+    let style = lumen_cut::data::substyle::SubStyle::load(&dir)?;
+    let mut ass_path_for_video: Option<PathBuf> = None;
+    if want_ass {
+        let path = resolve("export.ass", "ass");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_ass_with_style(&caption_doc, &cuts.cuts, &style, &path, 1920, 1080)?;
+        ass_path_for_video = Some(path.clone());
+        artifacts.insert("ass".into(), serde_json::json!(path));
+    }
+    if want_md {
+        let path = resolve("export.md", "md");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Speakers flag currently uses the standard chapter markdown writer;
+        // speaker names are already embedded when present on paragraphs.
+        let _ = cmd.speakers;
+        write_md_with_chapters(&doc, &cuts.cuts, &dir, &path)?;
+        artifacts.insert("markdown".into(), serde_json::json!(path));
+    }
+
+    lumen_cut::data::cues::save(&dir, &lumen_cut::data::cues::to_cues(&doc, None))?;
+    artifacts.insert("cues".into(), serde_json::json!(dir.join("cues.json")));
+
+    let broll = lumen_cut::data::broll::load(&dir)?;
+    if cmd.fcp {
+        let path = resolve("export.fcpxml", "fcpxml");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        lumen_cut::export::write_fcp_with_broll(&doc, &cuts.cuts, &broll, &path, 1920, 1080)?;
+        artifacts.insert("fcp".into(), serde_json::json!(path));
+    }
+    if cmd.video {
+        let ass_path = ass_path_for_video.unwrap_or_else(|| dir.join("export.ass"));
+        if !ass_path.exists() {
+            write_ass_with_style(&caption_doc, &cuts.cuts, &style, &ass_path, 1920, 1080)?;
+        }
+        let mp4 = resolve("export.mp4", "mp4");
+        if let Some(parent) = mp4.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        lumen_cut::export::render_video_with_broll(&doc, &cuts.cuts, &ass_path, &mp4, &broll)
+            .await?;
+        artifacts.insert("video".into(), serde_json::json!(mp4));
+    }
+
+    if cmd.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "pid": cmd.pid,
+                "cuts": cuts.cuts.len(),
+                "lang": caption_lang,
+                "translated": cmd.translated,
+                "bilingual": bilingual && !cmd.translated,
+                "artifacts": artifacts,
+            }))?
+        );
+    } else {
+        let names: Vec<String> = artifacts
+            .values()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        println!(
+            "✓ export {}: applied {} cut(s) → {}",
+            cmd.pid,
+            cuts.cuts.len(),
+            names.join(", ")
+        );
+    }
+    Ok(())
 }
 
 // keep `Finding` reachable for documentation links
@@ -2298,6 +2890,213 @@ mod tests {
             } => assert_eq!(root, PathBuf::from("/tmp/projects")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn auto_parses_wave1_pipeline_flags() {
+        let cli = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "auto",
+            "talk.mp4",
+            "--source-lang",
+            "en",
+            "--lang",
+            "zh",
+            "--no-polish",
+            "--rough-cut",
+            "--align-fit",
+            "16",
+            "--stale-only",
+            "--title",
+            "Demo",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Auto {
+                source_lang,
+                lang,
+                no_polish,
+                rough_cut,
+                align_fit,
+                stale_only,
+                title,
+                ..
+            } => {
+                assert_eq!(source_lang.as_deref(), Some("en"));
+                assert_eq!(lang.as_deref(), Some("zh"));
+                assert!(no_polish);
+                assert!(rough_cut);
+                assert_eq!(align_fit, Some(16));
+                assert!(stale_only);
+                assert_eq!(title.as_deref(), Some("Demo"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_parses_format_and_caption_mode_flags() {
+        let cli = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "export",
+            "demo",
+            "--srt",
+            "--bilingual",
+            "--lang",
+            "zh",
+            "-o",
+            "/tmp/out.srt",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Export {
+                srt,
+                bilingual,
+                lang,
+                output,
+                translated,
+                ..
+            } => {
+                assert!(srt);
+                assert!(bilingual);
+                assert!(!translated);
+                assert_eq!(lang.as_deref(), Some("zh"));
+                assert_eq!(output, Some(PathBuf::from("/tmp/out.srt")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cut_parses_list_add_and_detect_flags() {
+        let list = Cli::try_parse_from(["lumen-cut-cli", "cut", "demo", "--list", "--kind", "filler"])
+            .unwrap();
+        match list.cmd {
+            Cmd::Cut { list, kind, .. } => {
+                assert!(list);
+                assert_eq!(kind.as_deref(), Some("filler"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let add = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "cut",
+            "demo",
+            "--add",
+            "--words",
+            "w1..w3",
+            "--note",
+            "manual",
+        ])
+        .unwrap();
+        match add.cmd {
+            Cmd::Cut {
+                add,
+                words,
+                note,
+                ..
+            } => {
+                assert!(add);
+                assert_eq!(words.as_deref(), Some("w1..w3"));
+                assert_eq!(note.as_deref(), Some("manual"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_start_still_parses_align_groups_and_fit() {
+        let cli = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "task",
+            "start",
+            "align",
+            "demo",
+            "--lang",
+            "zh",
+            "--groups",
+            "g1,g2",
+            "--align-fit",
+            "14",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Task {
+                action:
+                    TaskCmd::Start {
+                        kind,
+                        lang,
+                        groups,
+                        align_fit,
+                        ..
+                    },
+            } => {
+                assert_eq!(kind, "align");
+                assert_eq!(lang.as_deref(), Some("zh"));
+                assert_eq!(groups, vec!["g1".to_string(), "g2".to_string()]);
+                assert_eq!(align_fit, Some(14));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_check_fix_is_advisory_only() {
+        use lumen_cut::audit::{finish_check_emit, finish_check_fix};
+        use lumen_cut::data::{Paragraph, Sentence, Word};
+
+        let doc = Doc {
+            id: "p".into(),
+            schema: 1,
+            media: MediaRef {
+                path: PathBuf::from("m.mp4"),
+                duration_seconds: 10.0,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: "t".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            paragraphs: vec![Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![Sentence {
+                    id: "s1".into(),
+                    text: "hello".into(),
+                    words: vec![Word {
+                        id: "w1".into(),
+                        text: "hello".into(),
+                        start: 0.0,
+                        end: 1.0,
+                    }],
+                }],
+            }],
+            translations: Default::default(),
+        };
+        let mut cuts = ClipCuts::new();
+        cuts.add(lumen_cut::data::Cut {
+            id: "c1".into(),
+            note: None,
+            a_word: "w1".into(),
+            b_word: "w1".into(),
+            kind: lumen_cut::data::CutKind::Manual,
+            duration: 9.0,
+        });
+        let before = cuts.clone();
+        let items = finish_check_emit(&doc, &cuts);
+        let advice = finish_check_fix("p", &items, &cuts, &doc);
+        assert_eq!(cuts, before, "finish_check_fix must not mutate cuts");
+        assert!(
+            advice
+                .suggestions
+                .iter()
+                .any(|s| s.contains("cut") || s.contains("audit") || s.contains("translate") || s.contains("version")),
+            "expected advisory suggestions, got {advice:?}"
+        );
     }
 
     #[test]
