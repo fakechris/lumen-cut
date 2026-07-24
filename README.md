@@ -39,7 +39,8 @@ lumen-cut-cli cut ./projects/talk --auto
 lumen-cut-cli cut ./projects/talk --list --kind filler
 lumen-cut-cli export ./projects/talk --srt --bilingual --lang zh -o talk.zh.srt
 lumen-cut-cli align list talk --lang zh --fit 16 --root ./projects
-lumen-cut-cli task start align talk --lang zh --groups g1,g2 --align-fit 16 --root ./projects
+lumen-cut-cli task start align talk --lang zh --groups g1,g2 --align-fit 16 --align-local --root ./projects
+lumen-cut-cli task start translate talk --lang zh --second-look semantic --root ./projects
 
 # Soft-cut detect knobs + export a time window
 lumen-cut-cli cut ./projects/talk --auto --min-pause 1.0 --compress-to 0.5
