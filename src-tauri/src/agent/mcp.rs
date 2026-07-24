@@ -89,20 +89,44 @@ fn tools() -> Vec<Value> {
     vec![
         tool(
             "project_list",
-            "List lumen-cut projects under root",
+            "List available projects (open/choose work). Returns project ids under root.",
             &["root"],
         ),
         tool(
             "project_show",
-            "Show doc.json for a project",
+            "Load a project's transcript document (words, sentences, translations). Call before editing.",
             &["pid", "root"],
         ),
-        tool("audit", "Run the 56-code audit", &["pid", "root"]),
-        tool("finish_check", "Run finish-check", &["pid", "root"]),
-        tool("version_list", "List version lineage", &["pid", "root"]),
-        tool("cut_list", "List soft cuts", &["pid", "root"]),
-        tool("subtitle_list", "List subtitles", &["pid", "root"]),
-        tool("export", "Export srt/vtt/ass/md + cues", &["pid", "root"]),
+        tool(
+            "audit",
+            "Quality review of transcript/timing/structure. Use to find problems before delivery.",
+            &["pid", "root"],
+        ),
+        tool(
+            "finish_check",
+            "Delivery gate: is this project ready to export? Returns pass/fail blockers in plain language.",
+            &["pid", "root"],
+        ),
+        tool(
+            "version_list",
+            "List saved version snapshots and branches for recovery/export readiness.",
+            &["pid", "root"],
+        ),
+        tool(
+            "cut_list",
+            "List soft-cuts (removed speech/pauses) currently applied to the edit.",
+            &["pid", "root"],
+        ),
+        tool(
+            "subtitle_list",
+            "List subtitle cues with text and timing for reading or edit planning.",
+            &["pid", "root"],
+        ),
+        tool(
+            "export",
+            "Write subtitle sidecars (srt/vtt/ass/md) for delivery. Prefer after finish_check is clean.",
+            &["pid", "root"],
+        ),
     ]
 }
 

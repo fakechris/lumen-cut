@@ -6508,6 +6508,51 @@ pre.out {
   line-height: 1.4;
 }
 
+.editor-view .review-starters {
+  margin-bottom: 12px;
+}
+
+.editor-view > .export-layout.export-layout-split {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.9fr);
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.editor-view .export-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.editor-view .export-pane-queue {
+  background: color-mix(in srgb, var(--surface) 92%, var(--border));
+  border: 1px solid var(--border);
+  border-radius: var(--inspector-radius);
+  padding: 12px;
+}
+
+.editor-view .export-queue-header h3 {
+  font-size: var(--inspector-title-size);
+  margin: 0 0 4px;
+}
+
+.editor-view .export-queue-summary {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin: 0;
+}
+
+@media (max-width: 1100px) {
+  .editor-view > .export-layout.export-layout-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .editor-view .export-preflight .check-list small,
 .editor-view .export-preflight li small {
   display: block;
