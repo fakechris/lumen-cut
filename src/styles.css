@@ -6417,6 +6417,97 @@ pre.out {
   text-decoration: line-through;
 }
 
+.editor-view .style-preset-gallery > span {
+  display: block;
+  font-size: var(--inspector-label-size);
+  margin-bottom: 8px;
+}
+
+.editor-view .style-preset-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+}
+
+.editor-view .style-preset-card {
+  align-items: stretch;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--inspector-radius);
+  cursor: pointer;
+  display: grid;
+  gap: 6px;
+  min-height: 0;
+  padding: 8px;
+  text-align: left;
+}
+
+.editor-view .style-preset-card:hover {
+  border-color: var(--accent);
+}
+
+.editor-view .style-preset-swatch {
+  align-items: center;
+  background: #111;
+  border-radius: 6px;
+  display: flex;
+  justify-content: center;
+  min-height: 48px;
+  padding: 8px;
+}
+
+.editor-view .style-preset-card strong {
+  font-size: 12px;
+}
+
+.editor-view .style-preset-card small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.editor-view .setup-quick-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.editor-view .setup-quick-actions h3 {
+  font-size: var(--inspector-title-size);
+  margin: 0;
+}
+
+.editor-view .setup-quick-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.editor-view .setup-quick-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--inspector-radius);
+  cursor: pointer;
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  text-align: left;
+}
+
+.editor-view .setup-quick-card:hover {
+  border-color: var(--accent);
+}
+
+.editor-view .setup-quick-card strong {
+  font-size: 12px;
+}
+
+.editor-view .setup-quick-card small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .editor-view .export-preflight .check-list small,
 .editor-view .export-preflight li small {
   display: block;

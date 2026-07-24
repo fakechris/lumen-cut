@@ -3060,6 +3060,71 @@ export function TranscriptView({
               </div>
             </li>
           </ol>
+          {hasTranscript && (
+            <div className="setup-quick-actions">
+              <h3>{lang === "zh" ? "接下来可以" : "What next"}</h3>
+              <div className="setup-quick-grid">
+                <button
+                  type="button"
+                  className="setup-quick-card"
+                  disabled={operation !== null}
+                  onClick={() => {
+                    setActiveTab("transcript");
+                    runSpeechCleanup("silence");
+                  }}
+                >
+                  <strong>{lang === "zh" ? "去掉静音" : "Remove silence"}</strong>
+                  <small>
+                    {lang === "zh"
+                      ? "一键收紧停顿，可撤销"
+                      : "Tighten pauses in one undoable pass"}
+                  </small>
+                </button>
+                <button
+                  type="button"
+                  className="setup-quick-card"
+                  disabled={operation !== null}
+                  onClick={() => {
+                    setActiveTab("transcript");
+                    runSpeechCleanup("fillers");
+                  }}
+                >
+                  <strong>{lang === "zh" ? "去掉嗯啊" : "Remove fillers"}</strong>
+                  <small>
+                    {lang === "zh"
+                      ? "去掉 um / 呃 / 嗯 等填充词"
+                      : "Cut um / uh / 嗯-style fillers"}
+                  </small>
+                </button>
+                <button
+                  type="button"
+                  className="setup-quick-card"
+                  disabled={operation !== null}
+                  onClick={() => setActiveTab("translate")}
+                >
+                  <strong>{lang === "zh" ? "翻译字幕" : "Translate"}</strong>
+                  <small>
+                    {lang === "zh"
+                      ? "打开翻译工作区"
+                      : "Open the translation workspace"}
+                  </small>
+                </button>
+                <button
+                  type="button"
+                  className="setup-quick-card"
+                  disabled={operation !== null}
+                  onClick={() => setActiveTab("export")}
+                >
+                  <strong>{lang === "zh" ? "检查并导出" : "Check & export"}</strong>
+                  <small>
+                    {lang === "zh"
+                      ? "交付检查与导出规格"
+                      : "Delivery check and export settings"}
+                  </small>
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
