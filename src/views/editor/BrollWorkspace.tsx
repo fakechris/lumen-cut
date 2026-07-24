@@ -1,5 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { PipelineFreshness } from "../../components/PipelineFreshness";
 import type { Lang } from "../../i18n";
 import type {
   BrollOverview,
@@ -13,7 +14,9 @@ import type {
 interface Props {
   busy: boolean;
   doc: Doc;
+  drafts: Record<string, BrollPlacementInput>;
   lang: Lang;
+  newPlacement: BrollPlacementInput;
   overview: BrollOverview;
   previewJob: BrollPreviewJobStatus | null;
   previewPaths: string[];
@@ -22,6 +25,12 @@ interface Props {
   onPickFile: () => Promise<string | null>;
   onPreview: () => Promise<void>;
   onCancelPreview: () => Promise<void>;
+  onDraftsChange: (update: (
+    current: Record<string, BrollPlacementInput>,
+  ) => Record<string, BrollPlacementInput>) => void;
+  onNewPlacementChange: (update: (
+    current: BrollPlacementInput,
+  ) => BrollPlacementInput) => void;
   onRefresh: () => Promise<void>;
   onRemove: (id: string) => Promise<void>;
   onUpdate: (id: string, input: BrollPlacementInput) => Promise<void>;
@@ -39,13 +48,14 @@ function inputFromPlacement(placement: BrollPlacement): BrollPlacementInput {
     mode: placement.mode,
     fit: placement.fit,
     background: placement.background,
+    rect: placement.rect,
     sourceStart: placement.sourceStart,
     radius: placement.radius,
     name: placement.name || "",
   };
 }
 
-const EMPTY_INPUT: BrollPlacementInput = {
+export const EMPTY_BROLL_INPUT: BrollPlacementInput = {
   file: "",
   start: 3,
   end: 7,
@@ -60,7 +70,9 @@ const EMPTY_INPUT: BrollPlacementInput = {
 export function BrollWorkspace({
   busy,
   doc,
+  drafts,
   lang,
+  newPlacement,
   overview,
   previewJob,
   previewPaths,
@@ -69,6 +81,8 @@ export function BrollWorkspace({
   onPickFile,
   onPreview,
   onCancelPreview,
+  onDraftsChange,
+  onNewPlacementChange,
   onRefresh,
   onRemove,
   onUpdate,
@@ -80,26 +94,15 @@ export function BrollWorkspace({
       .flatMap((sentence) => sentence.words)
       .map((word) => [word.id, word] as const),
   );
-  const [drafts, setDrafts] = useState<Record<string, BrollPlacementInput>>({});
-  const [newPlacement, setNewPlacement] = useState<BrollPlacementInput>(EMPTY_INPUT);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const run = (action: Promise<unknown>) => {
     void action.catch(() => undefined);
   };
 
-  useEffect(() => {
-    setDrafts((current) => Object.fromEntries(
-      overview.accepted.map((placement) => [
-        placement.id,
-        current[placement.id] || inputFromPlacement(placement),
-      ]),
-    ));
-  }, [overview.accepted]);
-
   const chooseNewAsset = async () => {
     const file = await onPickFile();
     if (file) {
-      setNewPlacement((current) => ({
+      onNewPlacementChange((current) => ({
         ...current,
         file,
         name: current.name || fileName(file).replace(/\.[^.]+$/, ""),
@@ -109,13 +112,13 @@ export function BrollWorkspace({
 
   const add = async () => {
     await onAdd(newPlacement);
-    setNewPlacement(EMPTY_INPUT);
+    onNewPlacementChange(() => EMPTY_BROLL_INPUT);
   };
 
   const replaceAsset = async (id: string) => {
     const file = await onPickFile();
     if (file) {
-      setDrafts((current) => ({
+      onDraftsChange((current) => ({
         ...current,
         [id]: { ...current[id], file },
       }));
@@ -140,8 +143,8 @@ export function BrollWorkspace({
           <h2>{zh ? "B-roll 素材轨道" : "B-roll track"}</h2>
           <p>
             {zh
-              ? "建议只标记适合插入画面的时段。选择本地图片或视频后才会加入成片；预览会在本机完整渲染时间线，长视频需要等待。"
-              : "Suggestions only mark useful moments. Choose a local image or video to add it to the edit. Preview renders the full timeline locally, so long videos take time."}
+              ? "建议只标记适合插入画面的时段。选择本地图片或视频后才会加入成片；快速预览只合成每段素材的代表帧，不会整片重编码。"
+              : "Suggestions only mark useful moments. Choose a local image or video to add it to the edit. Quick preview composites one representative frame per placement without re-encoding the full timeline."}
           </p>
         </div>
         <button
@@ -149,7 +152,7 @@ export function BrollWorkspace({
           disabled={busy || isRendering || overview.accepted.length === 0}
           onClick={() => run(onPreview())}
         >
-          {isRendering ? `${zh ? "正在生成" : "Rendering"} ${previewJob.progress}%` : (zh ? "生成画面预览" : "Render previews")}
+          {isRendering ? `${zh ? "正在生成" : "Rendering"} ${previewJob.progress}%` : (zh ? "生成快速预览" : "Quick preview")}
         </button>
       </header>
 
@@ -162,7 +165,7 @@ export function BrollWorkspace({
                 : previewJob.phase === "preparing"
                   ? zh ? "正在准备时间线" : "Preparing timeline"
                   : previewJob.phase === "frames"
-                    ? zh ? "正在提取预览帧" : "Extracting preview frames"
+                    ? zh ? "正在直接合成代表帧" : "Compositing representative frames"
                     : previewJob.state === "cancelling"
                       ? zh ? "正在安全停止" : "Stopping safely"
                       : zh ? "正在硬件渲染时间线" : "Rendering timeline in hardware"}
@@ -176,6 +179,12 @@ export function BrollWorkspace({
               ? ` · ${Math.round(previewJob.current)} / ${Math.round(previewJob.total)}`
               : ""}
           </small>
+          <PipelineFreshness
+            state={previewJob.state}
+            phase={previewJob.phase}
+            updatedAt={previewJob.updatedAt}
+            lang={lang}
+          />
           <button
             className="button-quiet"
             disabled={previewJob.state === "cancelling"}
@@ -266,7 +275,17 @@ export function BrollWorkspace({
         ) : (
           <div className="broll-placement-list">
             {overview.accepted.map((placement) => {
-              const draft = drafts[placement.id] || inputFromPlacement(placement);
+              const original = inputFromPlacement(placement);
+              const draft = drafts[placement.id] || original;
+              const dirty = JSON.stringify(draft) !== JSON.stringify(original);
+              const valid = Boolean(draft.file)
+                && Number.isFinite(draft.start)
+                && Number.isFinite(draft.end)
+                && draft.start >= 0
+                && draft.end > draft.start
+                && (duration <= 0 || draft.end <= duration)
+                && Number.isFinite(draft.sourceStart)
+                && draft.sourceStart >= 0;
               return (
                 <article key={placement.id}>
                   <div className="broll-placement-title">
@@ -283,7 +302,7 @@ export function BrollWorkspace({
                       <span>{zh ? "名称" : "Name"}</span>
                       <input
                         value={draft.name || ""}
-                        onChange={(event) => setDrafts((current) => ({
+                        onChange={(event) => onDraftsChange((current) => ({
                           ...current,
                           [placement.id]: { ...draft, name: event.target.value },
                         }))}
@@ -291,47 +310,52 @@ export function BrollWorkspace({
                     </label>
                     <label>
                       <span>{zh ? "开始（秒）" : "Start (s)"}</span>
-                      <input type="number" min={0} max={duration} step={0.1} value={draft.start} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, start: event.target.valueAsNumber } }))} />
+                      <input type="number" min={0} max={duration} step={0.1} value={draft.start} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, start: event.target.valueAsNumber } }))} />
                     </label>
                     <label>
                       <span>{zh ? "结束（秒）" : "End (s)"}</span>
-                      <input type="number" min={0} max={duration} step={0.1} value={draft.end} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, end: event.target.valueAsNumber } }))} />
+                      <input type="number" min={0} max={duration} step={0.1} value={draft.end} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, end: event.target.valueAsNumber } }))} />
                     </label>
                     <label>
                       <span>{zh ? "显示" : "Display"}</span>
-                      <select value={draft.mode} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, mode: event.target.value as BrollPlacementInput["mode"] } }))}>
+                      <select value={draft.mode} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, mode: event.target.value as BrollPlacementInput["mode"] } }))}>
                         <option value="pip">{zh ? "画中画" : "Picture in picture"}</option>
                         <option value="fullscreen">{zh ? "全屏" : "Fullscreen"}</option>
                       </select>
                     </label>
                     <label>
                       <span>{zh ? "素材起点（秒）" : "Source start (s)"}</span>
-                      <input type="number" min={0} step={0.1} value={draft.sourceStart} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, sourceStart: event.target.valueAsNumber } }))} />
+                      <input type="number" min={0} step={0.1} value={draft.sourceStart} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, sourceStart: event.target.valueAsNumber } }))} />
                     </label>
                     {draft.mode === "pip" && (
                       <>
                         <label>
                           <span>{zh ? "裁切" : "Fit"}</span>
-                          <select value={draft.fit} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, fit: event.target.value as BrollPlacementInput["fit"] } }))}>
+                          <select value={draft.fit} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, fit: event.target.value as BrollPlacementInput["fit"] } }))}>
                             <option value="cover">Cover</option>
                             <option value="contain">Contain</option>
                           </select>
                         </label>
                         <label>
                           <span>{zh ? "背景" : "Background"}</span>
-                          <select value={draft.background} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, background: event.target.value as BrollPlacementInput["background"] } }))}>
+                          <select value={draft.background} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, background: event.target.value as BrollPlacementInput["background"] } }))}>
                             <option value="black">{zh ? "黑色" : "Black"}</option>
                             <option value="blur">{zh ? "模糊" : "Blur"}</option>
                           </select>
                         </label>
                         <label>
                           <span>{zh ? "圆角" : "Corner radius"}</span>
-                          <input type="number" min={0} step={1} value={draft.radius} onChange={(event) => setDrafts((current) => ({ ...current, [placement.id]: { ...draft, radius: event.target.valueAsNumber } }))} />
+                          <input type="number" min={0} step={1} value={draft.radius} onChange={(event) => onDraftsChange((current) => ({ ...current, [placement.id]: { ...draft, radius: event.target.valueAsNumber } }))} />
                         </label>
                       </>
                     )}
                   </div>
                   <div className="broll-placement-actions">
+                    {dirty && (
+                      <span className="broll-unsaved">
+                        {zh ? "修改未保存；切换页面或重启应用后草稿仍会保留" : "Unsaved changes; the draft survives page switches and app restarts"}
+                      </span>
+                    )}
                     {confirmRemove === placement.id ? (
                       <>
                         <span>{zh ? "确认移除这段素材？" : "Remove this placement?"}</span>
@@ -341,7 +365,25 @@ export function BrollWorkspace({
                     ) : (
                       <button className="button-quiet" disabled={busy} onClick={() => setConfirmRemove(placement.id)}>{zh ? "移除" : "Remove"}</button>
                     )}
-                    <button className="button-primary" disabled={busy} onClick={() => run(onUpdate(placement.id, draft))}>{zh ? "保存调整" : "Save changes"}</button>
+                    {dirty && (
+                      <button
+                        className="button-quiet"
+                        disabled={busy}
+                        onClick={() => onDraftsChange((current) => ({
+                          ...current,
+                          [placement.id]: original,
+                        }))}
+                      >
+                        {zh ? "重置" : "Reset"}
+                      </button>
+                    )}
+                    <button
+                      className="button-primary"
+                      disabled={busy || !dirty || !valid}
+                      onClick={() => run(onUpdate(placement.id, draft))}
+                    >
+                      {zh ? "保存调整" : "Save changes"}
+                    </button>
                   </div>
                 </article>
               );
@@ -364,27 +406,27 @@ export function BrollWorkspace({
           </button>
           <label>
             <span>{zh ? "开始（秒）" : "Start (s)"}</span>
-            <input type="number" min={0} max={duration} step={0.1} value={newPlacement.start} onChange={(event) => setNewPlacement((current) => ({ ...current, start: event.target.valueAsNumber }))} />
+            <input type="number" min={0} max={duration} step={0.1} value={newPlacement.start} onChange={(event) => onNewPlacementChange((current) => ({ ...current, start: event.target.valueAsNumber }))} />
           </label>
           <label>
             <span>{zh ? "结束（秒）" : "End (s)"}</span>
-            <input type="number" min={0} max={duration} step={0.1} value={newPlacement.end} onChange={(event) => setNewPlacement((current) => ({ ...current, end: event.target.valueAsNumber }))} />
+            <input type="number" min={0} max={duration} step={0.1} value={newPlacement.end} onChange={(event) => onNewPlacementChange((current) => ({ ...current, end: event.target.valueAsNumber }))} />
           </label>
           <label>
             <span>{zh ? "显示" : "Display"}</span>
-            <select value={newPlacement.mode} onChange={(event) => setNewPlacement((current) => ({ ...current, mode: event.target.value as BrollPlacementInput["mode"] }))}>
+            <select value={newPlacement.mode} onChange={(event) => onNewPlacementChange((current) => ({ ...current, mode: event.target.value as BrollPlacementInput["mode"] }))}>
               <option value="pip">{zh ? "画中画" : "Picture in picture"}</option>
               <option value="fullscreen">{zh ? "全屏" : "Fullscreen"}</option>
             </select>
           </label>
           <label>
             <span>{zh ? "素材起点（秒）" : "Source start (s)"}</span>
-            <input type="number" min={0} step={0.1} value={newPlacement.sourceStart} onChange={(event) => setNewPlacement((current) => ({ ...current, sourceStart: event.target.valueAsNumber }))} />
+            <input type="number" min={0} step={0.1} value={newPlacement.sourceStart} onChange={(event) => onNewPlacementChange((current) => ({ ...current, sourceStart: event.target.valueAsNumber }))} />
           </label>
           {newPlacement.mode === "pip" && (
             <label>
               <span>{zh ? "裁切" : "Fit"}</span>
-              <select value={newPlacement.fit} onChange={(event) => setNewPlacement((current) => ({ ...current, fit: event.target.value as BrollPlacementInput["fit"] }))}>
+              <select value={newPlacement.fit} onChange={(event) => onNewPlacementChange((current) => ({ ...current, fit: event.target.value as BrollPlacementInput["fit"] }))}>
                 <option value="cover">Cover</option>
                 <option value="contain">Contain</option>
               </select>

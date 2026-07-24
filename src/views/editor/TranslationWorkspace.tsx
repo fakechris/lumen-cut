@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { VirtualList } from "../../components/VirtualList";
 import type { Lang } from "../../i18n";
 import type { Doc, TaskStatus } from "../../types";
 
@@ -9,12 +10,29 @@ interface Props {
   lang: Lang;
   status: TaskStatus | null;
   busy: boolean;
+  drafts: Record<string, Record<string, TranslationDraft>>;
+  onDraftsChange: (
+    language: string,
+    update: (
+      current: Record<string, TranslationDraft>,
+    ) => Record<string, TranslationDraft>,
+  ) => void;
   onOpenSettings: () => void;
+  onPause: () => Promise<void>;
   onLanguageChange: (language: string) => void;
   onSave: (language: string, id: string, text: string) => Promise<void>;
+  onSaveMany: (
+    language: string,
+    updates: Array<{ id: string; text: string }>,
+  ) => Promise<void>;
   onSeek: (seconds: number, autoplay?: boolean) => void;
-  onStart: (language: string) => Promise<void>;
+  onStart: (language: string, staleOnly: boolean) => Promise<void>;
 }
+
+export type TranslationDraft = {
+  text: string;
+  savedText: string;
+};
 
 const LANGUAGE_NAMES: Record<string, string> = {
   en: "English",
@@ -23,7 +41,21 @@ const LANGUAGE_NAMES: Record<string, string> = {
   ko: "한국어",
   fr: "Français",
   es: "Español",
+  de: "Deutsch",
+  pt: "Português",
+  it: "Italiano",
+  ru: "Русский",
+  ar: "العربية",
+  hi: "हिन्दी",
+  th: "ไทย",
+  vi: "Tiếng Việt",
+  id: "Bahasa Indonesia",
+  tr: "Türkçe",
 };
+
+const translationRowKey = (
+  sentence: Doc["paragraphs"][number]["sentences"][number],
+) => sentence.id;
 const EMPTY_TRACK: Record<string, { text: string }> = {};
 
 export function TranslationWorkspace({
@@ -33,9 +65,13 @@ export function TranslationWorkspace({
   lang,
   status,
   busy,
+  drafts: storedDrafts,
+  onDraftsChange,
   onOpenSettings,
+  onPause,
   onLanguageChange,
   onSave,
+  onSaveMany,
   onSeek,
   onStart,
 }: Props) {
@@ -45,17 +81,12 @@ export function TranslationWorkspace({
   )?.lang;
   const [selected, setSelected] = useState(languages[0] || activeTaskLanguage || "en");
   const [query, setQuery] = useState("");
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [customLanguage, setCustomLanguage] = useState("");
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
   const [savingId, setSavingId] = useState<string | null>(null);
-  const rowRefs = useRef(new Map<string, HTMLDivElement>());
-
-  useEffect(() => {
-    if (activeTaskLanguage) {
-      setSelected(activeTaskLanguage);
-    } else if (languages.length > 0 && !languages.includes(selected)) {
-      setSelected(languages[0]);
-    }
-  }, [languages.join("|"), activeTaskLanguage]);
+  const [savingAll, setSavingAll] = useState(false);
+  const [pendingLanguage, setPendingLanguage] = useState<string | null>(null);
+  const [confirmRetranslate, setConfirmRetranslate] = useState(false);
 
   useEffect(() => {
     onLanguageChange(selected);
@@ -72,16 +103,40 @@ export function TranslationWorkspace({
     ),
     [doc],
   );
+  const sentenceIds = useMemo(
+    () => new Set(sentences.map((sentence) => sentence.id)),
+    [sentences],
+  );
   const track = doc.translations[selected] || EMPTY_TRACK;
-
-  useEffect(() => {
-    setDrafts(Object.fromEntries(
-      sentences.map((sentence) => [sentence.id, track[sentence.id]?.text || ""]),
-    ));
-  }, [selected, sentences, track]);
-  const completed = sentences.filter((sentence) => track[sentence.id]?.text).length;
+  const languageDrafts = storedDrafts[selected] || {};
+  const dirtyIds = useMemo(
+    () => new Set(Object.entries(languageDrafts)
+      .filter(([id, draft]) =>
+        sentenceIds.has(id)
+        && draft.text !== (track[id]?.text || ""))
+      .map(([id]) => id)),
+    [languageDrafts, sentenceIds, track],
+  );
+  const translationCounts = useMemo(() => sentences.reduce(
+    (counts, sentence) => {
+      const translation = track[sentence.id];
+      if (translation?.text) counts.completed += 1;
+      if (!translation?.text || translation.sourceText !== sentence.text) {
+        counts.needsUpdate += 1;
+      }
+      return counts;
+    },
+    { completed: 0, needsUpdate: 0 },
+  ), [sentences, track]);
+  const { completed, needsUpdate } = translationCounts;
   const translateTask = status?.kinds.find(
     (item) => item.kind === "translate" && (!item.lang || item.lang === selected),
+  );
+  const otherTranslateTask = status?.kinds.find(
+    (item) => item.kind === "translate"
+      && item.lang
+      && item.lang !== selected
+      && item.pending > 0,
   );
   const batchTotal = translateTask
     ? translateTask.calls ?? translateTask.pending + translateTask.done + translateTask.failed
@@ -112,31 +167,127 @@ export function TranslationWorkspace({
     return sentence && currentTime < sentence.end ? sentence : undefined;
   }, [currentTime, sentences]);
 
-  useEffect(() => {
-    if (!activeSentence || query) return;
-    const row = rowRefs.current.get(activeSentence.id);
-    if (!row || typeof row.scrollIntoView !== "function") return;
-    row.scrollIntoView({
-      behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
-      block: "center",
-    });
-  }, [activeSentence?.id, query]);
-
   const clock = (seconds: number) => {
     const minutes = Math.floor(seconds / 60);
     const rest = Math.floor(seconds % 60);
     return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
   };
 
+  const errorMessage = (error: unknown) =>
+    error instanceof Error ? error.message : String(error);
+
+  const saveDraft = async (id: string) => {
+    if (!dirtyIds.has(id)) return;
+    setSavingId(id);
+    setSaveErrors((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    try {
+      await onSave(selected, id, languageDrafts[id]?.text ?? track[id]?.text ?? "");
+      onDraftsChange(selected, (current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+    } catch (error) {
+      setSaveErrors((current) => ({ ...current, [id]: errorMessage(error) }));
+      throw error;
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  const saveAllDrafts = async () => {
+    const updates = sentences
+      .filter((sentence) => dirtyIds.has(sentence.id))
+      .map((sentence) => ({
+        id: sentence.id,
+        text: languageDrafts[sentence.id]?.text ?? track[sentence.id]?.text ?? "",
+      }));
+    if (updates.length === 0) return;
+    setSavingAll(true);
+    setSaveErrors({});
+    try {
+      await onSaveMany(selected, updates);
+      onDraftsChange(selected, (current) => {
+        const next = { ...current };
+        for (const update of updates) delete next[update.id];
+        return next;
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      setSaveErrors(Object.fromEntries(updates.map((update) => [update.id, message])));
+      throw error;
+    } finally {
+      setSavingAll(false);
+    }
+  };
+
+  const switchLanguage = (language: string) => {
+    setPendingLanguage(null);
+    setSaveErrors({});
+    setSelected(language);
+  };
+
+  const discardAndSwitchLanguage = (language: string) => {
+    onDraftsChange(selected, () => ({}));
+    switchLanguage(language);
+  };
+
+  const requestLanguageChange = (language: string) => {
+    if (language === selected) return;
+    if (dirtyIds.size > 0) {
+      setPendingLanguage(language);
+    } else {
+      setSelected(language);
+    }
+  };
+
+  const normalizedCustomLanguage = customLanguage.trim();
+  const validCustomLanguage = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/
+    .test(normalizedCustomLanguage);
+
+  const languageOptions = Array.from(new Set([
+    ...Object.keys(LANGUAGE_NAMES),
+    ...languages,
+    selected,
+  ]));
+
   return (
     <div className="translation-workspace">
       <aside className="translation-sidebar">
         <p className="eyebrow">{lang === "zh" ? "目标语言" : "Target language"}</p>
-        <select value={selected} onChange={(event) => setSelected(event.target.value)}>
-          {Object.entries(LANGUAGE_NAMES).map(([code, name]) => (
-            <option key={code} value={code}>{name}</option>
+        <select
+          aria-label={lang === "zh" ? "目标语言" : "Target language"}
+          value={selected}
+          onChange={(event) => {
+            requestLanguageChange(event.target.value);
+          }}
+        >
+          {languageOptions.map((code) => (
+            <option key={code} value={code}>{LANGUAGE_NAMES[code] || code}</option>
           ))}
         </select>
+        <div className="translation-custom-language">
+          <input
+            aria-label={lang === "zh" ? "自定义目标语言代码" : "Custom target language code"}
+            placeholder={lang === "zh" ? "其他语言，如 de-CH" : "Other, e.g. de-CH"}
+            value={customLanguage}
+            onChange={(event) => setCustomLanguage(event.target.value)}
+          />
+          <button
+            className="button-quiet"
+            disabled={!validCustomLanguage}
+            onClick={() => {
+              requestLanguageChange(normalizedCustomLanguage);
+              setCustomLanguage("");
+            }}
+          >
+            {lang === "zh" ? "使用" : "Use"}
+          </button>
+        </div>
         <label className="translation-search">
           <span className="sr-only">{lang === "zh" ? "搜索翻译" : "Search translation"}</span>
           <input
@@ -153,6 +304,59 @@ export function TranslationWorkspace({
           </span>
           <progress max={Math.max(sentences.length, 1)} value={completed} />
         </div>
+        {dirtyIds.size > 0 && (
+          <div className="translation-draft-actions" role="status">
+            <span>
+              {lang === "zh"
+                ? `${dirtyIds.size} 条修改尚未保存`
+                : `${dirtyIds.size} unsaved change${dirtyIds.size === 1 ? "" : "s"}`}
+            </span>
+            <button
+              className="button-primary"
+              disabled={busy || savingAll}
+              onClick={() => void saveAllDrafts().catch(() => undefined)}
+            >
+              {savingAll
+                ? (lang === "zh" ? "正在保存…" : "Saving…")
+                : (lang === "zh" ? "保存全部" : "Save all")}
+            </button>
+          </div>
+        )}
+        {pendingLanguage && (
+          <div className="translation-language-confirm" role="alert">
+            <span>
+              {lang === "zh"
+                ? `切换到 ${LANGUAGE_NAMES[pendingLanguage] || pendingLanguage} 前，要如何处理未保存修改？`
+                : `Handle unsaved changes before switching to ${LANGUAGE_NAMES[pendingLanguage] || pendingLanguage}.`}
+            </span>
+            <button
+              className="button-quiet"
+              disabled={savingAll}
+              onClick={() => setPendingLanguage(null)}
+            >
+              {lang === "zh" ? "取消" : "Cancel"}
+            </button>
+            <button
+              className="button-quiet"
+              disabled={savingAll}
+              onClick={() => discardAndSwitchLanguage(pendingLanguage)}
+            >
+              {lang === "zh" ? "放弃修改" : "Discard"}
+            </button>
+            <button
+              className="button-primary"
+              disabled={busy || savingAll}
+              onClick={() => {
+                const target = pendingLanguage;
+                void saveAllDrafts()
+                  .then(() => switchLanguage(target))
+                  .catch(() => undefined);
+              }}
+            >
+              {lang === "zh" ? "保存并切换" : "Save & switch"}
+            </button>
+          </div>
+        )}
         {translateTask && (
           <div className="task-detail">
             <strong>{translateTask.pending > 0
@@ -174,32 +378,99 @@ export function TranslationWorkspace({
               max={Math.max(batchTotal, 1)}
               value={translateTask.done}
             />
+            {translateTask.pending > 0 && !taskStopped && (
+              <button
+                className="button-quiet"
+                disabled={busy}
+                onClick={() => void onPause().catch(() => undefined)}
+              >
+                {lang === "zh" ? "暂停翻译" : "Pause translation"}
+              </button>
+            )}
             {translateTask.lastError && (
               <p className="task-error-detail">{translateTask.lastError}</p>
             )}
           </div>
         )}
+        {otherTranslateTask && (
+          <div className="translation-task-conflict" role="alert">
+            <span>
+              {lang === "zh"
+                ? `${(otherTranslateTask.lang || "").toUpperCase()} 翻译仍有 ${otherTranslateTask.pending} 个批次未完成。处理完该任务后才能开始 ${selected.toUpperCase()}。`
+                : `${(otherTranslateTask.lang || "").toUpperCase()} still has ${otherTranslateTask.pending} unfinished batches. Finish it before starting ${selected.toUpperCase()}.`}
+            </span>
+            <button
+              className="button-quiet"
+              onClick={() => requestLanguageChange(otherTranslateTask.lang || selected)}
+            >
+              {lang === "zh" ? "切回该任务" : "Open that task"}
+            </button>
+          </div>
+        )}
         {configured ? (
-          <>
+          <div className="translation-actions">
             <button
               className="button-primary"
-              disabled={busy || Boolean(translateTask?.pending && !taskStopped)}
-              onClick={() => onStart(selected)}
+              disabled={busy
+                || Boolean(otherTranslateTask)
+                || Boolean(translateTask?.pending && !taskStopped)
+                || (completed > 0 && needsUpdate === 0 && !taskStopped)}
+              onClick={() => onStart(selected, completed > 0)}
             >
-              {translateTask?.pending && taskStopped
+              {otherTranslateTask
+                ? (lang === "zh" ? "其他语言任务待处理" : "Another language needs attention")
+                : translateTask?.pending && taskStopped
                 ? (lang === "zh" ? "继续翻译" : "Resume translation")
                 : translateTask?.pending
                 ? (lang === "zh" ? "翻译进行中…" : "Translation running…")
                 : completed > 0
-                  ? (lang === "zh" ? "更新翻译" : "Update translation")
+                  ? needsUpdate > 0
+                    ? (lang === "zh" ? `更新 ${needsUpdate} 条变化` : `Update ${needsUpdate} changed`)
+                    : (lang === "zh" ? "翻译已是最新" : "Translation is up to date")
                   : (lang === "zh" ? "开始翻译" : "Start translation")}
             </button>
             <small>
               {lang === "zh"
-                ? "后台服务会自动启动。源文修改后可再次更新。"
-                : "The background service starts automatically. Run again after source edits."}
+                ? "按上下文批量请求；更新只发送缺失或源文有变化的字幕。"
+                : "Requests are context-aware batches. Update sends only missing or changed lines."}
             </small>
-          </>
+            {completed > 0 && !translateTask?.pending && (
+              confirmRetranslate ? (
+                <div className="translation-retranslate-confirm">
+                  <span>
+                    {lang === "zh"
+                      ? `确认覆盖并重新翻译全部 ${sentences.length} 条？`
+                      : `Replace and retranslate all ${sentences.length} lines?`}
+                  </span>
+                  <button
+                    className="button-quiet"
+                    disabled={busy}
+                    onClick={() => setConfirmRetranslate(false)}
+                  >
+                    {lang === "zh" ? "取消" : "Cancel"}
+                  </button>
+                  <button
+                    className="button-danger"
+                    disabled={busy}
+                    onClick={() => {
+                      setConfirmRetranslate(false);
+                      void onStart(selected, false);
+                    }}
+                  >
+                    {lang === "zh" ? "确认全部重译" : "Retranslate all"}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="translation-retranslate button-quiet"
+                  disabled={busy}
+                  onClick={() => setConfirmRetranslate(true)}
+                >
+                  {lang === "zh" ? "重新翻译全部…" : "Retranslate all…"}
+                </button>
+              )
+            )}
+          </div>
         ) : (
           <div className="agent-setup-callout">
             <strong>{lang === "zh" ? "先连接 AI Agent" : "Connect an AI Agent first"}</strong>
@@ -220,19 +491,22 @@ export function TranslationWorkspace({
           <span>{lang === "zh" ? "原文" : "Source"}</span>
           <span>{LANGUAGE_NAMES[selected] || selected}</span>
         </header>
-        {visibleSentences.map((sentence) => {
+        <VirtualList
+          activeKey={activeSentence?.id}
+          className="translation-virtual-list"
+          estimateHeight={118}
+          followActive={!query}
+          itemKey={translationRowKey}
+          items={visibleSentences}
+          renderItem={(sentence) => {
           const duration = Math.max(0.1, sentence.end - sentence.start);
-          const translated = drafts[sentence.id] ?? track[sentence.id]?.text ?? "";
+          const translated = languageDrafts[sentence.id]?.text ?? track[sentence.id]?.text ?? "";
           const targetCps = translated ? translated.replace(/\s/g, "").length / duration : 0;
           const active = activeSentence?.id === sentence.id;
           return (
           <div
             className={`translation-row${active ? " active" : ""}`}
             key={sentence.id}
-            ref={(element) => {
-              if (element) rowRefs.current.set(sentence.id, element);
-              else rowRefs.current.delete(sentence.id);
-            }}
           >
             <div>
               <header className="translation-cue-meta">
@@ -261,27 +535,46 @@ export function TranslationWorkspace({
                 value={translated}
                 onChange={(event) => {
                   const text = event.target.value;
-                  setDrafts((current) => ({ ...current, [sentence.id]: text }));
+                  onDraftsChange(selected, (current) => {
+                    const next = { ...current };
+                    if (text === (track[sentence.id]?.text || "")) {
+                      delete next[sentence.id];
+                    } else {
+                      next[sentence.id] = {
+                        text,
+                        savedText: track[sentence.id]?.text || "",
+                      };
+                    }
+                    return next;
+                  });
+                  setSaveErrors((current) => {
+                    const next = { ...current };
+                    delete next[sentence.id];
+                    return next;
+                  });
                 }}
-                onBlur={async () => {
-                  const saved = track[sentence.id]?.text || "";
-                  if (translated === saved) return;
-                  setSavingId(sentence.id);
-                  try {
-                    await onSave(selected, sentence.id, translated);
-                  } finally {
-                    setSavingId(null);
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    void saveDraft(sentence.id).catch(() => undefined);
                   }
                 }}
+                onBlur={() => void saveDraft(sentence.id).catch(() => undefined)}
               />
               {savingId === sentence.id && (
                 <small className="translation-saving" role="status">
                   {lang === "zh" ? "正在保存…" : "Saving…"}
                 </small>
               )}
+              {saveErrors[sentence.id] && (
+                <small className="translation-save-error" role="alert">
+                  {lang === "zh" ? "保存失败，草稿仍保留。" : "Save failed. Draft preserved."}
+                </small>
+              )}
             </div>
           </div>
-        )})}
+        )}}
+        />
       </section>
     </div>
   );

@@ -29,6 +29,44 @@ MAX_CUE_CHARS_CJK = 22
 PROGRESS_PREFIX = "LUMEN_CUT_PROGRESS "
 DEFAULT_MEMORY_LIMIT_MB = 6144
 MLX_CACHE_LIMIT_MB = 256
+PHYSICAL_MEMORY_FRACTION = 0.55
+MIN_MEMORY_LIMIT_MB = 2048
+
+
+def physical_memory_mb() -> int | None:
+    """Return installed RAM without importing a heavyweight dependency."""
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if pages > 0 and page_size > 0:
+            return (pages * page_size) // (1024 * 1024)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            physical_bytes = int(output.stdout.strip())
+            if physical_bytes > 0:
+                return physical_bytes // (1024 * 1024)
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+            pass
+    return None
+
+
+def default_memory_limit_mb() -> int:
+    physical = physical_memory_mb()
+    if not physical:
+        return DEFAULT_MEMORY_LIMIT_MB
+    return max(
+        MIN_MEMORY_LIMIT_MB,
+        min(DEFAULT_MEMORY_LIMIT_MB, int(physical * PHYSICAL_MEMORY_FRACTION)),
+    )
 
 
 class MlxResourceMonitor:
@@ -69,7 +107,7 @@ class MlxResourceMonitor:
 
 def configure_mlx_memory(mx: Any) -> MlxResourceMonitor:
     memory_limit_mb = int(
-        os.environ.get("LUMEN_CUT_MAX_SIDECAR_MEMORY_MB", DEFAULT_MEMORY_LIMIT_MB)
+        os.environ.get("LUMEN_CUT_MAX_SIDECAR_MEMORY_MB", default_memory_limit_mb())
     )
     mx.set_memory_limit(memory_limit_mb * 1024 * 1024)
     mx.set_cache_limit(MLX_CACHE_LIMIT_MB * 1024 * 1024)
@@ -185,7 +223,10 @@ def build_paragraphs(
     flush()
     if not sentences:
         return []
-    return [{"speaker": None, "sentences": sentences}]
+    # Speaker diarization is assigned at paragraph granularity in doc.json.
+    # Keep that granularity aligned with subtitle cues so a long ASR result
+    # cannot collapse every detected speaker into one dominant label.
+    return [{"speaker": None, "sentences": [sentence]} for sentence in sentences]
 
 
 def emit_progress(

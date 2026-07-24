@@ -171,29 +171,47 @@ fn call_tool(name: &str, args: &Value) -> AppResult<String> {
             Ok(serde_json::to_string_pretty(&lin)?)
         }
         "cut_list" => {
-            let cuts: crate::data::soft_cut::ClipCuts =
-                std::fs::read_to_string(dir.join("cuts.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
+            let cuts_path = dir.join("cuts.json");
+            let cuts: crate::data::soft_cut::ClipCuts = if cuts_path.exists() {
+                serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
+            } else {
+                Default::default()
+            };
             Ok(serde_json::to_string_pretty(&cuts)?)
         }
         "subtitle_list" => {
             let doc = crate::data::Doc::load(&dir)?;
-            let rows =
-                crate::data::subtitle::list(&doc, &crate::data::subtitle::load_hidden(&dir), None);
+            let hidden = crate::data::subtitle::load_hidden_checked(&dir)?;
+            let rows = crate::data::subtitle::list(&doc, &hidden, None);
             Ok(serde_json::to_string_pretty(&rows)?)
         }
         "export" => {
             let doc = crate::data::Doc::load(&dir)?;
-            let cuts: crate::data::soft_cut::ClipCuts =
-                std::fs::read_to_string(dir.join("cuts.json"))
-                    .ok()
-                    .and_then(|raw| serde_json::from_str(&raw).ok())
-                    .unwrap_or_default();
-            crate::export::write_srt_with(&doc, &cuts.cuts, &dir.join("export.srt"))?;
-            crate::export::write_vtt_with(&doc, &cuts.cuts, &dir.join("export.vtt"))?;
-            crate::export::write_ass_with(&doc, &cuts.cuts, &dir.join("export.ass"), 1920, 1080)?;
+            let cuts_path = dir.join("cuts.json");
+            let cuts: crate::data::soft_cut::ClipCuts = if cuts_path.exists() {
+                serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
+            } else {
+                Default::default()
+            };
+            let settings = crate::data::export_settings::load(&dir)?;
+            let hidden = crate::data::subtitle::load_hidden_checked(&dir)?;
+            let caption_doc = crate::data::export_settings::project_caption_doc_with_hidden(
+                &doc,
+                settings.subtitle_language.as_deref(),
+                settings.bilingual_subtitles,
+                &hidden,
+            )?;
+            crate::export::write_srt_with(&caption_doc, &cuts.cuts, &dir.join("export.srt"))?;
+            crate::export::write_vtt_with(&caption_doc, &cuts.cuts, &dir.join("export.vtt"))?;
+            let style = crate::data::substyle::SubStyle::load(&dir)?;
+            crate::export::write_ass_with_style(
+                &caption_doc,
+                &cuts.cuts,
+                &style,
+                &dir.join("export.ass"),
+                1920,
+                1080,
+            )?;
             crate::export::write_md_with(&doc, &cuts.cuts, &dir.join("export.md"))?;
             crate::data::cues::save(&dir, &crate::data::cues::to_cues(&doc, None))?;
             Ok(format!("exported srt+vtt+ass+md+cues to {}", dir.display()))
@@ -267,6 +285,15 @@ mod tests {
             translations: Default::default(),
         };
         doc.save(&project).unwrap();
+        crate::data::storage::write_json(
+            &project.join("style.json"),
+            &crate::data::substyle::SubStyle {
+                fontname: "Courier New".into(),
+                fontsize: 66,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let args = json!({
             "pid": "demo",
             "root": temp.path().to_string_lossy(),
@@ -275,5 +302,8 @@ mod tests {
         assert!(result.contains(&project.display().to_string()));
         assert!(project.join("export.srt").exists());
         assert!(project.join("cues.json").exists());
+        assert!(std::fs::read_to_string(project.join("export.ass"))
+            .unwrap()
+            .contains("Style: Default,Courier New,66,"));
     }
 }

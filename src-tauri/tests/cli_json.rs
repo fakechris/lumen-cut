@@ -63,6 +63,178 @@ fn doctor_json_is_one_machine_readable_value() {
 }
 
 #[test]
+fn task_status_json_surfaces_the_active_run_failure_and_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let task = temp.path().join("projects/demo/ai/translate");
+    std::fs::create_dir_all(task.join("pending")).expect("pending directory");
+    std::fs::create_dir_all(task.join("failed")).expect("failed directory");
+    std::fs::write(
+        task.join("task.json"),
+        r#"{"kind":"translate","lang":"zh-Hans","runId":"current","calls":1,"state":"running"}"#,
+    )
+    .expect("task manifest");
+    std::fs::write(
+        task.join("pending/translate-current-0000.json"),
+        r#"{"lines":[]}"#,
+    )
+    .expect("pending call");
+    std::fs::write(
+        task.join("failed/translate-current-0000.json"),
+        r#"{"error":"provider returned invalid JSON"}"#,
+    )
+    .expect("failed call");
+
+    let output = cli()
+        .args(["--json", "task", "status", "demo", "--root"])
+        .arg(temp.path().join("projects"))
+        .output()
+        .expect("run lumen-cut-cli task status");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("task status stdout must be JSON");
+    assert_eq!(value["pending"], 0);
+    assert_eq!(value["done"], 0);
+    assert_eq!(value["failed"], 1);
+    assert_eq!(value["kinds"][0]["state"], "failed");
+    assert_eq!(
+        value["kinds"][0]["lastError"],
+        "provider returned invalid JSON"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn diarize_progress_stays_on_stderr_while_json_stdout_remains_clean() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("audio.wav"), b"").expect("audio placeholder");
+    std::fs::write(
+        temp.path().join("doc.json"),
+        r#"{
+          "id":"demo","schema":1,
+          "media":{"path":"input.wav","durationSeconds":1.0,"sampleRate":16000,"channels":1},
+          "meta":{"title":"demo","description":"","language":"en",
+            "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"},
+          "paragraphs":[{
+            "id":1,"speaker":null,"sentences":[{
+              "id":"s1","text":"hello","words":[
+                {"id":"w1","text":"hello","start":0.1,"end":0.9}
+              ]
+            }]
+          }],
+          "translations":{}
+        }"#,
+    )
+    .expect("write doc");
+    let stub = temp.path().join("diarize-stub.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         printf '%s\\n' 'LUMEN_CUT_PROGRESS {\"phase\":\"loading_model\",\"progress\":0,\"device\":\"mps\",\"cpu_percent\":25,\"peak_memory_mb\":250}' >&2\n\
+         printf '%s\\n' 'LUMEN_CUT_PROGRESS {\"phase\":\"loading_model\",\"progress\":3,\"device\":\"mps\"}' >&2\n\
+         printf '%s\\n' 'LUMEN_CUT_PROGRESS {\"phase\":\"loading_model\",\"progress\":100,\"device\":\"mps\"}' >&2\n\
+         printf '%s' '{\"schema_version\":1,\"segments\":[{\"speaker\":\"SPEAKER_00\",\"start\":0.0,\"end\":1.0}]}'\n",
+    )
+    .expect("write sidecar stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make sidecar executable");
+
+    let output = cli()
+        .args(["--json", "diarize"])
+        .arg(temp.path())
+        .env("LUMEN_CUT_PYTHON", &stub)
+        .env("LUMEN_CUT_DIARIZE_SCRIPT", &stub)
+        .output()
+        .expect("run lumen-cut-cli diarize");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must contain one JSON value");
+    assert_eq!(value["segments"], 1);
+    assert_eq!(value["assigned"], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("progress: loading model 0%"));
+    assert!(stderr.contains("progress: loading model 100%"));
+    assert!(
+        !stderr.contains("loading model 3%"),
+        "small progress changes should be throttled"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_reports_post_processing_through_completed_without_polluting_json() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let media = temp.path().join("input.wav");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000",
+            "-t",
+            "0.2",
+        ])
+        .arg(&media)
+        .status()
+        .expect("ffmpeg is a required runtime dependency");
+    assert!(generated.success(), "failed to generate test audio");
+    let stub = temp.path().join("asr-stub.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         printf '%s' '{\"schema_version\":1,\"language\":\"en\",\"duration_seconds\":0.2,\"paragraphs\":[{\"speaker\":null,\"sentences\":[{\"text\":\"hello\",\"words\":[{\"text\":\"hello\",\"start\":0.0,\"end\":0.2}]}]}]}'\n",
+    )
+    .expect("write ASR stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make ASR stub executable");
+
+    let output = cli()
+        .args(["--json", "auto"])
+        .arg(&media)
+        .arg("--out")
+        .arg(temp.path().join("out"))
+        .env("LUMEN_CUT_PYTHON", &stub)
+        .env("LUMEN_CUT_ASR_SCRIPT", &stub)
+        .output()
+        .expect("run lumen-cut-cli auto");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must contain one JSON value");
+    assert_eq!(value["words"], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for phase in [
+        "progress: extracting 15%",
+        "progress: analyzing 35%",
+        "progress: saving 90%",
+        "progress: exporting 95%",
+        "progress: completed 100%",
+    ] {
+        assert!(stderr.contains(phase), "missing {phase} in:\n{stderr}");
+    }
+}
+
+#[test]
 fn align_list_json_is_read_only_and_returns_only_over_fit_groups() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("projects");

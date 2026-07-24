@@ -25,6 +25,7 @@ import {
   StarIcon,
   UploadIcon,
 } from "../components/Icons";
+import { ProjectCover } from "../components/ProjectCover";
 import type { Lang } from "../i18n";
 import type { ProjectSummary, TranscriptionJobStatus } from "../types";
 
@@ -92,6 +93,14 @@ const COPY = {
     words: "字词",
     paragraphs: "段落",
     ready: "等待转写",
+    offline: "媒体已移动",
+    lastOpened: "最近打开",
+    firstStepsTitle: "接下来会发生什么",
+    firstSteps: [
+      ["1", "导入媒体", "选择文件后先创建项目，不会立即占满资源。"],
+      ["2", "确认并转写", "项目页会检查本地模型，再由你明确开始识别。"],
+      ["3", "编辑并导出", "校对字幕、说话人、翻译和画面，完成后统一导出。"],
+    ],
     moreActions: "更多项目操作",
     star: "收藏项目",
     unstar: "取消收藏",
@@ -145,6 +154,14 @@ const COPY = {
     words: "words",
     paragraphs: "paragraphs",
     ready: "Ready to transcribe",
+    offline: "Media moved",
+    lastOpened: "Last opened",
+    firstStepsTitle: "What happens next",
+    firstSteps: [
+      ["1", "Import media", "Choosing a file creates a project without immediately consuming compute."],
+      ["2", "Review and transcribe", "The project checks local models, then waits for you to start recognition."],
+      ["3", "Edit and export", "Review captions, speakers, translation, and visuals before one final export."],
+    ],
     moreActions: "More project actions",
     star: "Star project",
     unstar: "Unstar project",
@@ -209,6 +226,33 @@ function recordingClock(elapsedSeconds: number) {
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function mediaClock(seconds: number) {
+  const safe = Math.max(0, seconds);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const rest = Math.floor(safe % 60);
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`
+    : `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+function relativeDate(value: string | null, lang: Lang) {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return null;
+  const elapsed = Math.max(0, Date.now() - timestamp);
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 1) return lang === "zh" ? "刚刚" : "just now";
+  if (minutes < 60) return lang === "zh" ? `${minutes} 分钟前` : `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return lang === "zh" ? `${hours} 小时前` : `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return lang === "zh" ? `${days} 天前` : `${days}d ago`;
+  return new Intl.DateTimeFormat(lang === "zh" ? "zh-CN" : "en-US", {
+    dateStyle: "medium",
+  }).format(timestamp);
 }
 
 function ingestPhaseLabel(phase: TranscriptionJobStatus["phase"], lang: Lang) {
@@ -624,7 +668,9 @@ export function ProjectsView({
       if (projectSort === "name") {
         return left.title.localeCompare(right.title, lang === "zh" ? "zh-CN" : "en-US");
       }
-      return Date.parse(right.updated_at || "") - Date.parse(left.updated_at || "");
+      const rightRecent = right.last_opened_at || right.updated_at;
+      const leftRecent = left.last_opened_at || left.updated_at;
+      return Date.parse(rightRecent || "") - Date.parse(leftRecent || "");
     });
   const hasFilters = Boolean(query.trim()) || starredOnly;
 
@@ -835,23 +881,39 @@ export function ProjectsView({
           </div>
         </div>
         {visibleProjects.length === 0 ? (
-          <div className="empty-library">
-            <FolderIcon />
-            <div>
-              <p>{hasFilters ? c.noResults : c.empty}</p>
-              {hasFilters && (
-                <button
-                  className="button-quiet"
-                  onClick={() => {
-                    setQuery("");
-                    setStarredOnly(false);
-                  }}
-                >
-                  {c.clearFilters}
-                </button>
-              )}
+          <>
+            <div className="empty-library">
+              <FolderIcon />
+              <div>
+                <p>{hasFilters ? c.noResults : c.empty}</p>
+                {hasFilters && (
+                  <button
+                    className="button-quiet"
+                    onClick={() => {
+                      setQuery("");
+                      setStarredOnly(false);
+                    }}
+                  >
+                    {c.clearFilters}
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+            {!hasFilters && (
+              <section className="first-project-guide" aria-labelledby="first-project-guide-title">
+                <h3 id="first-project-guide-title">{c.firstStepsTitle}</h3>
+                <div>
+                  {c.firstSteps.map(([number, title, detail]) => (
+                    <article key={number}>
+                      <span>{number}</span>
+                      <strong>{title}</strong>
+                      <p>{detail}</p>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
         ) : (
           <div className="project-rows">
             {visibleProjects.map((project) => {
@@ -867,7 +929,12 @@ export function ProjectsView({
                     disabled={creationLocked}
                     onClick={() => onOpenProject(project.pid, project.title)}
                   >
-                    <span className="project-file-icon"><FolderIcon /></span>
+                    <ProjectCover
+                      mediaAvailable={project.media_available !== false}
+                      pid={project.pid}
+                      title={project.title}
+                      updatedAt={project.updated_at}
+                    />
                     <span className="project-main">
                       <strong>{project.title}</strong>
                       {project.description && (
@@ -878,9 +945,19 @@ export function ProjectsView({
                           ? `${project.word_count} ${c.words} · ${project.paragraph_count} ${c.paragraphs}`
                           : c.ready}
                       </small>
+                      <small className="project-media-meta">
+                        <span>{mediaClock(project.duration_seconds)}</span>
+                        {relativeDate(project.last_opened_at, lang) && (
+                          <span>
+                            {c.lastOpened} {relativeDate(project.last_opened_at, lang)}
+                          </span>
+                        )}
+                      </small>
                     </span>
-                    <span className={`project-state ${hasTranscript ? "done" : "waiting"}`}>
-                      {hasTranscript ? (lang === "zh" ? "已转写" : "Transcribed") : c.ready}
+                    <span className={`project-state ${project.media_available === false ? "offline" : hasTranscript ? "done" : "waiting"}`}>
+                      {project.media_available === false
+                        ? c.offline
+                        : hasTranscript ? (lang === "zh" ? "已转写" : "Transcribed") : c.ready}
                     </span>
                     <span className="sr-only">{c.open}</span>
                     <ChevronRightIcon />

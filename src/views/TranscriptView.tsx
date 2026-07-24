@@ -1,6 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
+import { PipelineFreshness } from "../components/PipelineFreshness";
 import {
   audit,
+  audioMixGet,
+  audioMixSet,
   asrStatus,
   brollAcceptSuggestion,
   brollAdd,
@@ -12,15 +22,26 @@ import {
   brollUpdate,
   branchCreate,
   branchSwitch,
+  chapterList,
+  chapterSetMany,
   configShow,
   cutAuto,
   cutList,
+  cutManualMany,
   cutRestore,
+  editHistoryStatus,
+  editRedo,
+  editUndo,
   exportSubtitles,
   exportFinalCut,
-  finishCheck,
+  exportSettingsGet,
+  exportSettingsSet,
+  exportPreflight,
+  finishCheckForExport,
   mergeSubtitles,
   pickBrollFile,
+  pickMediaFile,
+  projectMediaRelink,
   projectUpdateMeta,
   projectReveal,
   projectShow,
@@ -32,17 +53,24 @@ import {
   speakerReidentifyStart,
   speakerReidentifyStatus,
   speakerRename,
+  setSubtitleTiming,
   splitSubtitle,
   styleGet,
   styleSet,
   subtitleList,
   subtitleReplace,
-  subtitleSet,
+  subtitleUpdateMany,
   subtitleVisibility,
   translationSet,
+  translationSetMany,
   taskStart,
   taskResume,
+  taskPause,
   taskStatus,
+  titleAdd,
+  titleList,
+  titleRemove,
+  titleUpdate,
   transcriptionCancel,
   transcriptionStart,
   transcriptionStatus,
@@ -53,7 +81,7 @@ import {
   videoExportStart,
   videoExportStatus,
 } from "../api";
-import type { CutSummary } from "../api";
+import type { CutSummary, EditHistoryStatus } from "../api";
 import {
   AlertIcon,
   CheckIcon,
@@ -64,11 +92,15 @@ import type { Lang } from "../i18n";
 import type {
   Doc,
   AsrStatus,
+  AudioMix,
   BrollOverview,
   BrollPlacementInput,
   BrollPreviewJobStatus,
   BrollSuggestion,
+  ChapterInput,
+  ChapterRow,
   FinishCheckItem,
+  ExportPreflightReport,
   SubtitleRow,
   SubtitleStyle,
   ReportSummary,
@@ -78,31 +110,71 @@ import type {
   SpeakerInfo,
   SpeakerReidentifyPreview,
   TaskStatus,
+  TitleClip,
+  TitleClipInput,
   TranscriptionJobStatus,
   VersionHistory,
   VideoExportJobStatus,
+  VideoExportSettings,
 } from "../types";
 import { StyleWorkspace } from "./editor/StyleWorkspace";
 import { EnhancementPanel } from "./editor/EnhancementPanel";
 import { PropertiesWorkspace } from "./editor/PropertiesWorkspace";
 import { TimelineWorkspace } from "./editor/TimelineWorkspace";
-import { TranscriptEditor } from "./editor/TranscriptEditor";
-import { TranslationWorkspace } from "./editor/TranslationWorkspace";
+import {
+  TranscriptEditor,
+  type TranscriptDraft,
+} from "./editor/TranscriptEditor";
+import {
+  TranslationWorkspace,
+  type TranslationDraft,
+} from "./editor/TranslationWorkspace";
 import { HistoryWorkspace } from "./editor/HistoryWorkspace";
-import { BrollWorkspace } from "./editor/BrollWorkspace";
+import { BrollWorkspace, EMPTY_BROLL_INPUT } from "./editor/BrollWorkspace";
+import { ReviewFindings } from "./editor/ReviewFindings";
 import { EditorMediaPreview } from "./editor/EditorMediaPreview";
 import { EditorTimelineDock } from "./editor/EditorTimelineDock";
+import {
+  ChapterWorkspace,
+  type ChapterDraft,
+} from "./editor/ChapterWorkspace";
+import { DEFAULT_AUDIO_MIX } from "./editor/audioMix";
+import {
+  editedTimelineDuration,
+  nextPlayableTime,
+  resolveTimelineCuts,
+  sourceToEditedTime,
+} from "./editor/timelineCuts";
 
 interface Props {
+  active: boolean;
+  chapterDrafts: Record<string, ChapterDraft>;
   lang: Lang;
+  onChapterDraftsChange: (update: (
+    current: Record<string, ChapterDraft>,
+  ) => Record<string, ChapterDraft>) => void;
+  onTranscriptDraftsChange: (update: (
+    current: Record<string, TranscriptDraft>,
+  ) => Record<string, TranscriptDraft>) => void;
+  onTranslationDraftsChange: (
+    language: string,
+    update: (
+      current: Record<string, TranslationDraft>,
+    ) => Record<string, TranslationDraft>,
+  ) => void;
   pid: string | null;
+  onOpenProjects: () => void;
   onOpenSettings: () => void;
   onProjectTitleChange: (title: string) => void;
+  transcriptDrafts: Record<string, TranscriptDraft>;
+  translationDrafts: Record<string, Record<string, TranslationDraft>>;
 }
 
 type Tab =
   | "setup"
   | "transcript"
+  | "subtitle"
+  | "chapters"
   | "speakers"
   | "translate"
   | "style"
@@ -113,6 +185,148 @@ type Tab =
   | "review"
   | "export";
 type Feedback = { tone: "success" | "error" | "info"; text: string };
+const EMPTY_EDIT_HISTORY: EditHistoryStatus = {
+  canUndo: false,
+  canRedo: false,
+  undoLabel: null,
+  redoLabel: null,
+};
+const DEFAULT_VIDEO_EXPORT_SETTINGS: VideoExportSettings = {
+  container: "mp4",
+  videoCodec: "h264",
+  resolution: "source",
+  aspectRatio: "source",
+  canvasFit: "contain",
+  subtitleMode: "burn",
+  subtitleLanguage: null,
+  bilingualSubtitles: false,
+  audioCodec: "aac",
+  encodingSpeed: "fast",
+};
+const BROLL_DRAFTS_KEY_PREFIX = "lumen-cut.brollDrafts.";
+const STYLE_DRAFTS_KEY_PREFIX = "lumen-cut.styleDrafts.";
+const COMPACT_TIMELINE_QUERY =
+  "(max-height: 760px), (max-width: 860px) and (max-height: 820px)";
+type TimelinePreference = "auto" | "expanded" | "collapsed";
+
+export function resolveTimelineCollapsed(
+  preference: TimelinePreference,
+  compactViewport: boolean,
+) {
+  if (preference === "collapsed") return true;
+  if (preference === "expanded") return false;
+  return compactViewport;
+}
+
+function normalizeVideoExportSettings(
+  settings: Partial<VideoExportSettings> | null | undefined,
+): VideoExportSettings {
+  return { ...DEFAULT_VIDEO_EXPORT_SETTINGS, ...(settings ?? {}) };
+}
+
+function videoCanvasSummary(settings: VideoExportSettings, lang: Lang) {
+  const ratio = settings.aspectRatio === "source"
+    ? (lang === "zh" ? "跟随源比例" : "source ratio")
+    : settings.aspectRatio;
+  if (settings.resolution === "source") {
+    return `${ratio} · ${lang === "zh" ? "沿用源清晰度" : "source quality"}`;
+  }
+  if (settings.aspectRatio === "source") {
+    return `${ratio} · ${settings.resolution}`;
+  }
+  const shortEdge = settings.resolution === "720p"
+    ? 720
+    : settings.resolution === "1080p"
+      ? 1080
+      : 2160;
+  const [ratioWidth, ratioHeight] = settings.aspectRatio.split(":").map(Number);
+  const width = ratioWidth >= ratioHeight
+    ? Math.round(shortEdge * ratioWidth / ratioHeight)
+    : shortEdge;
+  const height = ratioWidth >= ratioHeight
+    ? shortEdge
+    : Math.round(shortEdge * ratioHeight / ratioWidth);
+  return `${settings.aspectRatio} · ${width} × ${height}`;
+}
+
+type PersistedBrollDrafts = {
+  placements: Record<string, BrollPlacementInput>;
+  newPlacement: BrollPlacementInput;
+};
+
+function isBrollPlacementInput(value: unknown): value is BrollPlacementInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  const rect = input.rect;
+  const validRect = rect === undefined
+    || rect === null
+    || (
+      typeof rect === "object"
+      && !Array.isArray(rect)
+      && ["x", "y", "width", "height"].every(
+        (key) => Number.isFinite((rect as Record<string, unknown>)[key]),
+      )
+    );
+  return typeof input.file === "string"
+    && Number.isFinite(input.start)
+    && Number.isFinite(input.end)
+    && (input.mode === "pip" || input.mode === "fullscreen")
+    && (input.fit === "cover" || input.fit === "contain")
+    && (input.background === "black" || input.background === "blur")
+    && Number.isFinite(input.sourceStart)
+    && Number.isFinite(input.radius)
+    && (typeof input.name === "string" || input.name === null)
+    && validRect;
+}
+
+function initialBrollDrafts(pid: string | null): PersistedBrollDrafts {
+  if (!pid) {
+    return { placements: {}, newPlacement: { ...EMPTY_BROLL_INPUT } };
+  }
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(`${BROLL_DRAFTS_KEY_PREFIX}${pid}`) || "{}",
+    ) as Record<string, unknown>;
+    const placementsValue = parsed.placements;
+    const placements = placementsValue
+      && typeof placementsValue === "object"
+      && !Array.isArray(placementsValue)
+      ? Object.fromEntries(Object.entries(placementsValue)
+        .filter((entry): entry is [string, BrollPlacementInput] =>
+          isBrollPlacementInput(entry[1])))
+      : {};
+    return {
+      placements,
+      newPlacement: isBrollPlacementInput(parsed.newPlacement)
+        ? parsed.newPlacement
+        : { ...EMPTY_BROLL_INPUT },
+    };
+  } catch {
+    return { placements: {}, newPlacement: { ...EMPTY_BROLL_INPUT } };
+  }
+}
+
+function isSubtitleStyle(value: unknown): value is SubtitleStyle {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const style = value as Record<string, unknown>;
+  return ["name", "fontname", "primaryColour", "outlineColour"]
+    .every((key) => typeof style[key] === "string")
+    && ["fontsize", "alignment", "outline", "shadow", "marginL", "marginR", "marginV"]
+      .every((key) => Number.isFinite(style[key]))
+    && ["bold", "italic", "underline", "strikeOut"]
+      .every((key) => typeof style[key] === "boolean");
+}
+
+function restoredStyleDraft(pid: string, fallback: SubtitleStyle): SubtitleStyle {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(`${STYLE_DRAFTS_KEY_PREFIX}${pid}`) || "null",
+    );
+    return isSubtitleStyle(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 const COPY = {
   zh: {
@@ -129,6 +343,8 @@ const COPY = {
     startTitle: "准备开始转写",
     startDescription: "转写在本机运行，首次使用可能需要下载语音模型。",
     start: "开始转写",
+    checkingAsr: "正在检查本地环境…",
+    prepareAsr: "准备转写环境",
     transcribing: "正在转写音频…",
     transcribeHint: "完成后会自动打开转写稿",
     cancelTranscription: "取消转写",
@@ -139,7 +355,7 @@ const COPY = {
     language: "语言",
     auto: "自动检测",
     words: "字词",
-    paragraphs: "段落",
+    paragraphs: "字幕段",
     speaker: "识别说话人",
     translating: "翻译任务已开始",
     translate: "翻译",
@@ -187,6 +403,8 @@ const COPY = {
     startTitle: "Ready to transcribe",
     startDescription: "Transcription runs locally. The first run may download a speech model.",
     start: "Start transcription",
+    checkingAsr: "Checking local setup…",
+    prepareAsr: "Prepare transcription",
     transcribing: "Transcribing audio…",
     transcribeHint: "The transcript opens automatically when complete",
     cancelTranscription: "Cancel transcription",
@@ -197,7 +415,7 @@ const COPY = {
     language: "Language",
     auto: "Auto-detect",
     words: "words",
-    paragraphs: "paragraphs",
+    paragraphs: "cues",
     speaker: "Identify speakers",
     translating: "Translation started",
     translate: "Translate",
@@ -295,24 +513,123 @@ function transcriptionPhaseLabel(phase: TranscriptionJobStatus["phase"], lang: L
   return labels[phase][lang === "zh" ? 0 : 1];
 }
 
+function finishCheckLabel(code: string, lang: Lang) {
+  const labels: Record<string, [string, string]> = {
+    "transcribe-complete": ["转写内容", "Transcript"],
+    "translations-filled": ["翻译完整性", "Translation coverage"],
+    "audit-pass": ["内容与时码审查", "Content and timing"],
+    "aligned-with-media": ["媒体时码对齐", "Media alignment"],
+    "soft-cuts-sane": ["时间线剪辑", "Timeline edits"],
+    "speaker-labels": ["说话人标签", "Speaker labels"],
+    "export-ready": ["导出资产", "Export assets"],
+    "version-head-committed": ["版本状态", "Version state"],
+  };
+  return labels[code]?.[lang === "zh" ? 0 : 1] ?? code;
+}
+
+function exportPreflightLabel(code: string, lang: Lang) {
+  const labels: Record<string, [string, string]> = {
+    settings: ["导出规格", "Delivery settings"],
+    media: ["源媒体", "Source media"],
+    "media-duration": ["媒体时长", "Media duration"],
+    timeline: ["成片时间线", "Edited timeline"],
+    "timeline-data": ["时间线数据", "Timeline data"],
+    captions: ["字幕轨道", "Caption track"],
+    "caption-state": ["字幕可见性", "Caption visibility"],
+    "hidden-captions": ["隐藏字幕", "Hidden captions"],
+    style: ["字幕样式", "Caption style"],
+    broll: ["B-roll 素材", "B-roll assets"],
+    titles: ["标题图层", "Title layers"],
+    audio: ["音频混合", "Audio mix"],
+    encoder: ["视频编码器", "Video encoder"],
+    "size-estimate": ["文件体积", "File size"],
+  };
+  return labels[code]?.[lang === "zh" ? 0 : 1] ?? code;
+}
+
+function exportPreflightMessage(
+  item: ExportPreflightReport["items"][number],
+  report: ExportPreflightReport,
+  lang: Lang,
+) {
+  if (lang !== "zh") return item.message;
+  if (item.code === "hidden-captions") {
+    return `${report.summary.hiddenCaptions} 行隐藏字幕不会进入成片。`;
+  }
+  if (item.code === "size-estimate") {
+    return `预计输出 ${report.summary.estimatedMinMb}–${report.summary.estimatedMaxMb} MB，实际体积会随画面复杂度变化。`;
+  }
+  const prefixes: Record<string, string> = {
+    settings: "当前容器、编码、字幕或音频组合不兼容",
+    media: "源媒体无法用于视频导出",
+    "media-duration": "项目记录的时长与源媒体不同",
+    timeline: "当前剪辑后没有可导出的画面",
+    "timeline-data": "时间线编辑数据已损坏或无法读取",
+    captions: "所选字幕内容尚未准备好",
+    "caption-state": "字幕的显示与隐藏状态已损坏或无法读取",
+    style: "字幕样式已损坏或无法读取",
+    broll: "有 B-roll 素材无法用于成片",
+    titles: "有标题图层无法用于成片",
+    audio: "音频设置无法用于成片",
+    encoder: "当前设备缺少所选编码器",
+  };
+  const prefix = prefixes[item.code];
+  return prefix ? `${prefix}：${item.message}` : item.message;
+}
+
+function exportPreflightFixLabel(code: string, lang: Lang) {
+  const labels: Record<string, [string, string]> = {
+    media: ["重新定位", "Relink"],
+    timeline: ["查看时间线", "Open timeline"],
+    "timeline-data": ["查看时间线", "Open timeline"],
+    captions: ["前往翻译", "Open translation"],
+    "caption-state": ["检查字幕", "Review captions"],
+    style: ["检查样式", "Review style"],
+    broll: ["检查素材", "Review assets"],
+    titles: ["检查标题", "Review titles"],
+    audio: ["检查音频", "Review audio"],
+    settings: ["调整规格", "Adjust settings"],
+    encoder: ["调整编码", "Change encoder"],
+  };
+  return labels[code]?.[lang === "zh" ? 0 : 1] ?? null;
+}
+
 export function TranscriptView({
+  active,
+  chapterDrafts,
   lang,
+  onChapterDraftsChange,
+  onTranscriptDraftsChange,
+  onTranslationDraftsChange,
   pid,
+  onOpenProjects,
   onOpenSettings,
   onProjectTitleChange,
+  transcriptDrafts,
+  translationDrafts,
 }: Props) {
   const c = COPY[lang];
   const [doc, setDoc] = useState<Doc | null>(null);
+  const [projectLoadError, setProjectLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("setup");
+  const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
+  const toolsButtonRef = useRef<HTMLButtonElement>(null);
+  const toolsMenuRef = useRef<HTMLDivElement>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [auditReport, setAuditReport] = useState<ReportSummary | null>(null);
   const [finishItems, setFinishItems] = useState<FinishCheckItem[] | null>(null);
+  const [exportPreflightReport, setExportPreflightReport] =
+    useState<ExportPreflightReport | null>(null);
+  const [exportPreflightUpdating, setExportPreflightUpdating] = useState(false);
   const [allowDraftExport, setAllowDraftExport] = useState(false);
   const [taskState, setTaskState] = useState<TaskStatus | null>(null);
   const [cuts, setCuts] = useState<CutSummary[]>([]);
+  const [editHistory, setEditHistory] = useState<EditHistoryStatus>(EMPTY_EDIT_HISTORY);
   const [subtitleRows, setSubtitleRows] = useState<SubtitleRow[]>([]);
+  const [chapters, setChapters] = useState<ChapterRow[]>([]);
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle | null>(null);
+  const [savedSubtitleStyle, setSavedSubtitleStyle] = useState<SubtitleStyle | null>(null);
   const [speakers, setSpeakers] = useState<SpeakerInfo[]>([]);
   const [speakerEvidenceState, setSpeakerEvidenceState] = useState<SpeakerEvidence>({
     speakers: [],
@@ -326,25 +643,168 @@ export function TranscriptView({
   const [transcriptionJob, setTranscriptionJob] =
     useState<TranscriptionJobStatus | null>(null);
   const [transcriptionFailure, setTranscriptionFailure] = useState<string | null>(null);
+  const [confirmRetranscription, setConfirmRetranscription] = useState(false);
   const [videoExportJob, setVideoExportJob] = useState<VideoExportJobStatus | null>(null);
-  const [videoExportMode, setVideoExportMode] = useState<VideoExportJobStatus["mode"]>("fast");
+  const [videoExportSettings, setVideoExportSettings] = useState<VideoExportSettings>(
+    DEFAULT_VIDEO_EXPORT_SETTINGS,
+  );
   const [agentConfigured, setAgentConfigured] = useState(false);
   const [asrReadiness, setAsrReadiness] = useState<AsrStatus | null>(null);
+  const selectedAsrReady = asrReadiness
+    ? (asrReadiness.selectedReady ?? asrReadiness.ready)
+    : false;
   const [versionHistory, setVersionHistory] = useState<VersionHistory | null>(null);
   const [brollOverview, setBrollOverview] = useState<BrollOverview>({
     suggestions: [],
     accepted: [],
     errors: [],
   });
+  const initialBroll = useMemo(() => initialBrollDrafts(pid), [pid]);
+  const [brollDrafts, setBrollDrafts] =
+    useState<Record<string, BrollPlacementInput>>(initialBroll.placements);
+  const [newBrollPlacement, setNewBrollPlacement] =
+    useState<BrollPlacementInput>(initialBroll.newPlacement);
   const [brollPreviewJob, setBrollPreviewJob] = useState<BrollPreviewJobStatus | null>(null);
   const [brollPreviewPaths, setBrollPreviewPaths] = useState<string[]>([]);
+  const [titles, setTitles] = useState<TitleClip[]>([]);
+  const [audioMix, setAudioMix] = useState<AudioMix>(DEFAULT_AUDIO_MIX);
   const workbenchPlayerRef = useRef<HTMLMediaElement | null>(null);
   const [workbenchTime, setWorkbenchTime] = useState(0);
   const [workbenchPlaying, setWorkbenchPlaying] = useState(false);
+  const [previewCuts, setPreviewCuts] = useState(true);
+  const [previewExpanded, setPreviewExpanded] = useState(false);
+  const [timelinePreference, setTimelinePreference] =
+    useState<TimelinePreference>("auto");
+  const [compactTimelineViewport, setCompactTimelineViewport] = useState(
+    () => window.matchMedia?.(COMPACT_TIMELINE_QUERY).matches ?? false,
+  );
+  const [inspectorPercent, setInspectorPercent] = useState(46);
+  const [resizingPanes, setResizingPanes] = useState(false);
   const [previewTranslationLanguage, setPreviewTranslationLanguage] = useState<string | null>(null);
   const previousPending = useRef(0);
+  const wasActive = useRef(active);
   const activeProject = useRef(pid);
+  const exportSettingsProject = useRef<string | null>(null);
+  const exportCheckRun = useRef(false);
   activeProject.current = pid;
+  const newBrollPlacementDirty = JSON.stringify(newBrollPlacement)
+    !== JSON.stringify(EMPTY_BROLL_INPUT);
+  const subtitleStyleDirty = subtitleStyle !== null
+    && savedSubtitleStyle !== null
+    && JSON.stringify(subtitleStyle) !== JSON.stringify(savedSubtitleStyle);
+  const timelineCollapsed = resolveTimelineCollapsed(
+    timelinePreference,
+    compactTimelineViewport,
+  );
+  const timelineAutoCollapsed = timelinePreference === "auto" && compactTimelineViewport;
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia(COMPACT_TIMELINE_QUERY);
+    const update = () => setCompactTimelineViewport(query.matches);
+    update();
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", update);
+      return () => query.removeEventListener("change", update);
+    }
+    query.addListener?.(update);
+    return () => query.removeListener?.(update);
+  }, []);
+
+  useEffect(() => {
+    if (!toolsMenuOpen) return;
+    toolsMenuRef.current
+      ?.querySelector<HTMLButtonElement>('[role="menuitem"]')
+      ?.focus();
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && !toolsMenuRef.current?.parentElement?.contains(event.target)) {
+        setToolsMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setToolsMenuOpen(false);
+      toolsButtonRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [toolsMenuOpen]);
+
+  useEffect(() => {
+    if (!pid || !subtitleStyle || !savedSubtitleStyle) return;
+    try {
+      const key = `${STYLE_DRAFTS_KEY_PREFIX}${pid}`;
+      if (subtitleStyleDirty) {
+        localStorage.setItem(key, JSON.stringify(subtitleStyle));
+      } else {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      // Keep the in-memory preview if browser storage is unavailable.
+    }
+  }, [pid, savedSubtitleStyle, subtitleStyle, subtitleStyleDirty]);
+
+  useEffect(() => {
+    if (!pid) return;
+    try {
+      const key = `${BROLL_DRAFTS_KEY_PREFIX}${pid}`;
+      if (Object.keys(brollDrafts).length === 0 && !newBrollPlacementDirty) {
+        localStorage.removeItem(key);
+      } else {
+        localStorage.setItem(key, JSON.stringify({
+          placements: brollDrafts,
+          newPlacement: newBrollPlacement,
+        } satisfies PersistedBrollDrafts));
+      }
+    } catch {
+      // Keep the in-memory draft if browser storage is unavailable.
+    }
+  }, [brollDrafts, newBrollPlacement, newBrollPlacementDirty, pid]);
+
+  useEffect(() => {
+    if (!doc) return;
+    const accepted = new Map(brollOverview.accepted.map((placement) => [
+      placement.id,
+      {
+        file: placement.file,
+        start: placement.start,
+        end: placement.end,
+        mode: placement.mode,
+        fit: placement.fit,
+        background: placement.background,
+        rect: placement.rect,
+        sourceStart: placement.sourceStart,
+        radius: placement.radius,
+        name: placement.name || "",
+      } satisfies BrollPlacementInput,
+    ]));
+    setBrollDrafts((current) => Object.fromEntries(
+      Object.entries(current).filter(([id, draft]) => {
+        const original = accepted.get(id);
+        return original && JSON.stringify(draft) !== JSON.stringify(original);
+      }),
+    ));
+  }, [brollOverview.accepted, doc]);
+
+  useEffect(() => {
+    if (
+      Object.keys(brollDrafts).length === 0
+      && !newBrollPlacementDirty
+      && !subtitleStyleDirty
+    ) return;
+    const warnOnClose = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnOnClose);
+    return () => window.removeEventListener("beforeunload", warnOnClose);
+  }, [brollDrafts, newBrollPlacementDirty, subtitleStyleDirty]);
+
   const previewRows = useMemo(() => {
     if (!doc || activeTab !== "translate" || !previewTranslationLanguage) {
       return subtitleRows;
@@ -356,6 +816,37 @@ export function TranscriptView({
       text: track[row.id]?.text || row.text,
     }));
   }, [activeTab, doc, previewTranslationLanguage, subtitleRows]);
+  const previewBrollOverview = useMemo<BrollOverview>(() => {
+    if (activeTab !== "broll") return brollOverview;
+    return {
+      ...brollOverview,
+      accepted: brollOverview.accepted.map((placement) => {
+        const draft = brollDrafts[placement.id];
+        return draft ? { id: placement.id, ...draft } : placement;
+      }),
+    };
+  }, [activeTab, brollDrafts, brollOverview]);
+  const translationLanguages = useMemo(
+    () => Object.keys(doc?.translations ?? {}).sort((left, right) => left.localeCompare(right)),
+    [doc],
+  );
+  const exportCaptionTrack = videoExportSettings.subtitleLanguage
+    ? `${videoExportSettings.bilingualSubtitles ? "bilingual" : "translation"}:${videoExportSettings.subtitleLanguage}`
+    : "source";
+  const timelineCutIntervals = useMemo(
+    () => doc ? resolveTimelineCuts(doc, cuts) : [],
+    [cuts, doc],
+  );
+  const programDuration = useMemo(
+    () => doc
+      ? editedTimelineDuration(doc.media.durationSeconds, timelineCutIntervals)
+      : 0,
+    [doc, timelineCutIntervals],
+  );
+  const programTime = useMemo(
+    () => sourceToEditedTime(workbenchTime, timelineCutIntervals),
+    [timelineCutIntervals, workbenchTime],
+  );
   const { wordsByCue, nextCueById } = useMemo(() => {
     const words: Record<string, string[]> = {};
     const nextCues: Record<string, string> = {};
@@ -391,10 +882,68 @@ export function TranscriptView({
     }
   }, []);
 
+  useEffect(() => {
+    if (active) return;
+    const player = workbenchPlayerRef.current;
+    if (player && !player.paused) player.pause();
+    setWorkbenchPlaying(false);
+  }, [active]);
+
+  useEffect(() => {
+    const returningToEditor = active && !wasActive.current;
+    wasActive.current = active;
+    if (!returningToEditor || !pid) return;
+    let disposed = false;
+    void Promise.all([asrStatus(), configShow()])
+      .then(([readiness, config]) => {
+        if (disposed) return;
+        setAsrReadiness(readiness);
+        setAgentConfigured(Boolean(
+          config.llmEndpoint.trim() && config.llmModel.trim(),
+        ));
+      })
+      .catch((error) => {
+        if (!disposed) {
+          setFeedback({ tone: "error", text: friendlyError(error, lang) });
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [active, lang, pid]);
+
+  const updateWorkbenchTime = useCallback((seconds: number) => {
+    let next = seconds;
+    if (doc && previewCuts && workbenchPlaying) {
+      const playable = nextPlayableTime(seconds, timelineCutIntervals);
+      if (playable > seconds + 0.001) {
+        next = Math.min(doc.media.durationSeconds, playable + 0.001);
+        if (workbenchPlayerRef.current) {
+          workbenchPlayerRef.current.currentTime = next;
+        }
+      }
+    }
+    setWorkbenchTime(next);
+  }, [doc, previewCuts, timelineCutIntervals, workbenchPlaying]);
+
   const reload = async (projectId: string, resetTab = true) => {
+    exportCheckRun.current = false;
     setFinishItems(null);
+    setExportPreflightReport(null);
+    setExportPreflightUpdating(false);
     setAllowDraftExport(false);
-    const [nextDoc, nextRows, nextStyle, nextEvidence, nextBroll] = await Promise.all([
+    const [
+      nextDoc,
+      nextRows,
+      nextStyle,
+      nextEvidence,
+      nextBroll,
+      nextTitles,
+      nextEditHistory,
+      nextAudioMix,
+      nextExportSettings,
+      nextChapters,
+    ] = await Promise.all([
       projectShow(projectId),
       subtitleList(projectId),
       styleGet(projectId),
@@ -408,14 +957,34 @@ export function TranscriptView({
         });
         return { suggestions: [], accepted: [], errors: [friendlyError(error, lang)] };
       }),
+      titleList(projectId).catch(() => []),
+      editHistoryStatus(projectId).catch(() => EMPTY_EDIT_HISTORY),
+      audioMixGet(projectId).catch(() => DEFAULT_AUDIO_MIX),
+      exportSettingsGet(projectId).catch(() => DEFAULT_VIDEO_EXPORT_SETTINGS),
+      chapterList(projectId).catch((error) => {
+        setFeedback({
+          tone: "error",
+          text: lang === "zh"
+            ? `章节数据无法加载，其他编辑仍可继续：${friendlyError(error, lang)}`
+            : `Chapter data could not be loaded; other editing can continue: ${friendlyError(error, lang)}`,
+        });
+        return [];
+      }),
     ]);
     if (activeProject.current !== projectId) return;
     setDoc(nextDoc);
     setSubtitleRows(nextRows);
-    setSubtitleStyle(nextStyle);
+    setSubtitleStyle(restoredStyleDraft(projectId, nextStyle));
+    setSavedSubtitleStyle(nextStyle);
     setSpeakers(nextEvidence.speakers);
     setSpeakerEvidenceState(nextEvidence);
     setBrollOverview(nextBroll);
+    setTitles(nextTitles);
+    setEditHistory(nextEditHistory);
+    setAudioMix(nextAudioMix);
+    setVideoExportSettings(normalizeVideoExportSettings(nextExportSettings));
+    setChapters(nextChapters);
+    exportSettingsProject.current = projectId;
     if (resetTab) {
       setActiveTab(nextDoc.paragraphs.length > 0 ? "transcript" : "setup");
     }
@@ -428,26 +997,36 @@ export function TranscriptView({
   };
 
   useEffect(() => {
+    exportCheckRun.current = false;
     setDoc(null);
+    setProjectLoadError(null);
     setFeedback(null);
     setWorkbenchTime(0);
     setWorkbenchPlaying(false);
     workbenchPlayerRef.current?.pause();
     setAuditReport(null);
     setFinishItems(null);
+    setExportPreflightReport(null);
+    setExportPreflightUpdating(false);
     setAllowDraftExport(false);
     setTaskState(null);
     setOperation(null);
     setTranscriptionJob(null);
     setTranscriptionFailure(null);
+    setConfirmRetranscription(false);
+    setChapters([]);
     setVideoExportJob(null);
     setVersionHistory(null);
     setSpeakerEvidenceState({ speakers: [], turns: [], identified: false, unlabelled: 0 });
     setSpeakerPreview(null);
     setSpeakerAnalysisJob(null);
     setBrollOverview({ suggestions: [], accepted: [], errors: [] });
+    setTitles([]);
+    setAudioMix(DEFAULT_AUDIO_MIX);
+    setEditHistory(EMPTY_EDIT_HISTORY);
     setBrollPreviewJob(null);
     setBrollPreviewPaths([]);
+    exportSettingsProject.current = null;
     if (!pid) return;
     void Promise.all([
       reload(pid),
@@ -457,14 +1036,24 @@ export function TranscriptView({
         if (status.kinds.some(
           (task) => task.pending > 0 && task.state !== "paused" && task.state !== "failed",
         )) {
-          const recovery = await taskResume(pid);
-          if (activeProject.current !== pid) return;
-          if (recovery.resumed > 0 || recovery.recoveredSubmissions > 0) {
+          try {
+            const recovery = await taskResume(pid);
+            if (activeProject.current !== pid) return;
+            if (recovery.resumed > 0 || recovery.recoveredSubmissions > 0) {
+              setFeedback({
+                tone: "info",
+                text: lang === "zh"
+                  ? `已恢复 ${recovery.resumed} 个未完成任务，其中 ${recovery.recoveredSubmissions} 个模型结果无需重算。`
+                  : `Resumed ${recovery.resumed} unfinished tasks; ${recovery.recoveredSubmissions} model results did not need recomputation.`,
+              });
+            }
+          } catch (error) {
+            if (activeProject.current !== pid) return;
             setFeedback({
-              tone: "info",
+              tone: "error",
               text: lang === "zh"
-                ? `已恢复 ${recovery.resumed} 个未完成任务，其中 ${recovery.recoveredSubmissions} 个模型结果无需重算。`
-                : `Resumed ${recovery.resumed} unfinished tasks; ${recovery.recoveredSubmissions} model results did not need recomputation.`,
+                ? `未完成的 AI 任务尚未恢复：${friendlyError(error, lang)}`
+                : `Unfinished AI tasks were not resumed: ${friendlyError(error, lang)}`,
             });
           }
         }
@@ -498,8 +1087,8 @@ export function TranscriptView({
             setFeedback({
               tone: "info",
               text: lang === "zh"
-                ? `已恢复上次说话人分析提案：${status.preview.changed} 个段落标签待确认。`
-                : `Restored the previous speaker proposal: ${status.preview.changed} paragraph labels await review.`,
+                ? `已恢复上次说话人分析提案：${status.preview.changed} 个字幕片段标签待确认。`
+                : `Restored the previous speaker proposal: ${status.preview.changed} subtitle labels await review.`,
             });
           } else if (status.state === "failed") {
             setFeedback({
@@ -529,7 +1118,7 @@ export function TranscriptView({
           }
         })
         .catch(() => undefined),
-      brollPreviewStatus(pid)
+      brollPreviewStatus(pid, true)
         .then((status) => {
           if (status.state === "running" || status.state === "cancelling") {
             setBrollPreviewJob(status);
@@ -540,9 +1129,55 @@ export function TranscriptView({
         })
         .catch(() => undefined),
     ]).catch((error) => {
-        setFeedback({ tone: "error", text: friendlyError(error, lang) });
+        const message = friendlyError(error, lang);
+        setProjectLoadError(message);
+        setFeedback({ tone: "error", text: message });
       });
   }, [pid]);
+
+  useEffect(() => {
+    if (!pid || exportSettingsProject.current !== pid) return;
+    const shouldRecheck = exportCheckRun.current;
+    if (shouldRecheck) {
+      setExportPreflightReport(null);
+      setExportPreflightUpdating(true);
+    }
+    let disposed = false;
+    const timeout = window.setTimeout(() => {
+      void (async () => {
+        try {
+          await exportSettingsSet(pid, videoExportSettings);
+          if (shouldRecheck) {
+            const [items, preflight] = await Promise.all([
+              finishCheckForExport(pid, videoExportSettings),
+              exportPreflight(pid, videoExportSettings),
+            ]);
+            if (disposed || activeProject.current !== pid) return;
+            setFinishItems(items);
+            setExportPreflightReport(preflight);
+            setAllowDraftExport(false);
+          }
+        } catch (error) {
+          if (disposed || activeProject.current !== pid) return;
+          setFeedback({
+            tone: "error",
+            text:
+              lang === "zh"
+                ? `导出预设未能保存或重新检查：${friendlyError(error, lang)}`
+                : `Export preset could not be saved or rechecked: ${friendlyError(error, lang)}`,
+          });
+        } finally {
+          if (!disposed && activeProject.current === pid) {
+            setExportPreflightUpdating(false);
+          }
+        }
+      })();
+    }, 350);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timeout);
+    };
+  }, [lang, pid, videoExportSettings]);
 
   useEffect(() => {
     if (
@@ -579,19 +1214,20 @@ export function TranscriptView({
           keepPolling = false;
           await reload(pid, false);
           if (disposed || activeProject.current !== pid) return;
-          const translate = status.kinds.find(
-            (task) => task.kind === "translate" && watchedTasks.has(`${task.kind}:${task.lang || ""}`),
+          const finished = status.kinds.find(
+            (task) => watchedTasks.has(`${task.kind}:${task.lang || ""}`),
           );
-          if (translate) {
+          if (finished) {
+            const failed = finished.failed > 0 || finished.state === "failed";
             setFeedback({
-              tone: translate.failed > 0 || translate.state === "failed" ? "error" : "success",
-              text: translate.failed > 0 || translate.state === "failed"
+              tone: failed ? "error" : "success",
+              text: failed
                 ? lang === "zh"
-                  ? `翻译已停止：${translate.failed} 个批次失败，已完成的结果已经保存。`
-                  : `Translation stopped: ${translate.failed} batches failed. Completed results were saved.`
+                  ? `${taskLabel(finished.kind, lang)}已停止：${finished.failed} 个批次失败。${finished.lastError || "已完成的结果已经保存。"}`
+                  : `${taskLabel(finished.kind, lang)} stopped: ${finished.failed} batches failed. ${finished.lastError || "Completed results were saved."}`
                 : lang === "zh"
-                  ? "翻译完成，结果已保存。"
-                  : "Translation complete. Results were saved.",
+                  ? `${taskLabel(finished.kind, lang)}完成，结果已保存。`
+                  : `${taskLabel(finished.kind, lang)} completed. Results were saved.`,
             });
           }
         } else {
@@ -763,7 +1399,7 @@ export function TranscriptView({
     let timer: number | undefined;
     const poll = async () => {
       try {
-        const status = await brollPreviewStatus(pid);
+        const status = await brollPreviewStatus(pid, true);
         if (disposed) return;
         if (status.state === "completed") {
           setBrollPreviewJob(status);
@@ -821,8 +1457,8 @@ export function TranscriptView({
           setFeedback({
             tone: "info",
             text: lang === "zh"
-              ? `分析完成：${status.preview.changed} 个段落标签可能改变。项目尚未被修改。`
-              : `Analysis complete: ${status.preview.changed} paragraph labels may change. The project is unchanged.`,
+              ? `分析完成：${status.preview.changed} 个字幕片段标签可能改变。项目尚未被修改。`
+              : `Analysis complete: ${status.preview.changed} subtitle labels may change. The project is unchanged.`,
           });
           setOperation(null);
           setSpeakerAnalysisJob(null);
@@ -886,6 +1522,41 @@ export function TranscriptView({
   }
 
   if (!doc) {
+    if (projectLoadError) {
+      return (
+        <section className="editor-load-error" role="alert">
+          <AlertIcon />
+          <p className="eyebrow">{lang === "zh" ? "项目没有打开" : "Project did not open"}</p>
+          <h2>{lang === "zh" ? "项目数据暂时无法读取" : "Project data is temporarily unavailable"}</h2>
+          <p>{projectLoadError}</p>
+          <small>
+            {lang === "zh"
+              ? "原始媒体和已保存编辑不会因这次加载失败而被删除。"
+              : "The source media and saved edits are not deleted by this loading failure."}
+          </small>
+          <div>
+            <button
+              className="button-primary"
+              onClick={() => {
+                if (!pid) return;
+                setProjectLoadError(null);
+                setFeedback(null);
+                void reload(pid).catch((error) => {
+                  const message = friendlyError(error, lang);
+                  setProjectLoadError(message);
+                  setFeedback({ tone: "error", text: message });
+                });
+              }}
+            >
+              {lang === "zh" ? "重试打开" : "Try again"}
+            </button>
+            <button className="button-quiet" onClick={onOpenProjects}>
+              {lang === "zh" ? "返回项目" : "Back to projects"}
+            </button>
+          </div>
+        </section>
+      );
+    }
     return (
       <section className="editor-loading" role="status">
         <span className="spinner" aria-hidden="true" />
@@ -901,14 +1572,38 @@ export function TranscriptView({
 
   const hasTranscript = doc.paragraphs.length > 0;
   const failedFinishItems = finishItems?.filter((item) => !item.pass) ?? [];
-  const exportReady = finishItems !== null && failedFinishItems.length === 0;
-  const exportAllowed = exportReady || allowDraftExport;
+  const exportPreflightBlockers = exportPreflightReport?.items.filter(
+    (item) => item.level === "blocker",
+  ) ?? [];
+  const hasExportCheck = finishItems !== null && exportPreflightReport !== null;
+  const workflowReady = finishItems !== null && failedFinishItems.length === 0;
+  const exportReady = workflowReady && exportPreflightReport?.ready === true;
+  const workflowExportAllowed = workflowReady || allowDraftExport;
+  const videoExportAllowed = workflowExportAllowed
+    && exportPreflightReport?.ready === true;
+  const subtitleExportAllowed = workflowExportAllowed
+    && exportPreflightReport !== null
+    && !exportPreflightBlockers.some((item) =>
+      ["settings", "captions", "caption-state", "style", "timeline-data"].includes(item.code)
+    );
+  const finalCutExportAllowed = workflowExportAllowed
+    && exportPreflightReport !== null
+    && !exportPreflightBlockers.some((item) =>
+      ["media", "timeline", "timeline-data", "broll", "titles"].includes(item.code)
+    );
   const isVideoExporting = videoExportJob !== null
     && ["running", "cancelling"].includes(videoExportJob.state);
   const failedTasks = taskState?.kinds.reduce((sum, task) => sum + task.failed, 0) ?? 0;
   const stoppedTasks = taskState?.kinds.filter(
     (task) => task.state === "paused" || task.state === "failed",
   ).length ?? 0;
+  const invalidateDeliveryCheck = () => {
+    exportCheckRun.current = false;
+    setFinishItems(null);
+    setExportPreflightReport(null);
+    setExportPreflightUpdating(false);
+    setAllowDraftExport(false);
+  };
   const perform = async (name: string, action: () => Promise<void>) => {
     setOperation(name);
     setFeedback(null);
@@ -935,13 +1630,14 @@ export function TranscriptView({
   };
 
   const startTranscription = async () => {
+    setConfirmRetranscription(false);
     setOperation("transcribe");
     setFeedback(null);
     setTranscriptionFailure(null);
     try {
       const readiness = await asrStatus();
       setAsrReadiness(readiness);
-      if (!readiness.ready) {
+      if (!(readiness.selectedReady ?? readiness.ready)) {
         setFeedback({ tone: "error", text: c.asrNotReady });
         setOperation(null);
         return;
@@ -970,13 +1666,29 @@ export function TranscriptView({
     }
   };
 
-  const startTranslation = (language: string) =>
+  const startTranslation = (language: string, staleOnly: boolean) =>
     perform("translate", async () => {
-      const result = await taskStart("translate", pid, language);
+      const result = await taskStart("translate", pid, language, staleOnly);
       setTaskState(await taskStatus(pid));
       setFeedback({
         tone: "info",
-        text: `${c.translating} · ${result.pending} ${c.pending}`,
+        text: result.pending > 0
+          ? `${c.translating} · ${result.pending} ${lang === "zh" ? "个上下文批次" : "context batches"}`
+          : lang === "zh"
+            ? "没有缺失或过期的译文，当前翻译已是最新。"
+            : "No missing or stale translations. This track is up to date.",
+      });
+    });
+
+  const pauseTranslation = () =>
+    perform("translate-pause", async () => {
+      const result = await taskPause(pid, "translate");
+      setTaskState(await taskStatus(pid));
+      setFeedback({
+        tone: "info",
+        text: lang === "zh"
+          ? `翻译已暂停；${result.queuedCalls} 个排队批次已停止，${result.inFlightCalls} 个在途请求完成后会安全保存。`
+          : `Translation paused. ${result.queuedCalls} queued batch(es) stopped; ${result.inFlightCalls} in-flight request(s) will be saved safely.`,
       });
     });
 
@@ -998,10 +1710,28 @@ export function TranscriptView({
     });
 
   const saveSubtitle = async (id: string, text: string) => {
-    await perform(`subtitle-${id}`, async () => {
-      const changed = await subtitleSet(pid, id, text);
-      if (!changed) throw new Error(`subtitle ${id} was not found`);
-      await reload(pid, false);
+    await performRecoverable(`subtitle-${id}`, async () => {
+      const result = await subtitleUpdateMany(pid, [{ id, text }]);
+      const updated = result.sentences[0];
+      if (!updated) throw new Error(`subtitle ${id} was not found`);
+      setDoc((current) => current ? {
+        ...current,
+        paragraphs: current.paragraphs.map((paragraph) => ({
+          ...paragraph,
+          sentences: paragraph.sentences.map((sentence) =>
+            sentence.id === id ? updated : sentence
+          ),
+        })),
+      } : current);
+      setSubtitleRows((current) => current.map((row) =>
+        row.id === id ? {
+          ...row,
+          text: updated.text,
+          start: updated.words[0]?.start ?? row.start,
+          end: updated.words[updated.words.length - 1]?.end ?? row.end,
+        } : row
+      ));
+      await refreshEditHistory();
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "这句转写已保存。" : "This transcript line was saved.",
@@ -1009,8 +1739,55 @@ export function TranscriptView({
     });
   };
 
+  const saveSubtitles = async (updates: Array<{ id: string; text: string }>) => {
+    if (updates.length === 0) return;
+    await performRecoverable("subtitles", async () => {
+      const result = await subtitleUpdateMany(pid, updates);
+      const updated = new Map(result.sentences.map((sentence) => [sentence.id, sentence]));
+      setDoc((current) => current ? {
+        ...current,
+        paragraphs: current.paragraphs.map((paragraph) => ({
+          ...paragraph,
+          sentences: paragraph.sentences.map((sentence) => {
+            return updated.get(sentence.id) ?? sentence;
+          }),
+        })),
+      } : current);
+      setSubtitleRows((current) => current.map((row) => {
+        const sentence = updated.get(row.id);
+        return sentence ? {
+          ...row,
+          text: sentence.text,
+          start: sentence.words[0]?.start ?? row.start,
+          end: sentence.words[sentence.words.length - 1]?.end ?? row.end,
+        } : row;
+      }));
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? `已原子保存 ${updates.length} 条转写（${result.changed} 条有变化），可一次撤销。`
+          : `Saved ${updates.length} transcript lines atomically (${result.changed} changed) in one undo step.`,
+      });
+    });
+  };
+
+  const saveChapters = async (next: ChapterInput[]) => {
+    await performRecoverable("chapters", async () => {
+      await chapterSetMany(pid, next);
+      setChapters(await chapterList(pid));
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? `已保存 ${next.length} 个章节。`
+          : `Saved ${next.length} chapter${next.length === 1 ? "" : "s"}.`,
+      });
+    });
+  };
+
   const saveTranslation = async (language: string, id: string, text: string) => {
-    await perform(`translation-${id}`, async () => {
+    await performRecoverable(`translation-${id}`, async () => {
       const changed = await translationSet(pid, language, id, text);
       if (!changed) throw new Error(`subtitle ${id} was not found`);
       setDoc((current) => current ? {
@@ -1019,13 +1796,58 @@ export function TranscriptView({
           ...current.translations,
           [language]: {
             ...(current.translations[language] || {}),
-            [id]: { text },
+            [id]: {
+              text,
+              sourceText: current.paragraphs
+                .flatMap((paragraph) => paragraph.sentences)
+                .find((sentence) => sentence.id === id)?.text,
+            },
           },
         },
       } : current);
+      await refreshEditHistory();
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "这句译文已保存。" : "This translation was saved.",
+      });
+    });
+  };
+
+  const saveTranslations = async (
+    language: string,
+    updates: Array<{ id: string; text: string }>,
+  ) => {
+    if (updates.length === 0) return;
+    await performRecoverable("translations", async () => {
+      await translationSetMany(pid, language, updates);
+      const updateMap = new Map(updates.map((update) => [update.id, update.text]));
+      setDoc((current) => current ? {
+        ...current,
+        translations: {
+          ...current.translations,
+          [language]: {
+            ...(current.translations[language] || {}),
+            ...Object.fromEntries(
+              current.paragraphs
+                .flatMap((paragraph) => paragraph.sentences)
+                .filter((sentence) => updateMap.has(sentence.id))
+                .map((sentence) => [
+                  sentence.id,
+                  {
+                    text: updateMap.get(sentence.id) ?? "",
+                    sourceText: sentence.text,
+                  },
+                ]),
+            ),
+          },
+        },
+      } : current);
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? `已保存 ${updates.length} 条译文。`
+          : `Saved ${updates.length} translation${updates.length === 1 ? "" : "s"}.`,
       });
     });
   };
@@ -1051,8 +1873,12 @@ export function TranscriptView({
 
   const changeSubtitleVisibility = async (id: string, hidden: boolean) => {
     await perform(`visibility-${id}`, async () => {
-      await subtitleVisibility(pid, id, hidden);
-      await reload(pid, false);
+      const changed = await subtitleVisibility(pid, id, hidden);
+      if (!changed) throw new Error(`subtitle ${id} was not found`);
+      setSubtitleRows((current) => current.map((row) =>
+        row.id === id ? { ...row, hidden } : row
+      ));
+      await refreshEditHistory();
     });
   };
 
@@ -1092,12 +1918,55 @@ export function TranscriptView({
     });
   };
 
+  const updateSubtitleTiming = async (id: string, start: number, end: number) => {
+    await perform(`timing-${id}`, async () => {
+      const changed = await setSubtitleTiming(pid, id, start, end);
+      if (!changed) return;
+      await reload(pid, false);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? `字幕时码已更新为 ${start.toFixed(2)}s–${end.toFixed(2)}s，可撤销。`
+          : `Cue timing updated to ${start.toFixed(2)}s–${end.toFixed(2)}s and can be undone.`,
+      });
+    });
+  };
+
+  const undoEditorEdit = async () => {
+    await perform("undo", async () => {
+      const action = await editUndo(pid);
+      setEditHistory(action.status);
+      if (!action.changed) return;
+      await reload(pid, false);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "已撤销上一项编辑。" : "Undid the last edit.",
+      });
+    });
+  };
+
+  const redoEditorEdit = async () => {
+    await perform("redo", async () => {
+      const action = await editRedo(pid);
+      setEditHistory(action.status);
+      if (!action.changed) return;
+      await reload(pid, false);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "已重新应用编辑。" : "Redid the edit.",
+      });
+    });
+  };
+
   const saveStyle = async (style: SubtitleStyle) => {
     setOperation("style");
     setFeedback(null);
     try {
       await styleSet(pid, style);
-      setSubtitleStyle(await styleGet(pid));
+      const saved = await styleGet(pid);
+      setSubtitleStyle(saved);
+      setSavedSubtitleStyle(saved);
+      await refreshEditHistory();
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "字幕样式已保存。" : "Subtitle style saved.",
@@ -1108,6 +1977,10 @@ export function TranscriptView({
     } finally {
       setOperation(null);
     }
+  };
+
+  const resetStylePreview = () => {
+    if (savedSubtitleStyle) setSubtitleStyle(savedSubtitleStyle);
   };
 
   const previewSpeakers = async () => {
@@ -1234,6 +2107,74 @@ export function TranscriptView({
     setBrollOverview(await brollList(pid));
   };
 
+  const refreshTitles = async () => {
+    setTitles(await titleList(pid));
+  };
+
+  const refreshEditHistory = async () => {
+    invalidateDeliveryCheck();
+    try {
+      setEditHistory(await editHistoryStatus(pid));
+    } catch {
+      // A history refresh must never turn a completed, durable edit into a UI failure.
+    }
+  };
+
+  const relinkProjectMediaAt = async (path: string) => {
+    await performRecoverable("media-relink", async () => {
+      await projectMediaRelink(pid, path);
+      await Promise.all([reload(pid, false), refreshEditHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? "项目媒体已重新连接；转写稿、说话人和时间线编辑均已保留。"
+          : "Project media reconnected. Transcript, speakers, and timeline edits were preserved.",
+      });
+    });
+  };
+
+  const relinkProjectMedia = async () => {
+    const path = await pickMediaFile();
+    if (!path) return;
+    await relinkProjectMediaAt(path);
+  };
+
+  const fixExportBlocker = (code: string) => {
+    if (code === "media") {
+      void relinkProjectMedia();
+      return;
+    }
+    if (code === "captions") {
+      setActiveTab("translate");
+      return;
+    }
+    if (code === "caption-state") {
+      setActiveTab("subtitle");
+      return;
+    }
+    if (code === "style") {
+      setActiveTab("style");
+      return;
+    }
+    if (code === "timeline" || code === "timeline-data" || code === "titles" || code === "audio") {
+      setActiveTab("timeline");
+      return;
+    }
+    if (code === "broll") {
+      setActiveTab("broll");
+      return;
+    }
+    if (code === "settings" || code === "encoder") {
+      window.requestAnimationFrame(() => {
+        const field = document.querySelector<HTMLSelectElement>(
+          ".video-export-settings select",
+        );
+        field?.scrollIntoView({ block: "center", behavior: "smooth" });
+        field?.focus();
+      });
+    }
+  };
+
   const pickBrollAsset = () => performRecoverable("broll-pick", pickBrollFile);
 
   const acceptBrollSuggestion = async (suggestion: BrollSuggestion) => {
@@ -1241,7 +2182,7 @@ export function TranscriptView({
     if (!file) return false;
     await performRecoverable("broll-add", async () => {
       await brollAcceptSuggestion(pid, suggestion, file);
-      await refreshBroll();
+      await Promise.all([refreshBroll(), refreshEditHistory()]);
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "素材已按建议时段加入 B-roll 轨道。" : "Added the asset at the suggested B-roll range.",
@@ -1253,7 +2194,7 @@ export function TranscriptView({
   const addBroll = async (input: BrollPlacementInput) => {
     await performRecoverable("broll-add", async () => {
       await brollAdd(pid, input);
-      await refreshBroll();
+      await Promise.all([refreshBroll(), refreshEditHistory()]);
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "素材已加入 B-roll 轨道。" : "Added the asset to the B-roll track.",
@@ -1264,7 +2205,7 @@ export function TranscriptView({
   const updateBroll = async (id: string, input: BrollPlacementInput) => {
     await performRecoverable("broll-update", async () => {
       await brollUpdate(pid, id, input);
-      await refreshBroll();
+      await Promise.all([refreshBroll(), refreshEditHistory()]);
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "B-roll 调整已保存。" : "Saved the B-roll changes.",
@@ -1275,10 +2216,61 @@ export function TranscriptView({
   const removeBroll = async (id: string) => {
     await performRecoverable("broll-remove", async () => {
       if (!await brollRemove(pid, id)) throw new Error(`B-roll ${id} was not found`);
-      await refreshBroll();
+      await Promise.all([refreshBroll(), refreshEditHistory()]);
       setFeedback({
         tone: "success",
         text: lang === "zh" ? "已从成片中移除这段素材。" : "Removed the asset from the edit.",
+      });
+    });
+  };
+
+  const addTitle = async (input: TitleClipInput) => {
+    await performRecoverable("title-add", async () => {
+      await titleAdd(pid, input);
+      await Promise.all([refreshTitles(), refreshEditHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "标题已加入时间线。" : "Added the title to the timeline.",
+      });
+    });
+  };
+
+  const updateTitle = async (id: string, input: TitleClipInput) => {
+    await performRecoverable("title-update", async () => {
+      await titleUpdate(pid, id, input);
+      await Promise.all([refreshTitles(), refreshEditHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "标题调整已保存。" : "Saved the title changes.",
+      });
+    });
+  };
+
+  const removeTitle = async (id: string) => {
+    await performRecoverable("title-remove", async () => {
+      if (!await titleRemove(pid, id)) throw new Error(`title ${id} was not found`);
+      await Promise.all([refreshTitles(), refreshEditHistory()]);
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "标题已移除。" : "Removed the title.",
+      });
+    });
+  };
+
+  const updateAudioMix = async (mix: AudioMix) => {
+    await performRecoverable("audio-mix", async () => {
+      const saved = await audioMixSet(pid, mix);
+      setAudioMix(saved);
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: mix.voiceEnhance || mix.normalizeLoudness
+          ? lang === "zh"
+            ? "音频设置已保存；音量与淡化用于节目监看，对白增强与响度处理会在导出时执行。"
+            : "Audio settings saved. Gain and fades are monitored; dialogue and loudness processing run on export."
+          : lang === "zh"
+            ? "音频设置已保存，并会应用到节目监看和视频导出。"
+            : "Audio settings saved for the program monitor and video export.",
       });
     });
   };
@@ -1352,6 +2344,7 @@ export function TranscriptView({
     perform("cuts", async () => {
       const added = await cutAuto(pid);
       setCuts(await cutList(pid));
+      if (added > 0) await refreshEditHistory();
       setFeedback({
         tone: "success",
         text: lang === "zh" ? `新增 ${added} 个建议切口。` : `Added ${added} suggested cuts.`,
@@ -1365,19 +2358,42 @@ export function TranscriptView({
 
   const runFinishCheck = () =>
     perform("finish", async () => {
-      const items = await finishCheck(pid);
+      const [items, preflight] = await Promise.all([
+        finishCheckForExport(pid, videoExportSettings),
+        exportPreflight(pid, videoExportSettings),
+      ]);
       setFinishItems(items);
+      setExportPreflightReport(preflight);
+      exportCheckRun.current = true;
       setAllowDraftExport(false);
     });
 
   const restoreCut = (cutId: string) =>
     perform(`restore-${cutId}`, async () => {
-      await cutRestore(pid, cutId);
+      const changed = await cutRestore(pid, cutId);
       setCuts(await cutList(pid));
+      if (changed) await refreshEditHistory();
     });
+
+  const removeTimelineCues = async (cueIds: string[]) => {
+    await perform(`cut-${cueIds.join("-")}`, async () => {
+      const added = await cutManualMany(pid, cueIds);
+      if (added === 0) return;
+      setCuts(await cutList(pid));
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? `已将 ${cueIds.length} 段字幕对应的画面和声音作为一次编辑移除，可一次撤销。`
+          : `${cueIds.length} selected cue(s) will be removed as one edit and can be undone once.`,
+      });
+    });
+  };
 
   const runSubtitleExport = () =>
     perform("export-subtitles", async () => {
+      const saved = await exportSettingsSet(pid, videoExportSettings);
+      setVideoExportSettings(saved);
       const paths = await exportSubtitles(pid);
       setFeedback({
         tone: "success",
@@ -1391,7 +2407,9 @@ export function TranscriptView({
   const runVideoExport = async () => {
     try {
       setFeedback(null);
-      setVideoExportJob(await videoExportStart(pid, videoExportMode));
+      const saved = await exportSettingsSet(pid, videoExportSettings);
+      setVideoExportSettings(saved);
+      setVideoExportJob(await videoExportStart(pid, saved));
     } catch (error) {
       setFeedback({ tone: "error", text: friendlyError(error, lang) });
     }
@@ -1419,22 +2437,48 @@ export function TranscriptView({
       await projectReveal(pid);
     });
 
-  const tabs: Array<{ id: Tab; label: string; disabled?: boolean }> = [
-    { id: "setup", label: c.setup },
-    { id: "transcript", label: c.transcript, disabled: !hasTranscript },
-    { id: "speakers", label: lang === "zh" ? "说话人" : "Speakers", disabled: !hasTranscript },
-    { id: "translate", label: c.translate, disabled: !hasTranscript },
-    { id: "style", label: c.style, disabled: !hasTranscript },
-    { id: "properties", label: c.properties },
-    { id: "history", label: c.history },
-    { id: "timeline", label: c.timeline, disabled: !hasTranscript },
-    { id: "broll", label: c.broll, disabled: !hasTranscript },
-    { id: "review", label: c.review, disabled: !hasTranscript },
-    { id: "export", label: c.export, disabled: !hasTranscript },
+  const primaryTabs: Array<{ id: Tab; label: string }> = hasTranscript
+    ? [
+      { id: "transcript", label: c.transcript },
+      { id: "subtitle", label: lang === "zh" ? "字幕" : "Subtitle" },
+      { id: "translate", label: c.translate },
+      { id: "style", label: c.style },
+    ]
+    : [{ id: "setup", label: c.setup }];
+  const toolTabs: Array<{ id: Tab; label: string; description: string }> = [
+    {
+      id: "setup",
+      label: lang === "zh" ? "转写设置" : "Transcription setup",
+      description: lang === "zh" ? "检查模型或安全地重新转写" : "Check models or safely transcribe again",
+    },
+    {
+      id: "speakers",
+      label: lang === "zh" ? "说话人" : "Speakers",
+      description: lang === "zh" ? "识别、校对与合并" : "Identify, review, and merge",
+    },
+    {
+      id: "chapters",
+      label: lang === "zh" ? "章节" : "Chapters",
+      description: lang === "zh" ? "生成与整理章节" : "Generate and organize chapters",
+    },
+    {
+      id: "timeline",
+      label: c.timeline,
+      description: lang === "zh" ? "检查剪切与节奏" : "Review cuts and pacing",
+    },
+    {
+      id: "broll",
+      label: c.broll,
+      description: lang === "zh" ? "添加补充画面" : "Add supporting visuals",
+    },
   ];
+  const activeTool = toolTabs.find((tab) => tab.id === activeTab);
 
   return (
-    <section className="editor-view">
+    <section
+      className={`editor-view${hasTranscript ? " has-transcript" : ""}${previewExpanded ? " preview-expanded" : ""}${timelineCollapsed ? " timeline-collapsed" : ""}${resizingPanes ? " resizing-panes" : ""}`}
+      style={{ "--inspector-width": `${inspectorPercent}%` } as CSSProperties}
+    >
       <header className="editor-header">
         <div>
           <p className="eyebrow">{mediaName(doc.media.path)}</p>
@@ -1445,6 +2489,12 @@ export function TranscriptView({
           </p>
         </div>
         <div className="editor-header-actions">
+          <button
+            className={activeTab === "properties" ? "active" : ""}
+            onClick={() => setActiveTab("properties")}
+          >
+            {lang === "zh" ? "项目" : "Project"}
+          </button>
           <button
             className={activeTab === "history" ? "active" : ""}
             onClick={() => setActiveTab("history")}
@@ -1505,31 +2555,134 @@ export function TranscriptView({
       </header>
 
       <EditorMediaPreview
+            audioMix={audioMix}
+            broll={previewBrollOverview}
+            exportSettings={videoExportSettings}
             currentTime={workbenchTime}
             doc={doc}
+            expanded={previewExpanded}
             lang={lang}
+            programDuration={programDuration}
+            programTime={programTime}
         playerRef={workbenchPlayerRef}
         rows={previewRows}
         subtitleStyle={subtitleStyle}
+        titles={titles}
         onPlayingChange={setWorkbenchPlaying}
-        onTimeChange={setWorkbenchTime}
+        onRelinkMedia={relinkProjectMedia}
+        onRelinkMediaPath={relinkProjectMediaAt}
+        onTimeChange={updateWorkbenchTime}
+        onToggleExpanded={() => setPreviewExpanded((value) => !value)}
+        onUpdateBroll={updateBroll}
+        onUpdateTitle={updateTitle}
       />
 
-      <nav className="editor-tabs" aria-label={lang === "zh" ? "编辑步骤" : "Editor sections"}>
-        {tabs.map((tab) => (
+      <div
+        aria-label={lang === "zh" ? "调整视频和编辑器宽度" : "Resize monitor and editor panes"}
+        aria-orientation="vertical"
+        aria-valuemax={58}
+        aria-valuemin={32}
+        aria-valuenow={inspectorPercent}
+        className="editor-pane-resizer"
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          setInspectorPercent((value) => Math.min(
+            58,
+            Math.max(32, value + (event.key === "ArrowLeft" ? 2 : -2)),
+          ));
+        }}
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          setResizingPanes(true);
+        }}
+        onPointerMove={(event) => {
+          if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+          const bounds = event.currentTarget.parentElement?.getBoundingClientRect();
+          if (!bounds || bounds.width <= 0) return;
+          const next = ((bounds.right - event.clientX) / bounds.width) * 100;
+          setInspectorPercent(Math.min(58, Math.max(32, next)));
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          setResizingPanes(false);
+        }}
+        role="separator"
+        tabIndex={0}
+      />
+
+      <nav className="editor-tabs" aria-label={lang === "zh" ? "编辑主流程" : "Primary editor workflow"}>
+        {primaryTabs.map((tab) => (
           <button
             aria-current={activeTab === tab.id ? "page" : undefined}
-            className={activeTab === tab.id ? "active" : ""}
-            disabled={tab.disabled}
+            className={`${activeTab === tab.id ? "active " : ""}editor-tab-${tab.id} editor-tab-primary`}
             key={tab.id}
             onClick={() => {
               setFeedback(null);
+              setToolsMenuOpen(false);
               setActiveTab(tab.id);
             }}
           >
             {tab.label}
           </button>
         ))}
+        {hasTranscript && (
+          <div className="editor-tools-menu">
+            <button
+              aria-label={activeTool
+                ? lang === "zh"
+                  ? `当前工具：${activeTool.label}，打开更多编辑工具`
+                  : `Current tool: ${activeTool.label}. Open more editing tools`
+                : lang === "zh" ? "打开更多编辑工具" : "Open more editing tools"}
+              aria-expanded={toolsMenuOpen}
+              aria-haspopup="menu"
+              className={activeTool ? "active" : ""}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowDown") return;
+                event.preventDefault();
+                setToolsMenuOpen(true);
+              }}
+              onClick={() => setToolsMenuOpen((open) => !open)}
+              ref={toolsButtonRef}
+              type="button"
+            >
+              <span>{activeTool?.label || (lang === "zh" ? "工具" : "Tools")}</span>
+              <span aria-hidden="true">⌄</span>
+            </button>
+            {toolsMenuOpen && <div
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+                event.preventDefault();
+                const items = Array.from(
+                  event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+                );
+                const index = items.indexOf(document.activeElement as HTMLButtonElement);
+                const offset = event.key === "ArrowDown" ? 1 : -1;
+                items[(index + offset + items.length) % items.length]?.focus();
+              }}
+              ref={toolsMenuRef}
+              role="menu"
+            >
+              {toolTabs.map((tab) => (
+                <button
+                  aria-current={activeTab === tab.id ? "page" : undefined}
+                  key={tab.id}
+                  onClick={() => {
+                    setFeedback(null);
+                    setActiveTab(tab.id);
+                    setToolsMenuOpen(false);
+                  }}
+                  role="menuitem"
+                >
+                  <span>{tab.label}</span>
+                  <small>{tab.description}</small>
+                </button>
+              ))}
+            </div>}
+          </div>
+        )}
       </nav>
 
       {feedback && (
@@ -1548,7 +2701,7 @@ export function TranscriptView({
             <p className="eyebrow">{c.imported}</p>
             <h2>{hasTranscript ? c.transcript : c.startTitle}</h2>
             <p>{hasTranscript ? c.transcribeHint : c.startDescription}</p>
-            {asrReadiness && !asrReadiness.ready && (
+            {asrReadiness && !selectedAsrReady && (
               <div className="notice error-notice setup-readiness" role="alert">
                 <AlertIcon />
                 <span>{c.asrNotReady}</span>
@@ -1559,8 +2712,16 @@ export function TranscriptView({
             )}
             <button
               className="button-primary button-large"
-              disabled={operation !== null}
-              onClick={startTranscription}
+              disabled={operation !== null || asrReadiness === null}
+              onClick={() => {
+                if (!selectedAsrReady) {
+                  onOpenSettings();
+                } else if (hasTranscript) {
+                  setConfirmRetranscription(true);
+                } else {
+                  void startTranscription();
+                }
+              }}
             >
               {operation === "transcribe" ? (
                 <>
@@ -1571,15 +2732,45 @@ export function TranscriptView({
                 </>
               ) : (
                 <>
-                  <PlayIcon />
-                  {transcriptionFailure
-                    ? c.retry
-                    : hasTranscript
-                      ? (lang === "zh" ? "重新转写" : "Transcribe again")
-                      : c.start}
+                  {selectedAsrReady ? <PlayIcon /> : null}
+                  {asrReadiness === null
+                    ? c.checkingAsr
+                    : !selectedAsrReady
+                      ? c.prepareAsr
+                      : transcriptionFailure
+                        ? c.retry
+                        : hasTranscript
+                          ? (lang === "zh" ? "重新转写" : "Transcribe again")
+                          : c.start}
                 </>
               )}
             </button>
+            {confirmRetranscription && operation === null && (
+              <div className="retranscription-confirm" role="alert">
+                <strong>
+                  {lang === "zh" ? "重新转写会替换当前转写稿" : "Retranscription replaces the current transcript"}
+                </strong>
+                <p>
+                  {lang === "zh"
+                    ? "开始前会自动保存完整恢复版本。旧译文、说话人、隐藏字幕、剪切和 AI 分析会随新时码重置；字幕样式、标题、音频设置和按时间放置的 B-roll 会保留。"
+                    : "A complete recovery version is saved first. Translations, speakers, hidden cues, cuts, and AI analysis reset with the new timing; style, titles, audio settings, and time-based B-roll remain."}
+                </p>
+                <div>
+                  <button
+                    className="button-quiet"
+                    onClick={() => setConfirmRetranscription(false)}
+                  >
+                    {lang === "zh" ? "取消" : "Cancel"}
+                  </button>
+                  <button
+                    className="button-danger"
+                    onClick={() => void startTranscription()}
+                  >
+                    {lang === "zh" ? "保存恢复点并重新转写" : "Save recovery point & retranscribe"}
+                  </button>
+                </div>
+              </div>
+            )}
             {transcriptionJob ? (
               <div className="transcription-progress" aria-live="polite">
                 <div>
@@ -1589,7 +2780,9 @@ export function TranscriptView({
                 <progress max={100} value={transcriptionJob.progress} />
                 {transcriptionJob.device && (
                   <small className="pipeline-resources">
-                    MLX · Metal
+                    {transcriptionJob.device === "cloud"
+                      ? (lang === "zh" ? "云端转写" : "Cloud transcription")
+                      : "MLX · Metal"}
                     {transcriptionJob.elapsedSeconds !== null ? ` · ${Math.round(transcriptionJob.elapsedSeconds)}s` : ""}
                     {transcriptionJob.cpuPercent !== null ? ` · CPU ${transcriptionJob.cpuPercent}%` : ""}
                     {transcriptionJob.peakMemoryMb !== null
@@ -1603,6 +2796,12 @@ export function TranscriptView({
                       : ""}
                   </small>
                 )}
+                <PipelineFreshness
+                  state={transcriptionJob.state}
+                  phase={transcriptionJob.phase}
+                  updatedAt={transcriptionJob.updatedAt}
+                  lang={lang}
+                />
                 <button
                   className="button-quiet"
                   disabled={transcriptionJob.state === "cancelling"}
@@ -1632,6 +2831,33 @@ export function TranscriptView({
               <dd>{doc.meta.language || c.auto}</dd>
             </div>
           </dl>
+          <ol className="setup-workflow" aria-label={lang === "zh" ? "项目流程" : "Project workflow"}>
+            <li className="done">
+              <span>1</span>
+              <div>
+                <strong>{lang === "zh" ? "媒体已导入" : "Media imported"}</strong>
+                <small>{lang === "zh" ? "原文件保持在原位置" : "The source stays in place"}</small>
+              </div>
+            </li>
+            <li className={hasTranscript ? "done" : "current"} aria-current={!hasTranscript ? "step" : undefined}>
+              <span>2</span>
+              <div>
+                <strong>{lang === "zh" ? "生成转写与时码" : "Create transcript & timing"}</strong>
+                <small>
+                  {hasTranscript
+                    ? lang === "zh" ? "已完成，可安全重新转写" : "Complete; safe to run again"
+                    : lang === "zh" ? "确认环境后由你开始" : "You start after setup is ready"}
+                </small>
+              </div>
+            </li>
+            <li className={hasTranscript ? "current" : ""} aria-current={hasTranscript ? "step" : undefined}>
+              <span>3</span>
+              <div>
+                <strong>{lang === "zh" ? "编辑并导出" : "Edit & export"}</strong>
+                <small>{lang === "zh" ? "字幕、说话人、翻译与画面" : "Captions, speakers, translation, and visuals"}</small>
+              </div>
+            </li>
+          </ol>
         </div>
       )}
 
@@ -1670,16 +2896,48 @@ export function TranscriptView({
           <TranscriptEditor
             busy={operation !== null}
             currentTime={workbenchTime}
+            drafts={transcriptDrafts}
+            duration={doc.media.durationSeconds}
             isPlaying={workbenchPlaying}
             lang={lang}
+            mode="transcript"
             nextCueById={nextCueById}
             rows={subtitleRows}
             wordsByCue={wordsByCue}
+            onDraftsChange={onTranscriptDraftsChange}
             onMerge={mergeSubtitleLines}
             onReplace={replaceSubtitles}
             onSave={saveSubtitle}
+            onSaveMany={saveSubtitles}
             onSeek={seekWorkbench}
             onSplit={splitSubtitleLine}
+            onTiming={updateSubtitleTiming}
+            onVisibility={changeSubtitleVisibility}
+          />
+        </div>
+      )}
+
+      {activeTab === "subtitle" && (
+        <div className="subtitle-layout">
+          <TranscriptEditor
+            busy={operation !== null}
+            currentTime={workbenchTime}
+            drafts={transcriptDrafts}
+            duration={doc.media.durationSeconds}
+            isPlaying={workbenchPlaying}
+            lang={lang}
+            mode="subtitle"
+            nextCueById={nextCueById}
+            rows={subtitleRows}
+            wordsByCue={wordsByCue}
+            onDraftsChange={onTranscriptDraftsChange}
+            onMerge={mergeSubtitleLines}
+            onReplace={replaceSubtitles}
+            onSave={saveSubtitle}
+            onSaveMany={saveSubtitles}
+            onSeek={seekWorkbench}
+            onSplit={splitSubtitleLine}
+            onTiming={updateSubtitleTiming}
             onVisibility={changeSubtitleVisibility}
           />
         </div>
@@ -1694,18 +2952,43 @@ export function TranscriptView({
           lang={lang}
           status={taskState}
           onOpenSettings={onOpenSettings}
+          onPause={pauseTranslation}
           onLanguageChange={setPreviewTranslationLanguage}
+          onDraftsChange={onTranslationDraftsChange}
           onSave={saveTranslation}
+          onSaveMany={saveTranslations}
           onSeek={seekWorkbench}
           onStart={startTranslation}
+          drafts={translationDrafts}
         />
       )}
 
-      {activeTab === "style" && subtitleStyle && (
+      {activeTab === "chapters" && (
+        <ChapterWorkspace
+          busy={operation !== null}
+          chapters={chapters}
+          configured={agentConfigured}
+          currentTime={workbenchTime}
+          drafts={chapterDrafts}
+          lang={lang}
+          rows={subtitleRows}
+          status={taskState?.kinds.find((task) => task.kind === "chapters") ?? null}
+          onDraftsChange={onChapterDraftsChange}
+          onGenerate={() => startEnhancement("chapters", null)}
+          onOpenSettings={onOpenSettings}
+          onSave={saveChapters}
+          onSeek={seekWorkbench}
+        />
+      )}
+
+      {activeTab === "style" && savedSubtitleStyle && subtitleStyle && (
         <StyleWorkspace
           busy={operation === "style"}
           lang={lang}
+          savedStyle={savedSubtitleStyle}
           style={subtitleStyle}
+          onPreview={setSubtitleStyle}
+          onReset={resetStylePreview}
           onSave={saveStyle}
         />
       )}
@@ -1760,13 +3043,17 @@ export function TranscriptView({
         <BrollWorkspace
           busy={operation !== null}
           doc={doc}
+          drafts={brollDrafts}
           lang={lang}
+          newPlacement={newBrollPlacement}
           overview={brollOverview}
           previewJob={brollPreviewJob}
           previewPaths={brollPreviewPaths}
           onAcceptSuggestion={acceptBrollSuggestion}
           onAdd={addBroll}
           onCancelPreview={cancelBrollPreview}
+          onDraftsChange={setBrollDrafts}
+          onNewPlacementChange={setNewBrollPlacement}
           onPickFile={pickBrollAsset}
           onPreview={previewBroll}
           onRefresh={() => performRecoverable("broll-load", refreshBroll)}
@@ -1798,17 +3085,7 @@ export function TranscriptView({
               {auditReport.findings.length === 0 ? (
                 <p className="clean-result"><CheckIcon />{c.noFindings}</p>
               ) : (
-                <ul className="finding-list">
-                  {auditReport.findings.map((finding, index) => (
-                    <li key={`${finding.code}-${index}`}>
-                      <span className={`severity ${finding.severity}`}>{finding.severity}</span>
-                      <div>
-                        <strong>{finding.message}</strong>
-                        <small>{finding.location} · {finding.code}</small>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+                <ReviewFindings findings={auditReport.findings} lang={lang} />
               )}
             </section>
           )}
@@ -1866,12 +3143,14 @@ export function TranscriptView({
             <h2>{lang === "zh" ? "交付你的作品" : "Deliver your work"}</h2>
             <p>{c.exportHint}</p>
           </div>
-          <section className={`export-preflight ${exportReady ? "ready" : failedFinishItems.length > 0 ? "blocked" : "unchecked"}`}>
+          <section className={`export-preflight ${exportPreflightUpdating ? "checking" : exportReady ? "ready" : failedFinishItems.length > 0 || exportPreflightBlockers.length > 0 ? "blocked" : "unchecked"}`}>
             <header>
               <div>
                 <p className="eyebrow">{c.exportCheckTitle}</p>
                 <h3>
-                  {finishItems === null
+                  {exportPreflightUpdating
+                    ? lang === "zh" ? "正在按新规格重新检查…" : "Rechecking the new settings…"
+                    : !hasExportCheck
                     ? c.exportUnchecked
                     : exportReady
                       ? c.exportReady
@@ -1879,12 +3158,14 @@ export function TranscriptView({
                 </h3>
               </div>
               <button
-                className={finishItems === null ? "button-primary" : "button-quiet"}
-                disabled={operation !== null}
+                className={!hasExportCheck ? "button-primary" : "button-quiet"}
+                disabled={operation !== null || exportPreflightUpdating}
                 onClick={runFinishCheck}
               >
-                {operation === "finish" ? <span className="spinner" /> : null}
-                {finishItems === null
+                {operation === "finish" || exportPreflightUpdating
+                  ? <span className="spinner" />
+                  : null}
+                {!hasExportCheck
                   ? lang === "zh" ? "开始检查" : "Run check"
                   : lang === "zh" ? "重新检查" : "Check again"}
               </button>
@@ -1895,7 +3176,7 @@ export function TranscriptView({
                   <li key={item.ordinal}>
                     <AlertIcon />
                     <span>
-                      <strong>{item.code}</strong>
+                      <strong>{finishCheckLabel(item.code, lang)}</strong>
                       {item.blockers.map((blocker, index) => (
                         <small key={`${item.ordinal}-${index}`}>{blocker}</small>
                       ))}
@@ -1904,7 +3185,74 @@ export function TranscriptView({
                 ))}
               </ul>
             )}
-            {!exportReady && finishItems !== null && (
+            {exportPreflightReport && exportPreflightBlockers.length > 0 && (
+              <ul className="export-preflight-specific">
+                {exportPreflightBlockers.map((item) => {
+                  const fixLabel = exportPreflightFixLabel(item.code, lang);
+                  return (
+                    <li key={item.code}>
+                      <AlertIcon />
+                      <span>
+                        <strong>{exportPreflightLabel(item.code, lang)}</strong>
+                        <small>
+                          {exportPreflightMessage(item, exportPreflightReport, lang)}
+                        </small>
+                      </span>
+                      {fixLabel && (
+                        <button
+                          className="button-quiet export-preflight-fix"
+                          disabled={operation !== null}
+                          onClick={() => fixExportBlocker(item.code)}
+                        >
+                          {fixLabel}
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {exportPreflightReport && (
+              <>
+                <div className="export-preflight-summary">
+                  <span>
+                    <strong>{Math.round(exportPreflightReport.summary.durationSeconds)}s</strong>
+                    {lang === "zh" ? "成片" : "edited"}
+                  </span>
+                  <span>
+                    <strong>{exportPreflightReport.summary.visibleCaptions}</strong>
+                    {lang === "zh" ? "行字幕" : "captions"}
+                  </span>
+                  <span>
+                    <strong>{exportPreflightReport.summary.brollItems}</strong>
+                    B-roll
+                  </span>
+                  <span>
+                    <strong>{exportPreflightReport.summary.titleItems}</strong>
+                    {lang === "zh" ? "个标题" : "titles"}
+                  </span>
+                  <span>
+                    <strong>
+                      {exportPreflightReport.summary.estimatedMinMb}–{exportPreflightReport.summary.estimatedMaxMb} MB
+                    </strong>
+                    {lang === "zh" ? "预计体积" : "estimated"}
+                  </span>
+                </div>
+                {exportPreflightReport.items.some((item) => item.level === "warning") && (
+                  <div className="export-preflight-warnings">
+                    {exportPreflightReport.items
+                      .filter((item) => item.level === "warning")
+                      .map((item) => (
+                        <small key={item.code}>
+                          <strong>{exportPreflightLabel(item.code, lang)}</strong>
+                          {exportPreflightMessage(item, exportPreflightReport, lang)}
+                        </small>
+                      ))}
+                  </div>
+                )}
+              </>
+            )}
+            {!workflowReady && finishItems !== null && exportPreflightReport?.ready && (
               <label className="draft-export-override">
                 <input
                   type="checkbox"
@@ -1916,24 +3264,233 @@ export function TranscriptView({
             )}
           </section>
           <div className="export-actions">
-            <label className="video-export-mode">
-              <span>{lang === "zh" ? "视频编码模式" : "Video encoding mode"}</span>
-              <select
-                disabled={isVideoExporting || operation !== null}
-                value={videoExportMode}
-                onChange={(event) => setVideoExportMode(event.target.value as VideoExportJobStatus["mode"])}
-              >
-                <option value="fast">
-                  {lang === "zh" ? "硬件低负载 · 低 CPU / 较大文件" : "Hardware low-load · low CPU / larger file"}
-                </option>
-                <option value="quality">
-                  {lang === "zh" ? "高压缩质量 · 高 CPU / 较小文件" : "Compression quality · high CPU / smaller file"}
-                </option>
-              </select>
-            </label>
+            <fieldset className="video-export-settings" disabled={isVideoExporting || operation !== null}>
+              <legend>{lang === "zh" ? "视频交付规格" : "Video delivery settings"}</legend>
+              <div className="video-export-settings-grid">
+                <label>
+                  <span>{lang === "zh" ? "容器" : "Container"}</span>
+                  <select
+                    value={videoExportSettings.container}
+                    onChange={(event) => {
+                      const container = event.target.value as VideoExportSettings["container"];
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        container,
+                        videoCodec:
+                          container === "mp4" && current.videoCodec === "prores"
+                            ? "h264"
+                            : current.videoCodec,
+                        audioCodec:
+                          container === "mp4" && current.audioCodec === "pcm"
+                            ? "aac"
+                            : current.audioCodec,
+                      }));
+                    }}
+                  >
+                    <option value="mp4">MP4 · {lang === "zh" ? "通用交付" : "universal delivery"}</option>
+                    <option value="mov">MOV · {lang === "zh" ? "后期制作" : "post-production"}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "视频编码" : "Video codec"}</span>
+                  <select
+                    value={videoExportSettings.videoCodec}
+                    onChange={(event) => {
+                      const videoCodec = event.target.value as VideoExportSettings["videoCodec"];
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        videoCodec,
+                        container: videoCodec === "prores" ? "mov" : current.container,
+                      }));
+                    }}
+                  >
+                    <option value="h264">H.264 · {lang === "zh" ? "兼容性最好" : "best compatibility"}</option>
+                    <option value="hevc">HEVC · {lang === "zh" ? "更小文件" : "smaller file"}</option>
+                    <option value="prores">ProRes 422 HQ · {lang === "zh" ? "剪辑母版" : "editing master"}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "画布比例" : "Canvas ratio"}</span>
+                  <select
+                    value={videoExportSettings.aspectRatio}
+                    onChange={(event) =>
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        aspectRatio: event.target.value as VideoExportSettings["aspectRatio"],
+                      }))
+                    }
+                  >
+                    <option value="source">{lang === "zh" ? "跟随源视频" : "Match source"}</option>
+                    <option value="16:9">16:9 · {lang === "zh" ? "横屏" : "landscape"}</option>
+                    <option value="9:16">9:16 · {lang === "zh" ? "竖屏短视频" : "vertical short video"}</option>
+                    <option value="1:1">1:1 · {lang === "zh" ? "方形" : "square"}</option>
+                    <option value="4:5">4:5 · {lang === "zh" ? "竖屏信息流" : "portrait feed"}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "分辨率" : "Resolution"}</span>
+                  <select
+                    value={videoExportSettings.resolution}
+                    onChange={(event) =>
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        resolution: event.target.value as VideoExportSettings["resolution"],
+                      }))
+                    }
+                  >
+                    <option value="source">{lang === "zh" ? "跟随源视频" : "Match source"}</option>
+                    <option value="720p">720p HD</option>
+                    <option value="1080p">1080p Full HD</option>
+                    <option value="4k">4K UHD</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "源画面适配" : "Source framing"}</span>
+                  <select
+                    disabled={videoExportSettings.aspectRatio === "source"}
+                    value={videoExportSettings.canvasFit}
+                    onChange={(event) =>
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        canvasFit: event.target.value as VideoExportSettings["canvasFit"],
+                      }))
+                    }
+                  >
+                    <option value="contain">{lang === "zh" ? "完整显示 · 必要时留黑" : "Fit · letterbox if needed"}</option>
+                    <option value="cover">{lang === "zh" ? "填满画布 · 居中裁切" : "Fill · center crop"}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "字幕" : "Subtitles"}</span>
+                  <select
+                    value={videoExportSettings.subtitleMode}
+                    onChange={(event) =>
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        subtitleMode: event.target.value as VideoExportSettings["subtitleMode"],
+                      }))
+                    }
+                  >
+                    <option value="burn">{lang === "zh" ? "烧录到画面" : "Burn into picture"}</option>
+                    <option value="soft">{lang === "zh" ? "可开关软字幕" : "Switchable soft track"}</option>
+                    <option value="none">{lang === "zh" ? "不包含字幕" : "No subtitles"}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "字幕内容" : "Caption content"}</span>
+                  <select
+                    disabled={videoExportSettings.subtitleMode === "none"}
+                    value={exportCaptionTrack}
+                    onChange={(event) => {
+                      const [kind, ...languageParts] = event.target.value.split(":");
+                      const subtitleLanguage = languageParts.join(":") || null;
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        subtitleLanguage,
+                        bilingualSubtitles: kind === "bilingual",
+                      }));
+                    }}
+                  >
+                    <option value="source">
+                      {lang === "zh" ? `原文 · ${doc.meta.language || "自动"}` : `Original · ${doc.meta.language || "auto"}`}
+                    </option>
+                    {videoExportSettings.subtitleLanguage
+                      && !translationLanguages.includes(videoExportSettings.subtitleLanguage) && (
+                      <option value={exportCaptionTrack}>
+                        {lang === "zh"
+                          ? `译文不可用 · ${videoExportSettings.subtitleLanguage}`
+                          : `Translation unavailable · ${videoExportSettings.subtitleLanguage}`}
+                      </option>
+                    )}
+                    {translationLanguages.map((language) => (
+                      <option key={`translation-${language}`} value={`translation:${language}`}>
+                        {lang === "zh" ? `仅译文 · ${language}` : `Translation only · ${language}`}
+                      </option>
+                    ))}
+                    {translationLanguages.map((language) => (
+                      <option key={`bilingual-${language}`} value={`bilingual:${language}`}>
+                        {lang === "zh" ? `双语 · 原文 + ${language}` : `Bilingual · original + ${language}`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "音频" : "Audio"}</span>
+                  <select
+                    value={videoExportSettings.audioCodec}
+                    onChange={(event) => {
+                      const audioCodec = event.target.value as VideoExportSettings["audioCodec"];
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        audioCodec,
+                        container: audioCodec === "pcm" ? "mov" : current.container,
+                      }));
+                    }}
+                  >
+                    <option value="aac">AAC · {lang === "zh" ? "通用压缩" : "universal compressed"}</option>
+                    <option value="pcm">PCM · {lang === "zh" ? "无损后期" : "lossless post-production"}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{lang === "zh" ? "编码策略" : "Encoding strategy"}</span>
+                  <select
+                    disabled={videoExportSettings.videoCodec === "prores"}
+                    value={videoExportSettings.encodingSpeed}
+                    onChange={(event) =>
+                      setVideoExportSettings((current) => ({
+                        ...current,
+                        encodingSpeed: event.target.value as VideoExportSettings["encodingSpeed"],
+                      }))
+                    }
+                  >
+                    <option value="fast">{lang === "zh" ? "快速 · 优先硬件编码" : "Fast · prefer hardware"}</option>
+                    <option value="quality">{lang === "zh" ? "高质量 · CPU 精细压缩" : "Quality · CPU compression"}</option>
+                  </select>
+                </label>
+              </div>
+              <p className="video-export-settings-note">
+                {lang === "zh"
+                  ? `成片画布：${videoCanvasSummary(videoExportSettings, lang)}。`
+                  : `Delivery canvas: ${videoCanvasSummary(videoExportSettings, lang)}. `}
+                {videoExportSettings.aspectRatio !== "source"
+                  ? videoExportSettings.canvasFit === "cover"
+                    ? lang === "zh"
+                      ? " 源画面会等比放大并居中裁切，节目监看与最终导出使用同一构图。"
+                      : " The source is enlarged and center-cropped; the program monitor matches final framing."
+                    : lang === "zh"
+                      ? " 源画面会完整保留，比例不同时以黑边补齐。"
+                      : " The full source remains visible, with black padding when ratios differ."
+                  : ""}
+                {videoExportSettings.videoCodec === "prores"
+                  ? lang === "zh"
+                    ? "ProRes 生成体积较大的 MOV 剪辑母版，适合继续调色和后期。"
+                    : "ProRes creates a large MOV editing master for grading and post-production."
+                  : videoExportSettings.videoCodec === "hevc"
+                    ? lang === "zh"
+                      ? "HEVC 文件更小，但旧设备和部分网页工具兼容性不如 H.264。"
+                      : "HEVC is smaller, but less compatible with older devices and some web tools."
+                    : lang === "zh"
+                      ? "H.264 适合发布、审阅和跨设备播放。"
+                      : "H.264 is the safest choice for publishing, review, and cross-device playback."}
+                {videoExportSettings.subtitleMode === "soft"
+                  ? lang === "zh"
+                    ? " 字幕可在播放器中开关；标题与图形仍会渲染进画面。"
+                    : " Captions remain switchable; titles and graphics are still rendered into the picture."
+                  : ""}
+                {videoExportSettings.subtitleLanguage
+                  ? videoExportSettings.bilingualSubtitles
+                    ? lang === "zh"
+                      ? ` 字幕将按“原文 + ${videoExportSettings.subtitleLanguage}”双行输出。`
+                      : ` Captions will contain original + ${videoExportSettings.subtitleLanguage} on two lines.`
+                    : lang === "zh"
+                      ? ` 字幕将使用 ${videoExportSettings.subtitleLanguage} 译文。`
+                      : ` Captions will use the ${videoExportSettings.subtitleLanguage} translation.`
+                  : ""}
+              </p>
+            </fieldset>
             <button
               className="export-action"
-              disabled={operation !== null || !exportAllowed}
+              disabled={operation !== null || !subtitleExportAllowed}
               onClick={runSubtitleExport}
             >
               {operation === "export-subtitles" ? <span className="spinner" /> : <TranscriptIcon />}
@@ -1944,22 +3501,29 @@ export function TranscriptView({
             </button>
             <button
               className="export-action"
-              disabled={operation !== null || !exportAllowed || isVideoExporting}
+              disabled={operation !== null || !videoExportAllowed || isVideoExporting}
               onClick={runVideoExport}
             >
               {isVideoExporting ? <span className="spinner" /> : <PlayIcon />}
               <span>
                 <strong>{c.exportVideo}</strong>
                 <small>
-                  {videoExportMode === "fast"
-                    ? "MP4 · VideoToolbox · low CPU"
-                    : "MP4 · libx264 · smaller file"}
+                  {videoExportSettings.container.toUpperCase()} ·{" "}
+                  {videoExportSettings.videoCodec === "prores"
+                    ? "ProRes 422 HQ"
+                    : videoExportSettings.videoCodec.toUpperCase()} ·{" "}
+                  {videoExportSettings.resolution === "source"
+                    ? lang === "zh" ? "源分辨率" : "source resolution"
+                    : videoExportSettings.resolution} ·{" "}
+                  {videoExportSettings.aspectRatio === "source"
+                    ? lang === "zh" ? "源比例" : "source ratio"
+                    : videoExportSettings.aspectRatio}
                 </small>
               </span>
             </button>
             <button
               className="export-action"
-              disabled={operation !== null || !exportAllowed}
+              disabled={operation !== null || !finalCutExportAllowed}
               onClick={runFinalCutExport}
             >
               {operation === "export-fcp" ? <span className="spinner" /> : <PlayIcon />}
@@ -1979,7 +3543,7 @@ export function TranscriptView({
                       ? lang === "zh" ? "正在等待计算资源" : "Waiting for compute capacity"
                     : videoExportJob.state === "cancelling"
                       ? lang === "zh" ? "正在停止导出" : "Stopping export"
-                      : lang === "zh" ? "正在硬件编码" : "Hardware encoding"}
+                      : lang === "zh" ? "正在编码视频" : "Encoding video"}
                 </strong>
                 <span>{videoExportJob.progress}%</span>
               </div>
@@ -1990,14 +3554,26 @@ export function TranscriptView({
               />
               <small>
                 {videoExportJob.encoder === "h264_videotoolbox"
-                  ? "VideoToolbox · Apple Media Engine"
+                  ? "H.264 VideoToolbox · Apple Media Engine"
+                  : videoExportJob.encoder === "hevc_videotoolbox"
+                    ? "HEVC VideoToolbox · Apple Media Engine"
                   : videoExportJob.encoder === "libx264"
-                    ? "libx264 · CPU"
+                    ? "H.264 libx264 · CPU"
+                    : videoExportJob.encoder === "libx265"
+                      ? "HEVC libx265 · CPU"
+                      : videoExportJob.encoder === "prores_ks"
+                        ? "ProRes 422 HQ · CPU"
                     : lang === "zh" ? "正在选择编码后端…" : "Selecting encoder…"}
                 {videoExportJob.currentSeconds !== null && videoExportJob.totalSeconds !== null
                   ? ` · ${Math.round(videoExportJob.currentSeconds)}s / ${Math.round(videoExportJob.totalSeconds)}s`
                   : ""}
               </small>
+              <PipelineFreshness
+                state={videoExportJob.state}
+                phase={videoExportJob.phase}
+                updatedAt={videoExportJob.updatedAt}
+                lang={lang}
+              />
               <button
                 className="button-quiet"
                 disabled={videoExportJob.state === "cancelling"}
@@ -2023,16 +3599,39 @@ export function TranscriptView({
       )}
 
       <EditorTimelineDock
+        audioMix={audioMix}
         broll={brollOverview}
+        chapters={chapters}
+        busy={operation !== null}
         currentTime={workbenchTime}
         cuts={cuts}
         doc={doc}
+        history={editHistory}
         isPlaying={workbenchPlaying}
         lang={lang}
+        pid={pid}
         rows={subtitleRows}
+        titles={titles}
+        onAddTitle={addTitle}
+        onUpdateAudioMix={updateAudioMix}
         onOpenBroll={() => setActiveTab("broll")}
+        onRedo={redoEditorEdit}
+        onRemoveCues={removeTimelineCues}
         onSeek={seekWorkbench}
+        onSplit={splitSubtitleLine}
+        onUpdateCueTiming={updateSubtitleTiming}
         onTogglePlayback={toggleWorkbenchPlayback}
+        previewCuts={previewCuts}
+        onTogglePreviewCuts={() => setPreviewCuts((value) => !value)}
+        collapsed={timelineCollapsed}
+        autoCollapsed={timelineAutoCollapsed}
+        onToggleCollapsed={() => setTimelinePreference(
+          timelineCollapsed ? "expanded" : "collapsed",
+        )}
+        onUndo={undoEditorEdit}
+        onUpdateBroll={updateBroll}
+        onUpdateTitle={updateTitle}
+        onRemoveTitle={removeTitle}
       />
     </section>
   );

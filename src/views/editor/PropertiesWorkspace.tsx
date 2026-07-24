@@ -1,6 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { allowProjectMedia } from "../../api";
+import { PipelineFreshness } from "../../components/PipelineFreshness";
 import type { Lang } from "../../i18n";
 import type {
   Doc,
@@ -197,8 +198,8 @@ export function PropertiesWorkspace({
     if (!target) return;
     const confirmed = window.confirm(
       lang === "zh"
-        ? `将把 ${speaker.paragraph_count} 个“${speaker.id}”段落合并到“${target}”。合并前状态可从“版本”恢复。是否继续？`
-        : `Merge ${speaker.paragraph_count} “${speaker.id}” paragraphs into “${target}”? The prior state remains recoverable from Versions.`,
+        ? `将把 ${speaker.paragraph_count} 个“${speaker.id}”字幕片段合并到“${target}”。合并前状态可从“版本”恢复。是否继续？`
+        : `Merge ${speaker.paragraph_count} “${speaker.id}” subtitle segments into “${target}”? The prior state remains recoverable from Versions.`,
     );
     if (!confirmed) return;
     setWorking(`merge-${speaker.id}`);
@@ -406,6 +407,12 @@ export function PropertiesWorkspace({
                   : ""}
               </small>
             )}
+            <PipelineFreshness
+              state={analysis.state}
+              phase={analysis.phase}
+              updatedAt={analysis.updatedAt}
+              lang={lang}
+            />
           </div>
         )}
 
@@ -435,8 +442,8 @@ export function PropertiesWorkspace({
         {unlabelled > 0 && (
           <p className="speaker-coverage" role="status">
             {lang === "zh"
-              ? `还有 ${unlabelled} 个段落未标记说话人。`
-              : `${unlabelled} paragraph${unlabelled === 1 ? "" : "s"} still need a speaker label.`}
+              ? `还有 ${unlabelled} 个字幕片段未标记说话人。`
+              : `${unlabelled} subtitle segment${unlabelled === 1 ? " still needs" : "s still need"} a speaker label.`}
           </p>
         )}
 
@@ -497,8 +504,8 @@ export function PropertiesWorkspace({
                     <small>
                       {speaker.paragraph_count}{" "}
                       {lang === "zh"
-                        ? "个段落"
-                        : speaker.paragraph_count === 1 ? "paragraph" : "paragraphs"}
+                        ? "个字幕片段"
+                        : speaker.paragraph_count === 1 ? "subtitle segment" : "subtitle segments"}
                     </small>
                   </div>
                   <div className="speaker-merge">
@@ -556,13 +563,13 @@ export function PropertiesWorkspace({
                 <p className="eyebrow">{lang === "zh" ? "非破坏性提案" : "Non-destructive proposal"}</p>
                 <h3 id="speaker-proposal-title">
                   {lang === "zh"
-                    ? `${preview.changed} 个段落标签将改变`
-                    : `${preview.changed} paragraph label${preview.changed === 1 ? "" : "s"} will change`}
+                    ? `${preview.changed} 个字幕片段标签将改变`
+                    : `${preview.changed} subtitle label${preview.changed === 1 ? "" : "s"} will change`}
                 </h3>
                 <small>
                   {lang === "zh"
-                    ? `${preview.segments} 个语音片段 · ${preview.unassigned} 个段落没有可靠匹配`
-                    : `${preview.segments} voice segments · ${preview.unassigned} paragraphs without a reliable match`}
+                    ? `${preview.segments} 个语音片段 · ${preview.unassigned} 个字幕片段没有可靠匹配`
+                    : `${preview.segments} voice segments · ${preview.unassigned} subtitle segments without a reliable match`}
                 </small>
               </div>
               <button
@@ -614,7 +621,7 @@ export function PropertiesWorkspace({
                 .map((proposal) => (
                   <article key={proposal.paragraphId}>
                     <input
-                      aria-label={lang === "zh" ? `选择段落 ${proposal.paragraphId}` : `Select paragraph ${proposal.paragraphId}`}
+                      aria-label={lang === "zh" ? `选择字幕片段 ${proposal.paragraphId}` : `Select subtitle segment ${proposal.paragraphId}`}
                       checked={selectedProposalIds.has(proposal.paragraphId)}
                       type="checkbox"
                       onChange={(event) => {

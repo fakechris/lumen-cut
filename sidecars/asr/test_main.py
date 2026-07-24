@@ -15,6 +15,13 @@ SPEC.loader.exec_module(ASR)
 
 
 class SidecarFormattingTests(unittest.TestCase):
+    def test_default_memory_policy_scales_down_on_an_eight_gigabyte_mac(self) -> None:
+        with mock.patch.object(ASR, "physical_memory_mb", return_value=8192):
+            limit = ASR.default_memory_limit_mb()
+
+        self.assertGreaterEqual(limit, ASR.MIN_MEMORY_LIMIT_MB)
+        self.assertLess(limit, ASR.DEFAULT_MEMORY_LIMIT_MB)
+
     def test_mlx_memory_policy_caps_unified_memory_and_cache(self) -> None:
         calls: list[tuple[str, int]] = []
         fake_mx = types.SimpleNamespace(
@@ -52,9 +59,23 @@ class SidecarFormattingTests(unittest.TestCase):
         ]
         paragraphs = ASR.build_paragraphs(segments)
         self.assertEqual(
-            [sentence["text"] for sentence in paragraphs[0]["sentences"]],
+            [
+                sentence["text"]
+                for paragraph in paragraphs
+                for sentence in paragraph["sentences"]
+            ],
             ["First", "Second"],
         )
+        self.assertEqual(len(paragraphs), 2)
+
+    def test_each_subtitle_cue_is_a_speaker_assignable_paragraph(self) -> None:
+        segments = [
+            {"text": "First.", "start": 0.0, "end": 0.8},
+            {"text": "Second.", "start": 1.0, "end": 1.8},
+        ]
+        paragraphs = ASR.build_paragraphs(segments)
+        self.assertEqual(len(paragraphs), 2)
+        self.assertTrue(all(len(paragraph["sentences"]) == 1 for paragraph in paragraphs))
 
     def test_cues_respect_the_editor_width_gate(self) -> None:
         segments = [
@@ -66,7 +87,11 @@ class SidecarFormattingTests(unittest.TestCase):
                 ]
             )
         ]
-        sentences = ASR.build_paragraphs(segments, "English")[0]["sentences"]
+        sentences = [
+            sentence
+            for paragraph in ASR.build_paragraphs(segments, "English")
+            for sentence in paragraph["sentences"]
+        ]
         self.assertGreater(len(sentences), 1)
         for sentence in sentences:
             visible = sum(not character.isspace() for character in sentence["text"])

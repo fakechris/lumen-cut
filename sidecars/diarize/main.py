@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import resource
+import subprocess
 import sys
 import time
 from typing import Any, TextIO
@@ -19,6 +20,44 @@ DEFAULT_MODEL = "pyannote/speaker-diarization-3.1"
 PROGRESS_PREFIX = "LUMEN_CUT_PROGRESS "
 CPU_THREAD_LIMIT = 4
 DEFAULT_MEMORY_LIMIT_MB = 6144
+PHYSICAL_MEMORY_FRACTION = 0.55
+MIN_MEMORY_LIMIT_MB = 2048
+
+
+def physical_memory_mb() -> int | None:
+    """Return installed RAM without importing psutil or another large package."""
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if pages > 0 and page_size > 0:
+            return (pages * page_size) // (1024 * 1024)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            physical_bytes = int(output.stdout.strip())
+            if physical_bytes > 0:
+                return physical_bytes // (1024 * 1024)
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+            pass
+    return None
+
+
+def default_memory_limit_mb() -> int:
+    physical = physical_memory_mb()
+    if not physical:
+        return DEFAULT_MEMORY_LIMIT_MB
+    return max(
+        MIN_MEMORY_LIMIT_MB,
+        min(DEFAULT_MEMORY_LIMIT_MB, int(physical * PHYSICAL_MEMORY_FRACTION)),
+    )
 
 
 def emit_progress(
@@ -50,7 +89,7 @@ class ResourceMonitor:
         self.started_cpu = time.process_time()
         configured_limit = os.environ.get("LUMEN_CUT_MAX_SIDECAR_MEMORY_MB")
         self.memory_limit_mb = (
-            int(configured_limit) if configured_limit else DEFAULT_MEMORY_LIMIT_MB
+            int(configured_limit) if configured_limit else default_memory_limit_mb()
         )
 
     @staticmethod

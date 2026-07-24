@@ -14,6 +14,7 @@
 //!   lumen-cut audit demo
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -21,7 +22,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use lumen_cut::asr::transcribe_file_with_aligner;
+use lumen_cut::asr::{transcribe_file_with_aligner_progress, AsrProgress, AsrProgressCallback};
 use lumen_cut::audit::{audit_project, finish_check_emit_for_project, Finding, Report};
 use lumen_cut::data::version::{
     commit_snapshot, create_branch, restore_snapshot, switch_branch, three_way_merge,
@@ -29,10 +30,12 @@ use lumen_cut::data::version::{
 };
 use lumen_cut::data::ClipCuts;
 use lumen_cut::data::{Doc, MediaRef, Meta};
-use lumen_cut::diarize::{assign_speakers, diarize_file};
+use lumen_cut::diarize::{
+    assign_speakers, diarize_file_with_model_progress, DiarizeProgress, DiarizeProgressCallback,
+};
 use lumen_cut::error::{AppError, AppResult};
 use lumen_cut::export::{
-    write_ass, write_ass_with, write_md, write_md_with_chapters, write_srt, write_srt_with,
+    write_ass, write_ass_with_style, write_md, write_md_with_chapters, write_srt, write_srt_with,
     write_vtt, write_vtt_with,
 };
 use lumen_cut::media::{extract_audio_wav, probe};
@@ -47,6 +50,116 @@ macro_rules! emit {
             println!($($human)+);
         }
     };
+}
+
+const CLI_PROGRESS_STEP: u8 = 5;
+
+#[derive(Default)]
+struct CliProgressState {
+    phase: String,
+    progress: u8,
+    emitted: bool,
+}
+
+fn should_emit_cli_progress(state: &mut CliProgressState, phase: &str, progress: u8) -> bool {
+    let progress = progress.min(100);
+    let phase_changed = state.phase != phase;
+    let advanced = progress >= state.progress.saturating_add(CLI_PROGRESS_STEP);
+    let emit = !state.emitted || phase_changed || advanced || progress == 100;
+    if emit {
+        state.phase = phase.to_string();
+        state.progress = progress;
+        state.emitted = true;
+    }
+    emit
+}
+
+fn format_cli_progress(
+    phase: &str,
+    progress: u8,
+    current: Option<u32>,
+    total: Option<u32>,
+    device: Option<&str>,
+    cpu_percent: Option<u32>,
+    peak_memory_mb: Option<u64>,
+) -> String {
+    let mut details = Vec::new();
+    if let (Some(current), Some(total)) = (current, total) {
+        details.push(format!("{current}/{total}"));
+    }
+    if let Some(device) = device.filter(|value| !value.trim().is_empty()) {
+        details.push(device.to_string());
+    }
+    if let Some(cpu) = cpu_percent {
+        details.push(format!("CPU {cpu}%"));
+    }
+    if let Some(memory) = peak_memory_mb {
+        details.push(format!("memory {memory} MB"));
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", details.join(" · "))
+    };
+    format!(
+        "progress: {} {}%{}",
+        phase.replace(['_', '-'], " "),
+        progress.min(100),
+        suffix
+    )
+}
+
+fn report_cli_phase(phase: &str, progress: u8) {
+    eprintln!(
+        "{}",
+        format_cli_progress(phase, progress, None, None, None, None, None)
+    );
+}
+
+fn cli_asr_progress() -> AsrProgressCallback {
+    let state = Arc::new(Mutex::new(CliProgressState::default()));
+    Arc::new(move |progress: AsrProgress| {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if should_emit_cli_progress(&mut state, &progress.phase, progress.progress) {
+            eprintln!(
+                "{}",
+                format_cli_progress(
+                    &progress.phase,
+                    progress.progress,
+                    progress.current,
+                    progress.total,
+                    progress.device.as_deref(),
+                    progress.cpu_percent,
+                    progress.peak_memory_mb,
+                )
+            );
+        }
+    })
+}
+
+fn cli_diarize_progress() -> DiarizeProgressCallback {
+    let state = Arc::new(Mutex::new(CliProgressState::default()));
+    Arc::new(move |progress: DiarizeProgress| {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if should_emit_cli_progress(&mut state, &progress.phase, progress.progress) {
+            eprintln!(
+                "{}",
+                format_cli_progress(
+                    &progress.phase,
+                    progress.progress,
+                    progress.current,
+                    progress.total,
+                    progress.device.as_deref(),
+                    progress.cpu_percent,
+                    progress.peak_memory_mb,
+                )
+            );
+        }
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -634,7 +747,24 @@ async fn run_cli() -> AppResult<()> {
                 if json {
                     println!("{}", serde_json::to_string(&st)?);
                 } else {
-                    println!("pending={} done={}", st.pending, st.done);
+                    println!(
+                        "pending={} done={} failed={}",
+                        st.pending, st.done, st.failed
+                    );
+                    for kind in &st.kinds {
+                        println!(
+                            "{} state={} pending={} done={} failed={}{}",
+                            kind.kind,
+                            kind.state,
+                            kind.pending,
+                            kind.done,
+                            kind.failed,
+                            kind.last_error
+                                .as_deref()
+                                .map(|error| format!(" error={error}"))
+                                .unwrap_or_default()
+                        );
+                    }
                     if let Some(quality) = &st.polish_quality {
                         println!(
                             "polishQuality={:?} measured={}/{} residualTerms={}",
@@ -801,9 +931,25 @@ async fn run_cli() -> AppResult<()> {
             } else {
                 ClipCuts::new()
             };
-            write_srt_with(&doc, &cuts.cuts, &dir.join("export.srt"))?;
-            write_vtt_with(&doc, &cuts.cuts, &dir.join("export.vtt"))?;
-            write_ass_with(&doc, &cuts.cuts, &dir.join("export.ass"), 1920, 1080)?;
+            let export_settings = lumen_cut::data::export_settings::load(&dir)?;
+            let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
+            let caption_doc = lumen_cut::data::export_settings::project_caption_doc_with_hidden(
+                &doc,
+                export_settings.subtitle_language.as_deref(),
+                export_settings.bilingual_subtitles,
+                &hidden,
+            )?;
+            write_srt_with(&caption_doc, &cuts.cuts, &dir.join("export.srt"))?;
+            write_vtt_with(&caption_doc, &cuts.cuts, &dir.join("export.vtt"))?;
+            let style = lumen_cut::data::substyle::SubStyle::load(&dir)?;
+            write_ass_with_style(
+                &caption_doc,
+                &cuts.cuts,
+                &style,
+                &dir.join("export.ass"),
+                1920,
+                1080,
+            )?;
             write_md_with_chapters(&doc, &cuts.cuts, &dir, &dir.join("export.md"))?;
             // Also write the portable flat `cues[]` view.
             lumen_cut::data::cues::save(&dir, &lumen_cut::data::cues::to_cues(&doc, None))?;
@@ -935,7 +1081,7 @@ async fn run_cli() -> AppResult<()> {
             match action {
                 SubtitleCmd::List { lang } => {
                     let doc = Doc::load(&dir)?;
-                    let hidden = subtitle::load_hidden(&dir);
+                    let hidden = subtitle::load_hidden_checked(&dir)?;
                     let rows = subtitle::list(&doc, &hidden, lang.as_deref());
                     if json {
                         println!("{}", serde_json::to_string(&rows)?);
@@ -1246,12 +1392,24 @@ async fn run_cli() -> AppResult<()> {
                         return Ok(());
                     }
                     let doc = Doc::load(&dir)?;
-                    let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
-                        .ok()
-                        .and_then(|raw| serde_json::from_str(&raw).ok())
-                        .unwrap_or_default();
+                    let cuts_path = dir.join("cuts.json");
+                    let cuts: ClipCuts = if cuts_path.exists() {
+                        serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
+                    } else {
+                        ClipCuts::new()
+                    };
                     let ass = dir.join("broll-preview.ass");
-                    write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
+                    let style = lumen_cut::data::substyle::SubStyle::load(&dir)?;
+                    let settings = lumen_cut::data::export_settings::load(&dir)?;
+                    let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
+                    let caption_doc =
+                        lumen_cut::data::export_settings::project_caption_doc_with_hidden(
+                            &doc,
+                            settings.subtitle_language.as_deref(),
+                            settings.bilingual_subtitles,
+                            &hidden,
+                        )?;
+                    write_ass_with_style(&caption_doc, &cuts.cuts, &style, &ass, 1920, 1080)?;
                     let preview_video = dir.join("broll-preview.mp4");
                     lumen_cut::export::render_video_with_broll(
                         &doc,
@@ -1552,6 +1710,8 @@ fn fmt_ts(seconds: f64) -> String {
 struct TaskStatus {
     pending: usize,
     done: usize,
+    failed: usize,
+    kinds: Vec<lumen_cut::agent::task::TaskKindStatus>,
     polish_quality: Option<lumen_cut::pipeline::polish::PolishQualityArtifact>,
 }
 
@@ -1614,19 +1774,32 @@ async fn task_start(
     }
     let recovered = lumen_cut::agent::task::restore_or_enqueue(&allocator, &task)?;
     info!(kind, pid, recovered, "restored durable task submissions");
-    let applied = lumen_cut::agent::task::wait_and_apply(
+    let result = lumen_cut::agent::task::wait_and_apply(
         allocator,
-        task,
+        task.clone(),
         std::time::Duration::from_secs(30 * 60),
     )
-    .await?;
-    info!(kind, pid, applied, "task completed and applied");
-    Ok(pending)
+    .await;
+    match result {
+        Ok(applied) => {
+            lumen_cut::agent::task::set_task_state(&task, "completed", None)?;
+            info!(kind, pid, applied, "task completed and applied");
+            Ok(pending)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            lumen_cut::agent::task::set_task_state(&task, "failed", Some(&message))?;
+            Err(error)
+        }
+    }
 }
 
 fn task_status(pid: &str, root: &Path) -> AppResult<TaskStatus> {
     let project_dir = root.join(pid);
-    let (pending, done) = lumen_cut::agent::task::task_counts(&project_dir);
+    let kinds = lumen_cut::agent::task::task_kind_statuses(&project_dir);
+    let pending = kinds.iter().map(|status| status.pending).sum();
+    let done = kinds.iter().map(|status| status.done).sum();
+    let failed = kinds.iter().map(|status| status.failed).sum();
     let polish_quality = lumen_cut::pipeline::polish::PolishQualityArtifact::load(
         &project_dir.join("ai/polish-quality.json"),
     )
@@ -1634,6 +1807,8 @@ fn task_status(pid: &str, root: &Path) -> AppResult<TaskStatus> {
     Ok(TaskStatus {
         pending,
         done,
+        failed,
+        kinds,
         polish_quality,
     })
 }
@@ -1674,9 +1849,27 @@ struct SpeakerTurn {
     end: f64,
     first_cue: String,
     last_cue: String,
+    cue_count: usize,
     text: String,
+    text_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cues: Option<Vec<String>>,
+    cues_truncated: bool,
+}
+
+const MAX_SPEAKER_TURN_TEXT_CHARS: usize = 500;
+const MAX_SPEAKER_TURN_CUES: usize = 100;
+
+fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
+    if value.chars().count() <= max_chars {
+        return (value, false);
+    }
+    if max_chars == 0 {
+        return (String::new(), true);
+    }
+    let mut truncated: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    (truncated, true)
 }
 
 fn speaker_turns(doc: &Doc, limit: Option<usize>, include_cues: bool) -> Vec<SpeakerTurn> {
@@ -1697,6 +1890,17 @@ fn speaker_turns(doc: &Doc, limit: Option<usize>, include_cues: bool) -> Vec<Spe
         else {
             continue;
         };
+        let (text, text_truncated) = truncate_chars(
+            paragraph
+                .sentences
+                .iter()
+                .map(|sentence| sentence.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            MAX_SPEAKER_TURN_TEXT_CHARS,
+        );
+        let cue_count = cue_ids.len();
+        let cues_truncated = include_cues && cue_count > MAX_SPEAKER_TURN_CUES;
         turns.push(SpeakerTurn {
             speaker: paragraph
                 .speaker
@@ -1706,13 +1910,11 @@ fn speaker_turns(doc: &Doc, limit: Option<usize>, include_cues: bool) -> Vec<Spe
             end: last.end,
             first_cue: first_cue.clone(),
             last_cue: last_cue.clone(),
-            text: paragraph
-                .sentences
-                .iter()
-                .map(|sentence| sentence.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            cues: include_cues.then_some(cue_ids),
+            cue_count,
+            text,
+            text_truncated,
+            cues: include_cues.then(|| cue_ids.into_iter().take(MAX_SPEAKER_TURN_CUES).collect()),
+            cues_truncated,
         });
     }
     if let Some(limit) = limit {
@@ -1753,8 +1955,9 @@ async fn speaker_view_project(dir: &Path, rerun: bool) -> AppResult<SpeakerView>
         })
         .collect();
     let fresh = if rerun {
+        let model = lumen_cut::data::modelconfig::load().diarize_model;
         Some(
-            diarize_file(&wav)
+            diarize_file_with_model_progress(&wav, &model, Some(cli_diarize_progress()))
                 .await?
                 .segments
                 .into_iter()
@@ -1879,7 +2082,8 @@ async fn diarize_project(dir: &Path) -> AppResult<(usize, usize)> {
     {
         warn!("HF_TOKEN not set; gated pyannote models may require `hf auth login`");
     }
-    let out = diarize_file(&wav).await?;
+    let model = lumen_cut::data::modelconfig::load().diarize_model;
+    let out = diarize_file_with_model_progress(&wav, &model, Some(cli_diarize_progress())).await?;
     let assigned = assign_speakers(&mut doc, &out.segments);
     doc.save(dir)?;
     Ok((out.segments.len(), assigned))
@@ -1958,8 +2162,11 @@ async fn run_auto(
     std::fs::create_dir_all(&out_dir)?;
 
     let media_path = if media.starts_with("http://") || media.starts_with("https://") {
+        report_cli_phase("downloading", 0);
         let tmpl = out_dir.join("source.%(ext)s");
-        download(media, &tmpl).await?
+        let path = download(media, &tmpl).await?;
+        report_cli_phase("downloading", 15);
+        path
     } else {
         PathBuf::from(media)
     };
@@ -1968,7 +2175,9 @@ async fn run_auto(
     }
 
     let wav = out_dir.join("audio.wav");
+    report_cli_phase("extracting", 15);
     extract_audio_wav(&media_path, &wav).await?;
+    report_cli_phase("analyzing", 35);
 
     let info = probe(&media_path).await?;
     let pid_stem = media_path
@@ -1980,9 +2189,16 @@ async fn run_auto(
 
     let model_config = lumen_cut::data::modelconfig::load();
     let model = model.unwrap_or(&model_config.asr_model);
-    let asr =
-        transcribe_file_with_aligner(&wav, model, lang, Some(&model_config.asr_aligner)).await?;
+    let asr = transcribe_file_with_aligner_progress(
+        &wav,
+        model,
+        lang,
+        Some(&model_config.asr_aligner),
+        Some(cli_asr_progress()),
+    )
+    .await?;
 
+    report_cli_phase("saving", 90);
     let mut doc: Doc = asr.into();
     doc.id = pid_stem.clone();
     doc.media = MediaRef {
@@ -1996,6 +2212,7 @@ async fn run_auto(
     lumen_cut::pipeline::timing::repair(&mut doc);
     doc.save(&pid_dir)?;
 
+    report_cli_phase("exporting", 95);
     let srt_path = pid_dir.join("out.srt");
     let vtt_path = pid_dir.join("out.vtt");
     let ass_path = pid_dir.join("out.ass");
@@ -2004,6 +2221,7 @@ async fn run_auto(
     write_vtt(&doc, &vtt_path)?;
     write_ass(&doc, &ass_path, 1920, 1080)?;
     write_md(&doc, &md_path)?;
+    report_cli_phase("completed", 100);
 
     Ok(AutoSummary {
         pid_dir,
@@ -2156,7 +2374,66 @@ mod tests {
         assert_eq!(turns[0].speaker, "Ada");
         assert_eq!(turns[0].first_cue, "p1s1");
         assert_eq!(turns[0].last_cue, "p1s1");
+        assert_eq!(turns[0].cue_count, 1);
+        assert!(!turns[0].text_truncated);
+        assert!(!turns[0].cues_truncated);
         assert_eq!(turns[0].cues.as_deref(), Some(&["p1s1".to_string()][..]));
+    }
+
+    #[test]
+    fn speaker_show_turns_bound_long_text_and_cue_lists_without_losing_span() {
+        let mut doc = sample_doc();
+        let template = doc.paragraphs[0].sentences[0].clone();
+        doc.paragraphs[0].sentences = (0..(MAX_SPEAKER_TURN_CUES + 5))
+            .map(|index| {
+                let mut sentence = template.clone();
+                sentence.id = format!("cue-{index}");
+                sentence.text = "long speaker text ".repeat(8);
+                sentence.words[0].id = format!("word-{index}");
+                sentence.words[0].start = index as f64;
+                sentence.words[0].end = index as f64 + 0.5;
+                sentence
+            })
+            .collect();
+
+        let turns = speaker_turns(&doc, Some(1), true);
+        let turn = &turns[0];
+        assert_eq!(turn.first_cue, "cue-0");
+        assert_eq!(turn.last_cue, format!("cue-{}", MAX_SPEAKER_TURN_CUES + 4));
+        assert_eq!(turn.cue_count, MAX_SPEAKER_TURN_CUES + 5);
+        assert_eq!(turn.cues.as_ref().unwrap().len(), MAX_SPEAKER_TURN_CUES);
+        assert!(turn.cues_truncated);
+        assert!(turn.text_truncated);
+        assert!(turn.text.chars().count() <= MAX_SPEAKER_TURN_TEXT_CHARS);
+    }
+
+    #[test]
+    fn cli_progress_is_throttled_by_phase_and_five_percent_steps() {
+        let mut state = CliProgressState::default();
+        assert!(should_emit_cli_progress(&mut state, "recognize", 0));
+        assert!(!should_emit_cli_progress(&mut state, "recognize", 4));
+        assert!(should_emit_cli_progress(&mut state, "recognize", 5));
+        assert!(!should_emit_cli_progress(&mut state, "recognize", 9));
+        assert!(should_emit_cli_progress(&mut state, "align", 0));
+        assert!(should_emit_cli_progress(&mut state, "align", 100));
+
+        let line = format_cli_progress(
+            "forced_align",
+            42,
+            Some(21),
+            Some(50),
+            Some("MLX"),
+            Some(123),
+            Some(456),
+        );
+        assert_eq!(
+            line,
+            "progress: forced align 42% · 21/50 · MLX · CPU 123% · memory 456 MB"
+        );
+        assert_eq!(
+            format_cli_progress("completed", 100, None, None, None, None, None),
+            "progress: completed 100%"
+        );
     }
 
     #[tokio::test]

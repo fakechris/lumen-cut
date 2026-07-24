@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +212,10 @@ pub fn prepare_task_with_task_options(
         _ => unreachable!(),
     };
     let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     crate::data::storage::write_json(
         &ai_dir.join("task.json"),
         &serde_json::json!({
@@ -222,6 +227,7 @@ pub fn prepare_task_with_task_options(
             "groups": &options.groups,
             "alignFit": options.align_fit,
             "calls": payloads.len(),
+            "startedAt": started_at,
         }),
     )?;
     let mut calls = Vec::with_capacity(payloads.len());
@@ -261,6 +267,7 @@ pub fn prepare_task_with_task_options(
             "groups": &options.groups,
             "alignFit": options.align_fit,
             "calls": calls.len(),
+            "startedAt": started_at,
         }),
     )?;
     Ok(PreparedTask {
@@ -368,6 +375,24 @@ pub fn load_recoverable_task(project_dir: &Path, kind: &str) -> AppResult<Option
     }))
 }
 
+pub fn load_matching_recoverable_task(
+    project_dir: &Path,
+    kind: &str,
+    requested_lang: Option<&str>,
+) -> AppResult<Option<PreparedTask>> {
+    let Some(task) = load_recoverable_task(project_dir, kind)? else {
+        return Ok(None);
+    };
+    if task.lang.as_deref() != requested_lang {
+        return Err(AppError::Schema(format!(
+            "unfinished {kind} task uses language `{}`; resume or finish it before starting language `{}`",
+            task.lang.as_deref().unwrap_or("none"),
+            requested_lang.unwrap_or("none"),
+        )));
+    }
+    Ok(Some(task))
+}
+
 fn remove_task_run_files(ai_dir: &Path, kind: &str, run_id: &str) -> AppResult<()> {
     let prefix = format!("{kind}-{run_id}-");
     for phase in ["pending", "submitted"] {
@@ -386,7 +411,7 @@ fn remove_task_run_files(ai_dir: &Path, kind: &str, run_id: &str) -> AppResult<(
     Ok(())
 }
 
-pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+fn load_tasks(project_dir: &Path, include_paused_and_failed: bool) -> AppResult<Vec<PreparedTask>> {
     let ai_dir = project_dir.join("ai");
     let entries = match std::fs::read_dir(&ai_dir) {
         Ok(entries) => entries,
@@ -404,7 +429,10 @@ pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>
         let task_path = ai_dir.join(&kind).join("task.json");
         if let Ok(raw) = std::fs::read_to_string(&task_path) {
             let stored: StoredTask = serde_json::from_str(&raw)?;
-            if matches!(stored.state.as_str(), "paused" | "failed" | "completed") {
+            if stored.state == "completed"
+                || (!include_paused_and_failed
+                    && matches!(stored.state.as_str(), "paused" | "failed"))
+            {
                 continue;
             }
         }
@@ -413,6 +441,37 @@ pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>
         }
     }
     Ok(tasks)
+}
+
+pub fn load_recoverable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+    load_tasks(project_dir, false)
+}
+
+/// Explicit user resume includes paused and failed apply loops. Automatic
+/// startup recovery intentionally uses [`load_recoverable_tasks`] instead.
+pub fn load_resumable_tasks(project_dir: &Path) -> AppResult<Vec<PreparedTask>> {
+    load_tasks(project_dir, true)
+}
+
+pub fn prepare_retry_task(project_dir: &Path, kind: &str) -> AppResult<PreparedTask> {
+    let path = project_dir.join("ai").join(kind).join("task.json");
+    let stored: StoredTask = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    if stored.kind != kind {
+        return Err(AppError::Schema(format!(
+            "stored task kind `{}` does not match retry kind `{kind}`",
+            stored.kind
+        )));
+    }
+    prepare_task_with_task_options(
+        project_dir,
+        kind,
+        stored.lang.as_deref(),
+        TaskOptions {
+            stale_only: stored.stale_only || kind == "translate",
+            groups: stored.groups,
+            align_fit: stored.align_fit,
+        },
+    )
 }
 
 /// Restore already-ACKed worker results and enqueue only calls that still need
@@ -438,52 +497,165 @@ pub fn restore_or_enqueue(allocator: &Allocator, task: &PreparedTask) -> AppResu
     Ok(restored)
 }
 
-/// Count every pending/completed call across task kinds. Status is a project
-/// view, not a translate-only view.
-pub fn task_counts(project_dir: &Path) -> (usize, usize) {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskKindStatus {
+    pub kind: String,
+    pub lang: Option<String>,
+    pub state: String,
+    pub calls: usize,
+    pub pending: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub last_error: Option<String>,
+    pub started_at: Option<u64>,
+    pub updated_at: Option<u64>,
+}
+
+/// Build one durable status row per task kind. Only files belonging to the
+/// manifest's active run are counted, so stale artifacts cannot make a new
+/// run look completed or failed.
+pub fn task_kind_statuses(project_dir: &Path) -> Vec<TaskKindStatus> {
     let ai = project_dir.join("ai");
-    let mut pending = 0;
-    let mut done = 0;
     let Ok(kinds) = std::fs::read_dir(ai) else {
-        return (0, 0);
+        return vec![];
     };
-    for kind in kinds
+    let mut statuses = kinds
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
-    {
-        let count = |name: &str| {
-            std::fs::read_dir(kind.path().join(name))
-                .map(|entries| entries.filter_map(Result::ok).count())
-                .unwrap_or_default()
-        };
-        let failed_names: std::collections::BTreeSet<std::ffi::OsString> =
-            std::fs::read_dir(kind.path().join("failed"))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .collect();
-        let done_names: std::collections::BTreeSet<std::ffi::OsString> =
-            std::fs::read_dir(kind.path().join("done"))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .collect();
-        pending += std::fs::read_dir(kind.path().join("pending"))
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        !failed_names.contains(&entry.file_name())
-                            && !done_names.contains(&entry.file_name())
+        .filter_map(|entry| {
+            let dir = entry.path();
+            let kind = entry.file_name().to_string_lossy().into_owned();
+            let task_json = std::fs::read_to_string(dir.join("task.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            let active_prefix = task_json
+                .as_ref()
+                .and_then(|value| value.get("runId"))
+                .and_then(|value| value.as_str())
+                .map(|run_id| format!("{kind}-{run_id}-"));
+            let entries_for = |name: &str| {
+                std::fs::read_dir(dir.join(name))
+                    .map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .filter(|entry| {
+                                active_prefix.as_ref().is_none_or(|prefix| {
+                                    entry.file_name().to_string_lossy().starts_with(prefix)
+                                })
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .count()
+                    .unwrap_or_default()
+            };
+            let done_entries = entries_for("done");
+            let failed_entries = entries_for("failed");
+            let pending_entries = entries_for("pending");
+            let done = done_entries.len();
+            let failed = failed_entries.len();
+            let failed_names: BTreeSet<std::ffi::OsString> = failed_entries
+                .iter()
+                .map(|entry| entry.file_name())
+                .collect();
+            let done_names: BTreeSet<std::ffi::OsString> =
+                done_entries.iter().map(|entry| entry.file_name()).collect();
+            let pending = pending_entries
+                .iter()
+                .filter(|entry| {
+                    !failed_names.contains(&entry.file_name())
+                        && !done_names.contains(&entry.file_name())
+                })
+                .count();
+            if pending + done + failed == 0 && !dir.join("task.json").exists() {
+                return None;
+            }
+            let lang = task_json
+                .as_ref()
+                .and_then(|value| value.get("lang"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let manifest_state = task_json
+                .as_ref()
+                .and_then(|value| value.get("state"))
+                .and_then(|value| value.as_str());
+            let calls = task_json
+                .as_ref()
+                .and_then(|value| value.get("calls"))
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(pending + done + failed);
+            let state = if failed > 0 && pending == 0 {
+                "failed"
+            } else if calls > 0 && done == calls {
+                "completed"
+            } else {
+                manifest_state.unwrap_or(if pending > 0 { "running" } else { "completed" })
+            }
+            .to_string();
+            let last_error = task_json
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    failed_entries
+                        .iter()
+                        .max_by_key(|entry| {
+                            entry
+                                .metadata()
+                                .ok()
+                                .and_then(|metadata| metadata.modified().ok())
+                        })
+                        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+                });
+            let started_at = task_json
+                .as_ref()
+                .and_then(|value| value.get("startedAt"))
+                .and_then(|value| value.as_u64());
+            let updated_at = std::iter::once(dir.join("task.json"))
+                .chain(std::iter::once(dir.clone()))
+                .chain(done_entries.iter().map(|entry| entry.path()))
+                .chain(failed_entries.iter().map(|entry| entry.path()))
+                .chain(pending_entries.iter().map(|entry| entry.path()))
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .filter_map(|metadata| metadata.modified().ok())
+                .filter_map(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .max();
+            Some(TaskKindStatus {
+                kind,
+                lang,
+                state,
+                calls,
+                pending,
+                done,
+                failed,
+                last_error,
+                started_at,
+                updated_at,
             })
-            .unwrap_or_default();
-        done += count("done");
-    }
-    (pending, done)
+        })
+        .collect::<Vec<_>>();
+    statuses.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    statuses
+}
+
+/// Count every active-run pending/completed call across task kinds. Kept for
+/// compatibility with existing callers; richer surfaces should use
+/// `task_kind_statuses`.
+pub fn task_counts(project_dir: &Path) -> (usize, usize) {
+    let statuses = task_kind_statuses(project_dir);
+    (
+        statuses.iter().map(|status| status.pending).sum(),
+        statuses.iter().map(|status| status.done).sum(),
+    )
 }
 
 fn timeline_payload(doc: &Doc) -> AppResult<serde_json::Value> {
@@ -1591,7 +1763,7 @@ pub async fn wait_and_apply(
     task: PreparedTask,
     timeout: Duration,
 ) -> AppResult<usize> {
-    wait_and_apply_inner(allocator, task, timeout, None).await
+    wait_and_apply_inner(allocator, task, timeout, None, None).await
 }
 
 pub async fn wait_and_apply_with_lock(
@@ -1600,7 +1772,24 @@ pub async fn wait_and_apply_with_lock(
     timeout: Duration,
     project_mutation: Arc<tokio::sync::Mutex<()>>,
 ) -> AppResult<usize> {
-    wait_and_apply_inner(allocator, task, timeout, Some(project_mutation)).await
+    wait_and_apply_inner(allocator, task, timeout, Some(project_mutation), None).await
+}
+
+pub async fn wait_and_apply_with_lock_and_pause(
+    allocator: Arc<Allocator>,
+    task: PreparedTask,
+    timeout: Duration,
+    project_mutation: Arc<tokio::sync::Mutex<()>>,
+    pause: Arc<AtomicBool>,
+) -> AppResult<usize> {
+    wait_and_apply_inner(
+        allocator,
+        task,
+        timeout,
+        Some(project_mutation),
+        Some(pause),
+    )
+    .await
 }
 
 async fn wait_and_apply_inner(
@@ -1608,12 +1797,22 @@ async fn wait_and_apply_inner(
     task: PreparedTask,
     timeout: Duration,
     project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+    pause: Option<Arc<AtomicBool>>,
 ) -> AppResult<usize> {
     if task.kind == "translate" {
-        return wait_and_apply_translation(allocator, task, timeout, project_mutation).await;
+        return wait_and_apply_translation(allocator, task, timeout, project_mutation, pause).await;
     }
     let started = Instant::now();
     loop {
+        if pause
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Relaxed))
+        {
+            return Err(AppError::Schema(format!(
+                "task {} paused by user; durable requests and accepted results were preserved",
+                task.kind
+            )));
+        }
         if task
             .calls
             .iter()
@@ -1738,6 +1937,7 @@ async fn wait_and_apply_translation(
     task: PreparedTask,
     timeout: Duration,
     project_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+    pause: Option<Arc<AtomicBool>>,
 ) -> AppResult<usize> {
     let started = Instant::now();
     let mut remaining: BTreeSet<String> = task
@@ -1749,6 +1949,15 @@ async fn wait_and_apply_translation(
     let mut errors = Vec::new();
 
     while !remaining.is_empty() {
+        if pause
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Relaxed))
+        {
+            return Err(AppError::Schema(format!(
+                "task {} paused by user; completed batches were saved",
+                task.kind
+            )));
+        }
         let mut progressed = false;
         for prepared in &task.calls {
             if !remaining.contains(&prepared.call.id) {
@@ -2391,6 +2600,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                 &task.project_dir.join("ai").join("cuts.json"),
                 &answer,
             )?;
+            crate::data::activity::touch(&task.project_dir)?;
             return Ok(cuts.cuts.len() - before);
         }
         "broll" => {
@@ -2398,6 +2608,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                 &task.project_dir.join("ai").join("broll-suggestions.json"),
                 &answer,
             )?;
+            crate::data::activity::touch(&task.project_dir)?;
             return Ok(answer["suggestions"]
                 .as_array()
                 .map(Vec::len)
@@ -2411,6 +2622,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
     };
     doc.meta.updated_at = chrono::Utc::now();
     doc.save(&task.project_dir)?;
+    crate::data::activity::touch(&task.project_dir)?;
     Ok(applied)
 }
 
@@ -2613,6 +2825,23 @@ mod tests {
         assert!(load_recoverable_task(tmp.path(), "translate")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_new_language_never_silently_recovers_an_unfinished_translation() {
+        let tmp = tempfile::tempdir().unwrap();
+        sample_doc().save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        set_task_state(&task, "paused", Some("provider timeout")).unwrap();
+
+        let matching = load_matching_recoverable_task(tmp.path(), "translate", Some("zh")).unwrap();
+        assert_eq!(matching.unwrap().lang.as_deref(), Some("zh"));
+
+        let error = load_matching_recoverable_task(tmp.path(), "translate", Some("ja"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("language `zh`"));
+        assert!(error.contains("language `ja`"));
     }
 
     #[tokio::test]

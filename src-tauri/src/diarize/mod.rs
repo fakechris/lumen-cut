@@ -16,7 +16,10 @@ use tracing::info;
 use crate::error::{AppError, AppResult};
 use crate::proc;
 
-pub use assign::{assign_speakers, match_paragraph, reliable_speaker_match, SpeakerMatch};
+pub use assign::{
+    assign_speakers, match_paragraph, normalize_speaker_paragraphs, reliable_speaker_match,
+    SpeakerMatch,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizeOutV1 {

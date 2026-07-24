@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 use crate::VERSION;
 
 use crate::agent::Allocator;
+use crate::audit::engine::Section;
 use crate::audit::{audit_project, finish_check_emit_for_project, Code, Finding, Report};
 use crate::data::version::{three_way_merge, working_head_is_committed};
 use crate::data::{ClipCuts, Doc, MediaRef, Meta};
@@ -74,6 +75,110 @@ fn trace_pipeline_finished(pipeline: &str, pid: &str, state: &str, error: Option
     } else {
         tracing::info!(pipeline, pid, state, "pipeline job finished");
     }
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn advance_progress(current: u8, reported: u8) -> u8 {
+    current.max(reported.min(100))
+}
+
+fn explicit_sidecar_override_ready(script_variable: &str) -> bool {
+    std::env::var_os(script_variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .is_some_and(|path| path.is_file())
+        && std::env::var_os("LUMEN_CUT_PYTHON").is_some_and(|value| !value.is_empty())
+}
+
+fn validate_transcription_preflight(
+    config: &crate::data::modelconfig::ModelConfig,
+    model_override: Option<&str>,
+) -> AppResult<()> {
+    match config.asr_engine {
+        crate::data::modelconfig::AsrEngine::OpenaiCompatible => {
+            if !crate::data::modelconfig::cloud_asr_configured(config) {
+                return Err(AppError::Schema(
+                    "cloud transcription is incomplete; open Settings → Speech & models and add an endpoint, API key, and model"
+                        .into(),
+                ));
+            }
+        }
+        crate::data::modelconfig::AsrEngine::Local => {
+            if explicit_sidecar_override_ready("LUMEN_CUT_ASR_SCRIPT") {
+                return Ok(());
+            }
+            let status = crate::asr::runtime_status();
+            if !status.runtime_ready {
+                return Err(AppError::Schema(
+                    "local transcription runtime is not installed; open Settings → Speech & models and install the transcription runtime"
+                        .into(),
+                ));
+            }
+            let model = model_override
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or(&config.asr_model);
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            if !crate::data::modelconfig::model_cached(&home, model) {
+                return Err(AppError::Schema(format!(
+                    "transcription model {model} is not downloaded; open Settings → Speech & models and download it"
+                )));
+            }
+            if !status.aligner_cached {
+                return Err(AppError::Schema(format!(
+                    "word-timing model {} is not downloaded; open Settings → Speech & models and download it",
+                    config.asr_aligner
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_speaker_preflight(model: &str) -> AppResult<()> {
+    if explicit_sidecar_override_ready("LUMEN_CUT_DIARIZE_SCRIPT") {
+        return Ok(());
+    }
+    let status = crate::asr::runtime_status();
+    if !status.diarize_runtime_ready {
+        return Err(AppError::Schema(
+            "speaker analysis runtime is not installed; open Settings → Speech & models and install the speaker runtime"
+                .into(),
+        ));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    if !crate::data::modelconfig::diarize_model_cached(&home, model) {
+        return Err(AppError::Schema(format!(
+            "speaker model {model} is not downloaded; open Settings → Speech & models and download it"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ai_provider_preflight(config: &crate::data::modelconfig::ModelConfig) -> AppResult<()> {
+    if !crate::data::modelconfig::llm_configured(config) {
+        return Err(AppError::Schema(
+            "AI provider is not configured; open Settings → AI features and choose a provider and model"
+                .into(),
+        ));
+    }
+    let endpoint = reqwest::Url::parse(config.llm_endpoint.trim())
+        .map_err(|_| AppError::Schema("AI provider URL is invalid; check it in Settings".into()))?;
+    if !matches!(endpoint.scheme(), "http" | "https") {
+        return Err(AppError::Schema(
+            "AI provider URL must use http or https; check it in Settings".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Tauri apps do not have a reliable working directory. Keep GUI projects in
@@ -184,6 +289,30 @@ pub async fn pick_broll_file(app: tauri::AppHandle) -> AppResult<Option<String>>
     }))
 }
 
+/// Pick a background-music file without blocking AppKit's event loop.
+#[tauri::command]
+pub async fn pick_audio_file(app: tauri::AppHandle) -> AppResult<Option<String>> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter(
+            "Audio",
+            &[
+                "aac", "aif", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav",
+            ],
+        )
+        .pick_file(move |selected| {
+            let _ = send.send(selected);
+        });
+    let selected = receive
+        .await
+        .map_err(|_| AppError::Schema("native file dialog closed unexpectedly".into()))?;
+    Ok(selected.and_then(|file| {
+        file.as_path()
+            .map(|path| path.to_string_lossy().into_owned())
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectArgs {
     pub pid: String,
@@ -204,12 +333,15 @@ pub struct ProjectSummary {
     pub paragraph_count: usize,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub starred: bool,
+    pub media_available: bool,
+    pub last_opened_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct ProjectLocalState {
     starred: bool,
+    last_opened_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn load_project_local_state(dir: &std::path::Path) -> ProjectLocalState {
@@ -228,6 +360,10 @@ fn project_summary(dir: PathBuf, doc: &Doc) -> ProjectSummary {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| doc.id.clone());
+    let local = load_project_local_state(&dir);
+    let updated_at = crate::data::activity::load(&dir)
+        .map(|activity| activity.max(doc.meta.updated_at))
+        .unwrap_or(doc.meta.updated_at);
     ProjectSummary {
         pid,
         title: doc.meta.title.clone(),
@@ -236,8 +372,10 @@ fn project_summary(dir: PathBuf, doc: &Doc) -> ProjectSummary {
         duration_seconds: doc.media.duration_seconds,
         word_count: doc.all_words().len(),
         paragraph_count: doc.paragraphs.len(),
-        updated_at: doc.meta.updated_at,
-        starred: load_project_local_state(&dir).starred,
+        updated_at,
+        starred: local.starred,
+        media_available: doc.media.path.is_file(),
+        last_opened_at: local.last_opened_at,
     }
 }
 
@@ -273,6 +411,14 @@ fn project_index(root: &std::path::Path, query: &str) -> AppResult<Vec<ProjectSu
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| {
             let dir = entry.path();
+            if let Err(error) = crate::data::version::recover_interrupted_restore(&dir) {
+                tracing::error!(
+                    project = %dir.display(),
+                    %error,
+                    "could not recover an interrupted project restore"
+                );
+                return None;
+            }
             let doc = Doc::load(&dir).ok()?;
             project_matches(&doc, query).then(|| project_summary(dir, &doc))
         })
@@ -281,7 +427,12 @@ fn project_index(root: &std::path::Path, query: &str) -> AppResult<Vec<ProjectSu
         right
             .starred
             .cmp(&left.starred)
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| {
+                right
+                    .last_opened_at
+                    .unwrap_or(right.updated_at)
+                    .cmp(&left.last_opened_at.unwrap_or(left.updated_at))
+            })
             .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
     });
     Ok(projects)
@@ -328,13 +479,19 @@ pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary
         paragraph_count: 0,
         updated_at: doc.meta.updated_at,
         starred: false,
+        media_available: true,
+        last_opened_at: None,
     })
 }
 
 #[tauri::command]
 pub async fn project_show(pid: String, root: Option<PathBuf>) -> AppResult<Doc> {
     let dir = resolve_project_dir(&pid, root)?;
-    run_blocking("project load", move || Doc::load(&dir)).await
+    run_blocking("project load", move || {
+        crate::data::version::recover_interrupted_restore(&dir)?;
+        Doc::load(&dir)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -362,7 +519,23 @@ pub async fn project_set_star(
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("project star update", move || {
         let doc = Doc::load(&dir)?;
-        save_project_local_state(&dir, &ProjectLocalState { starred })?;
+        let mut local = load_project_local_state(&dir);
+        local.starred = starred;
+        save_project_local_state(&dir, &local)?;
+        Ok(project_summary(dir, &doc))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn project_mark_opened(pid: String, root: Option<PathBuf>) -> AppResult<ProjectSummary> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("project recent update", move || {
+        let doc = Doc::load(&dir)?;
+        let mut local = load_project_local_state(&dir);
+        local.last_opened_at = Some(chrono::Utc::now());
+        save_project_local_state(&dir, &local)?;
         Ok(project_summary(dir, &doc))
     })
     .await
@@ -379,19 +552,34 @@ pub async fn project_update_meta(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("project metadata update", move || {
-        let mut doc = Doc::load(&dir)?;
-        let title = title.trim();
-        if title.is_empty() {
-            return Err(AppError::Schema("project title cannot be empty".into()));
-        }
-        doc.meta.title = title.to_string();
-        doc.meta.description = description.trim().to_string();
-        doc.meta.language = language
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        doc.meta.updated_at = chrono::Utc::now();
-        doc.save(&dir)?;
-        Ok(doc)
+        crate::data::edit_history::record(
+            &dir,
+            "Edit project details",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err(AppError::Schema("project title cannot be empty".into()));
+                }
+                let next_description = description.trim().to_string();
+                let next_language = language
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let changed = doc.meta.title != title
+                    || doc.meta.description != next_description
+                    || doc.meta.language != next_language;
+                if changed {
+                    doc.meta.title = title.to_string();
+                    doc.meta.description = next_description;
+                    doc.meta.language = next_language;
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok((doc, changed))
+            },
+            |(_, changed)| *changed,
+        )
+        .map(|(doc, _)| doc)
     })
     .await
 }
@@ -475,7 +663,7 @@ pub async fn project_delete(
             .active_tasks
             .lock()
             .expect("state poisoned")
-            .iter()
+            .keys()
             .any(|key| key.starts_with(&format!("{}::", dir.display())))
     {
         return Err(AppError::Schema(
@@ -495,14 +683,505 @@ pub async fn project_delete(
 /// filesystem path.
 pub struct MediaAssetState {
     current: Mutex<Option<PathBuf>>,
+    broll: Mutex<Option<PathBuf>>,
+    music: Mutex<HashSet<PathBuf>>,
+    timeline_cache: Mutex<Option<PathBuf>>,
+    project_thumbnails: Mutex<HashSet<PathBuf>>,
+    failed_project_thumbnails: Mutex<HashSet<PathBuf>>,
 }
 
 impl Default for MediaAssetState {
     fn default() -> Self {
         Self {
             current: Mutex::new(None),
+            broll: Mutex::new(None),
+            music: Mutex::new(HashSet::new()),
+            timeline_cache: Mutex::new(None),
+            project_thumbnails: Mutex::new(HashSet::new()),
+            failed_project_thumbnails: Mutex::new(HashSet::new()),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectThumbnail {
+    pub path: Option<String>,
+    pub media_available: bool,
+    pub deferred: bool,
+}
+
+fn allow_project_thumbnail_cache(
+    app: &tauri::AppHandle,
+    state: &MediaAssetState,
+    cache_dir: &std::path::Path,
+) -> AppResult<()> {
+    let mut allowed = state
+        .project_thumbnails
+        .lock()
+        .expect("project thumbnail state poisoned");
+    if allowed.insert(cache_dir.to_path_buf()) {
+        app.asset_protocol_scope()
+            .allow_directory(cache_dir, true)
+            .map_err(|error| AppError::Schema(format!("project thumbnail scope: {error}")))?;
+    }
+    Ok(())
+}
+
+fn project_thumbnail_args(
+    media: &std::path::Path,
+    duration: f64,
+    output: &std::path::Path,
+    audio_only: bool,
+) -> Vec<String> {
+    let mut args = vec!["-nostdin".into(), "-y".into(), "-v".into(), "error".into()];
+    if !audio_only {
+        args.extend([
+            "-ss".into(),
+            format!("{:.3}", (duration.max(0.0) * 0.1).min(30.0)),
+        ]);
+    }
+    args.extend(["-i".into(), media.to_string_lossy().into_owned()]);
+    if audio_only {
+        args.extend([
+            "-filter_complex".into(),
+            "aformat=channel_layouts=mono,showwavespic=s=640x360:colors=#9f4f24:scale=sqrt,format=yuvj420p".into(),
+            "-frames:v".into(),
+            "1".into(),
+        ]);
+    } else {
+        args.extend([
+            "-vf".into(),
+            "scale=640:360:force_original_aspect_ratio=increase,crop=640:360,format=yuvj420p"
+                .into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-q:v".into(),
+            "3".into(),
+        ]);
+    }
+    args.push(output.to_string_lossy().into_owned());
+    args
+}
+
+#[tauri::command]
+pub async fn project_thumbnail(
+    pid: String,
+    root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MediaAssetState>,
+) -> AppResult<ProjectThumbnail> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let prepared = run_blocking("project thumbnail cache validation", move || {
+        let doc = Doc::load(&dir)?;
+        if !doc.media.path.is_file() {
+            return Ok(None);
+        }
+        let media = std::fs::canonicalize(&doc.media.path)?;
+        let signature = timeline_visual_signature(&media)?;
+        let cache_dir = dir.join(".lumen-cut").join("project-thumbnail");
+        let thumbnail = cache_dir.join("thumbnail.jpg");
+        let cached = std::fs::read_to_string(cache_dir.join("manifest.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<TimelineVisualCache>(&raw).ok())
+            .is_some_and(|value| value == signature)
+            && thumbnail.is_file();
+        let audio_only = media
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "aac" | "aif" | "aiff" | "flac" | "m4a" | "mp3" | "ogg" | "opus" | "wav"
+                )
+            });
+        Ok(Some((
+            media,
+            doc.media.duration_seconds.max(0.001),
+            signature,
+            cache_dir,
+            thumbnail,
+            cached,
+            audio_only,
+        )))
+    })
+    .await?;
+
+    let Some((media, duration, signature, cache_dir, thumbnail, cached, audio_only)) = prepared
+    else {
+        return Ok(ProjectThumbnail {
+            path: None,
+            media_available: false,
+            deferred: false,
+        });
+    };
+    if cached {
+        allow_project_thumbnail_cache(&app, &state, &cache_dir)?;
+        return Ok(ProjectThumbnail {
+            path: Some(thumbnail.to_string_lossy().into_owned()),
+            media_available: true,
+            deferred: false,
+        });
+    }
+    if state
+        .failed_project_thumbnails
+        .lock()
+        .expect("project thumbnail failure state poisoned")
+        .contains(&cache_dir)
+    {
+        return Ok(ProjectThumbnail {
+            path: None,
+            media_available: true,
+            deferred: false,
+        });
+    }
+    if crate::performance::active_heavy_label().is_some() {
+        return Ok(ProjectThumbnail {
+            path: None,
+            media_available: true,
+            deferred: true,
+        });
+    }
+
+    let _heavy_work = crate::performance::acquire_heavy("project-thumbnail").await?;
+    tokio::fs::create_dir_all(&cache_dir).await?;
+    let temporary = cache_dir.join("thumbnail.tmp.jpg");
+    let _ = tokio::fs::remove_file(&temporary).await;
+    let args = project_thumbnail_args(&media, duration, &temporary, audio_only);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        crate::proc::run("ffmpeg", &arg_refs),
+    )
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            state
+                .failed_project_thumbnails
+                .lock()
+                .expect("project thumbnail failure state poisoned")
+                .insert(cache_dir);
+            tracing::warn!(
+                project = %pid,
+                media = %media.display(),
+                "project thumbnail timed out; continuing without a thumbnail"
+            );
+            return Ok(ProjectThumbnail {
+                path: None,
+                media_available: true,
+                deferred: true,
+            });
+        }
+    }
+    let bytes = tokio::fs::read(&temporary).await?;
+    crate::data::storage::write(&thumbnail, &bytes)?;
+    let _ = tokio::fs::remove_file(&temporary).await;
+    crate::data::storage::write_json(&cache_dir.join("manifest.json"), &signature)?;
+    allow_project_thumbnail_cache(&app, &state, &cache_dir)?;
+    Ok(ProjectThumbnail {
+        path: Some(thumbnail.to_string_lossy().into_owned()),
+        media_available: true,
+        deferred: false,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMediaStatus {
+    pub path: PathBuf,
+    pub available: bool,
+    pub file_size: Option<u64>,
+    pub expected_duration_seconds: f64,
+    pub issue: Option<String>,
+    pub suggested_path: Option<PathBuf>,
+}
+
+fn find_nearby_media(project_dir: &std::path::Path, missing: &std::path::Path) -> Option<PathBuf> {
+    let target = missing.file_name()?;
+    let mut roots = Vec::new();
+    if let Some(parent) = missing.parent().filter(|parent| parent.is_dir()) {
+        roots.push(parent.to_path_buf());
+    }
+    roots.push(project_dir.to_path_buf());
+    if let Some(root) = project_dir.parent() {
+        roots.push(root.to_path_buf());
+    }
+
+    let mut candidates = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut budget = 2_000usize;
+    let mut pending = roots
+        .into_iter()
+        .map(|path| (path, 0usize))
+        .collect::<std::collections::VecDeque<_>>();
+    while let Some((directory, depth)) = pending.pop_front() {
+        if budget == 0 {
+            break;
+        }
+        let canonical = match std::fs::canonicalize(&directory) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !visited.insert(canonical.clone()) {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&canonical) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+            if kind.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&target.to_string_lossy())
+                && path != missing
+            {
+                candidates.push(path);
+                if candidates.len() > 1 {
+                    return None;
+                }
+            } else if kind.is_dir()
+                && depth < 2
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                pending.push_back((path, depth + 1));
+            }
+        }
+    }
+    candidates.pop()
+}
+
+#[tauri::command]
+pub async fn project_media_status(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<ProjectMediaStatus> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("project media status", move || {
+        let doc = Doc::load(&dir)?;
+        match std::fs::metadata(&doc.media.path) {
+            Ok(metadata) if metadata.is_file() => Ok(ProjectMediaStatus {
+                path: doc.media.path,
+                available: true,
+                file_size: Some(metadata.len()),
+                expected_duration_seconds: doc.media.duration_seconds,
+                issue: None,
+                suggested_path: None,
+            }),
+            Ok(_) => Ok(ProjectMediaStatus {
+                suggested_path: find_nearby_media(&dir, &doc.media.path),
+                path: doc.media.path,
+                available: false,
+                file_size: None,
+                expected_duration_seconds: doc.media.duration_seconds,
+                issue: Some("the saved media path is not a file".into()),
+            }),
+            Err(error) => {
+                let suggested_path = find_nearby_media(&dir, &doc.media.path);
+                Ok(ProjectMediaStatus {
+                    path: doc.media.path,
+                    available: false,
+                    file_size: None,
+                    expected_duration_seconds: doc.media.duration_seconds,
+                    issue: Some(if error.kind() == std::io::ErrorKind::NotFound {
+                        "the original media file is missing or was moved".into()
+                    } else {
+                        format!("the original media file cannot be read: {error}")
+                    }),
+                    suggested_path,
+                })
+            }
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn project_media_relink(
+    pid: String,
+    path: PathBuf,
+    root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MediaAssetState>,
+) -> AppResult<Doc> {
+    let media_path = tokio::fs::canonicalize(path).await?;
+    let metadata = tokio::fs::metadata(&media_path).await?;
+    if !metadata.is_file() {
+        return Err(AppError::Schema(
+            "replacement media path is not a file".into(),
+        ));
+    }
+    let info = probe(&media_path).await?;
+    if !info.duration_seconds.is_finite() || info.duration_seconds <= 0.0 {
+        return Err(AppError::Schema(
+            "replacement file has no readable audio or video duration".into(),
+        ));
+    }
+
+    let dir = resolve_project_dir(&pid, root)?;
+    let cache_dir = dir.join(".lumen-cut").join("timeline-visuals");
+    let _mutation = lock_project_mutation(&dir).await;
+    let saved_media_path = media_path.clone();
+    let (doc, changed) = run_blocking("project media relink", move || {
+        let mut doc = Doc::load(&dir)?;
+        let expected = doc.media.duration_seconds;
+        let difference = (info.duration_seconds - expected).abs();
+        let tolerance = (expected * 0.02).max(2.0);
+        if expected > 0.0 && difference > tolerance {
+            return Err(AppError::Schema(format!(
+                "replacement duration differs from this project by {:.1}s (expected {:.1}s, found {:.1}s); choose the original media or an equivalent copy",
+                difference, expected, info.duration_seconds
+            )));
+        }
+        let changed = doc.media.path != saved_media_path
+            || (doc.media.duration_seconds - info.duration_seconds).abs() > f64::EPSILON
+            || doc.media.sample_rate != info.sample_rate
+            || doc.media.channels != info.channels;
+        let result = crate::data::edit_history::record(
+            &dir,
+            "Relink project media",
+            || {
+                doc.media.path = saved_media_path;
+                doc.media.duration_seconds = info.duration_seconds;
+                doc.media.sample_rate = info.sample_rate;
+                doc.media.channels = info.channels;
+                doc.meta.updated_at = chrono::Utc::now();
+                doc.save(&dir)?;
+                Ok((doc, changed))
+            },
+            |(_, changed)| *changed,
+        )?;
+        Ok(result)
+    })
+    .await?;
+
+    if changed {
+        let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+    }
+    let scope = app.asset_protocol_scope();
+    {
+        let mut current = state.current.lock().expect("media asset state poisoned");
+        if let Some(previous) = current.as_ref().filter(|path| *path != &media_path) {
+            scope
+                .forbid_file(previous)
+                .map_err(|error| AppError::Schema(format!("media scope: {error}")))?;
+        }
+        scope
+            .allow_file(&media_path)
+            .map_err(|error| AppError::Schema(format!("media scope: {error}")))?;
+        *current = Some(media_path);
+    }
+    {
+        let mut timeline_cache = state
+            .timeline_cache
+            .lock()
+            .expect("timeline asset state poisoned");
+        if let Some(previous) = timeline_cache.take() {
+            let _ = scope.forbid_directory(previous, true);
+        }
+    }
+    Ok(doc)
+}
+
+#[tauri::command]
+pub async fn broll_asset_allow(
+    pid: String,
+    id: String,
+    root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MediaAssetState>,
+) -> AppResult<String> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let asset = run_blocking("B-roll asset validation", move || {
+        let placement = crate::data::broll::load(&dir)?
+            .into_iter()
+            .find(|placement| placement.id == id)
+            .ok_or_else(|| AppError::Schema(format!("B-roll id {id} not found")))?;
+        let asset = std::fs::canonicalize(placement.file)?;
+        if !asset.is_file() {
+            return Err(AppError::ProjectNotFound(asset));
+        }
+        Ok(asset)
+    })
+    .await?;
+
+    let scope = app.asset_protocol_scope();
+    let mut current = state.broll.lock().expect("B-roll asset state poisoned");
+    if let Some(previous) = current.as_ref().filter(|path| *path != &asset) {
+        scope
+            .forbid_file(previous)
+            .map_err(|error| AppError::Schema(format!("B-roll media scope: {error}")))?;
+    }
+    scope
+        .allow_file(&asset)
+        .map_err(|error| AppError::Schema(format!("B-roll media scope: {error}")))?;
+    *current = Some(asset.clone());
+    Ok(asset.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn audio_asset_allow(
+    pid: String,
+    music_id: String,
+    root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MediaAssetState>,
+) -> AppResult<String> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let (asset, current_assets) = run_blocking("music asset validation", move || {
+        let mix = crate::data::audio_mix::load(&dir)?;
+        let track = mix
+            .music
+            .iter()
+            .find(|track| track.id == music_id)
+            .ok_or_else(|| AppError::Schema(format!("music track {music_id} not found")))?;
+        let asset = std::fs::canonicalize(&track.path)?;
+        if !asset.is_file() {
+            return Err(AppError::ProjectNotFound(asset));
+        }
+        let current_assets = mix
+            .music
+            .iter()
+            .filter_map(|track| std::fs::canonicalize(&track.path).ok())
+            .collect::<HashSet<_>>();
+        Ok((asset, current_assets))
+    })
+    .await?;
+
+    let scope = app.asset_protocol_scope();
+    let mut allowed = state.music.lock().expect("music asset state poisoned");
+    let stale = allowed
+        .difference(&current_assets)
+        .cloned()
+        .collect::<Vec<_>>();
+    for previous in stale {
+        scope
+            .forbid_file(&previous)
+            .map_err(|error| AppError::Schema(format!("music media scope: {error}")))?;
+        allowed.remove(&previous);
+    }
+    if allowed.insert(asset.clone()) {
+        scope
+            .allow_file(&asset)
+            .map_err(|error| AppError::Schema(format!("music media scope: {error}")))?;
+    }
+    Ok(asset.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -535,6 +1214,199 @@ pub async fn media_asset_allow(
         .map_err(|error| AppError::Schema(format!("media scope: {error}")))?;
     *current = Some(media_path.clone());
     Ok(media_path.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineVisuals {
+    pub contact_sheet: Option<String>,
+    pub waveform: Option<String>,
+    pub deferred: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TimelineVisualCache {
+    version: u32,
+    media_size: u64,
+    media_modified_ms: u128,
+}
+
+fn timeline_visual_signature(path: &std::path::Path) -> AppResult<TimelineVisualCache> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::Schema(format!("media modification time: {error}")))?;
+    Ok(TimelineVisualCache {
+        version: 1,
+        media_size: metadata.len(),
+        media_modified_ms: modified.as_millis(),
+    })
+}
+
+fn contact_sheet_args(media: &str, duration: f64, output: &str) -> Vec<String> {
+    const FRAMES: usize = 12;
+    let mut args = vec!["-nostdin".into(), "-y".into(), "-v".into(), "error".into()];
+    for index in 0..FRAMES {
+        let at = duration * (index as f64 + 0.5) / FRAMES as f64;
+        args.extend(["-ss".into(), format!("{at:.3}"), "-i".into(), media.into()]);
+    }
+    let mut filter = (0..FRAMES)
+        .map(|index| {
+            format!(
+                "[{index}:v]scale=120:68:force_original_aspect_ratio=increase,\
+                 crop=120:68,setsar=1,setpts=PTS-STARTPTS[v{index}]"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    filter.push(';');
+    for index in 0..FRAMES {
+        filter.push_str(&format!("[v{index}]"));
+    }
+    filter.push_str(&format!("hstack=inputs={FRAMES}[out]"));
+    args.extend([
+        "-filter_complex".into(),
+        filter,
+        "-map".into(),
+        "[out]".into(),
+        "-frames:v".into(),
+        "1".into(),
+        output.into(),
+    ]);
+    args
+}
+
+fn allow_timeline_cache(
+    app: &tauri::AppHandle,
+    state: &MediaAssetState,
+    cache_dir: &std::path::Path,
+) -> AppResult<()> {
+    let scope = app.asset_protocol_scope();
+    let mut current = state
+        .timeline_cache
+        .lock()
+        .expect("timeline asset state poisoned");
+    if let Some(previous) = current.as_ref().filter(|path| *path != cache_dir) {
+        scope
+            .forbid_directory(previous, true)
+            .map_err(|error| AppError::Schema(format!("timeline visual scope: {error}")))?;
+    }
+    scope
+        .allow_directory(cache_dir, true)
+        .map_err(|error| AppError::Schema(format!("timeline visual scope: {error}")))?;
+    *current = Some(cache_dir.to_path_buf());
+    Ok(())
+}
+
+/// Prepare a compact contact sheet and waveform for the timeline. Generation
+/// is cached by media identity and runs through async child processes, never
+/// on AppKit's event thread.
+#[tauri::command]
+pub async fn timeline_visuals(
+    pid: String,
+    root: Option<PathBuf>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MediaAssetState>,
+) -> AppResult<TimelineVisuals> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let (media, duration, signature, cache_dir, cached) =
+        run_blocking("timeline visual cache validation", move || {
+            let doc = Doc::load(&dir)?;
+            let media = std::fs::canonicalize(&doc.media.path)?;
+            if !media.is_file() {
+                return Err(AppError::ProjectNotFound(media));
+            }
+            let signature = timeline_visual_signature(&media)?;
+            let cache_dir = dir.join(".lumen-cut").join("timeline-visuals");
+            let manifest = cache_dir.join("manifest.json");
+            let cached = std::fs::read_to_string(&manifest)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<TimelineVisualCache>(&raw).ok())
+                .is_some_and(|value| value == signature);
+            Ok((
+                media,
+                doc.media.duration_seconds.max(0.001),
+                signature,
+                cache_dir,
+                cached,
+            ))
+        })
+        .await?;
+
+    let contact_sheet = cache_dir.join("contact-sheet.jpg");
+    let waveform = cache_dir.join("waveform.png");
+    let existing = |path: &std::path::Path| path.is_file().then(|| path.to_path_buf());
+    if cached {
+        allow_timeline_cache(&app, &state, &cache_dir)?;
+        return Ok(TimelineVisuals {
+            contact_sheet: existing(&contact_sheet).map(|path| path.to_string_lossy().into_owned()),
+            waveform: existing(&waveform).map(|path| path.to_string_lossy().into_owned()),
+            deferred: false,
+        });
+    }
+
+    if crate::performance::active_heavy_label().is_some() {
+        return Ok(TimelineVisuals {
+            contact_sheet: None,
+            waveform: None,
+            deferred: true,
+        });
+    }
+    let _heavy_work = crate::performance::acquire_heavy("timeline-visuals").await?;
+    tokio::fs::create_dir_all(&cache_dir).await?;
+    let _ = tokio::fs::remove_file(&contact_sheet).await;
+    let _ = tokio::fs::remove_file(&waveform).await;
+    let media_arg = media.to_string_lossy().into_owned();
+
+    let audio_only = media
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "aac" | "aif" | "aiff" | "flac" | "m4a" | "mp3" | "ogg" | "opus" | "wav"
+            )
+        });
+    if !audio_only {
+        let output = contact_sheet.to_string_lossy().into_owned();
+        let args = contact_sheet_args(&media_arg, duration, &output);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = crate::proc::run("ffmpeg", &refs).await;
+    }
+
+    let waveform_output = waveform.to_string_lossy().into_owned();
+    let _ = crate::proc::run(
+        "ffmpeg",
+        &[
+            "-nostdin",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            &media_arg,
+            "-filter_complex",
+            "aformat=channel_layouts=mono,showwavespic=s=1440x64:colors=#9f4f24:scale=sqrt",
+            "-frames:v",
+            "1",
+            &waveform_output,
+        ],
+    )
+    .await;
+
+    if !contact_sheet.is_file() && !waveform.is_file() {
+        return Err(AppError::Schema(
+            "ffmpeg could not create timeline thumbnails or a waveform".into(),
+        ));
+    }
+    crate::data::storage::write_json(&cache_dir.join("manifest.json"), &signature)?;
+    allow_timeline_cache(&app, &state, &cache_dir)?;
+    Ok(TimelineVisuals {
+        contact_sheet: existing(&contact_sheet).map(|path| path.to_string_lossy().into_owned()),
+        waveform: existing(&waveform).map(|path| path.to_string_lossy().into_owned()),
+        deferred: false,
+    })
 }
 
 // ============================================================================
@@ -582,6 +1454,96 @@ fn ensure_not_cancelled() -> AppResult<()> {
     }
 }
 
+fn remove_if_present(path: &std::path::Path) -> AppResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn invalidate_transcript_derived_state(dir: &std::path::Path) -> AppResult<()> {
+    for name in ["hidden.json", "cuts.json", "chapters.json"] {
+        remove_if_present(&dir.join(name))?;
+    }
+    for path in [dir.join("ai"), dir.join(".lumen-cut").join("edit-history")] {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn persist_transcription_result(doc: Doc, pid_dir: PathBuf) -> AppResult<AutoResult> {
+    let previous = Doc::load(&pid_dir)
+        .ok()
+        .filter(|doc| !doc.paragraphs.is_empty());
+    let mut recovery = None;
+    if let Some(previous) = previous {
+        let mut lineage = crate::data::version::Lineage::load(&pid_dir)?;
+        let branch = lineage
+            .active_branch
+            .clone()
+            .unwrap_or_else(|| "main".into());
+        let id = crate::data::version::commit_snapshot(
+            &pid_dir,
+            &previous,
+            &mut lineage,
+            &branch,
+            "Before retranscription",
+            "Automatic recovery point before replacing the transcript",
+            crate::data::version::VersionKind::Auto,
+        )?;
+        recovery = Some((lineage, id));
+    }
+
+    let apply = || {
+        if recovery.is_some() {
+            // A retranscription must write a genuinely fresh document.
+            // Doc::save normally preserves forward-compatible fields, but
+            // cue-derived fields such as chapters belong to the old word IDs.
+            remove_if_present(&pid_dir.join("doc.json"))?;
+            invalidate_transcript_derived_state(&pid_dir)?;
+        }
+        doc.save(&pid_dir)?;
+        let srt = pid_dir.join("out.srt");
+        let vtt = pid_dir.join("out.vtt");
+        let ass = pid_dir.join("out.ass");
+        let md = pid_dir.join("out.md");
+        write_srt(&doc, &srt)?;
+        write_vtt(&doc, &vtt)?;
+        write_ass(&doc, &ass, 1920, 1080)?;
+        write_md(&doc, &md)?;
+        Ok(AutoResult {
+            pid_dir: pid_dir.clone(),
+            srt,
+            vtt,
+            ass,
+            md,
+            word_count: doc.all_words().len(),
+            paragraph_count: doc.paragraphs.len(),
+        })
+    };
+
+    match apply() {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if let Some((mut lineage, id)) = recovery {
+                if let Err(restore_error) =
+                    crate::data::version::restore_snapshot(&pid_dir, &mut lineage, &id)
+                {
+                    return Err(AppError::Schema(format!(
+                        "retranscription failed ({error}) and recovery failed ({restore_error})"
+                    )));
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn run_auto_impl<F>(args: AutoArgs, report: F) -> AppResult<AutoResult>
 where
     F: Fn(&str, u8, Option<crate::asr::AsrProgress>) + Send + Sync + 'static,
@@ -591,6 +1553,13 @@ where
     let _heavy_work = crate::performance::acquire_heavy("transcription").await?;
     report("preparing", 5, None);
     ensure_not_cancelled()?;
+    let model_override = args.model.clone();
+    let model_config = run_blocking("transcription preflight", move || {
+        let config = crate::data::modelconfig::load();
+        validate_transcription_preflight(&config, model_override.as_deref())?;
+        Ok(config)
+    })
+    .await?;
     let out_dir = resolve_project_root(args.out);
     tokio::fs::create_dir_all(&out_dir).await?;
 
@@ -629,7 +1598,6 @@ where
     });
     let pid_dir = out_dir.join(&pid_stem);
     tokio::fs::create_dir_all(&pid_dir).await?;
-    let _mutation = lock_project_mutation(&pid_dir).await;
     let wav = pid_dir.join("audio.wav");
     // A recording project already uses `<pid>/audio.wav` as its media source.
     // Avoid asking ffmpeg to overwrite its own input.
@@ -642,22 +1610,41 @@ where
     let info = probe(&media_path).await?;
     ensure_not_cancelled()?;
 
-    let model_config =
-        run_blocking("model config load", || Ok(crate::data::modelconfig::load())).await?;
-    let model = args.model.as_deref().unwrap_or(&model_config.asr_model);
     report("transcribing", 45, None);
     let progress_report = report.clone();
-    let asr_out = crate::asr::transcribe_file_with_aligner_progress(
-        &wav,
-        model,
-        args.lang.as_deref(),
-        Some(&model_config.asr_aligner),
-        Some(Arc::new(move |progress| {
-            let phase = progress.phase.clone();
-            progress_report(&phase, progress.progress, Some(progress));
-        })),
-    )
-    .await?;
+    let progress_callback = Some(Arc::new(move |progress: crate::asr::AsrProgress| {
+        let phase = progress.phase.clone();
+        progress_report(&phase, progress.progress, Some(progress));
+    }) as crate::asr::AsrProgressCallback);
+    let asr_out = match model_config.asr_engine {
+        crate::data::modelconfig::AsrEngine::Local => {
+            let model = args.model.as_deref().unwrap_or(&model_config.asr_model);
+            crate::asr::transcribe_file_with_aligner_progress(
+                &wav,
+                model,
+                args.lang.as_deref(),
+                Some(&model_config.asr_aligner),
+                progress_callback,
+            )
+            .await?
+        }
+        crate::data::modelconfig::AsrEngine::OpenaiCompatible => {
+            let model = args
+                .model
+                .as_deref()
+                .unwrap_or(&model_config.asr_cloud_model);
+            crate::asr::cloud::transcribe_file(
+                &wav,
+                info.duration_seconds,
+                &model_config.asr_cloud_endpoint,
+                &model_config.asr_cloud_api_key,
+                model,
+                args.lang.as_deref(),
+                progress_callback,
+            )
+            .await?
+        }
+    };
     ensure_not_cancelled()?;
 
     report("saving", 88, None);
@@ -673,25 +1660,11 @@ where
     normalize_transcription_doc(&mut doc, args.lang.clone());
     doc.meta.updated_at = chrono::Utc::now();
     report("exporting", 94, None);
+    // Transcription can take minutes. Keep editing responsive while compute or
+    // network work runs, and serialize only the final authoritative swap.
+    let _mutation = lock_project_mutation(&pid_dir).await;
     let result = run_blocking("project save and subtitle export", move || {
-        doc.save(&pid_dir)?;
-        let srt = pid_dir.join("out.srt");
-        let vtt = pid_dir.join("out.vtt");
-        let ass = pid_dir.join("out.ass");
-        let md = pid_dir.join("out.md");
-        write_srt(&doc, &srt)?;
-        write_vtt(&doc, &vtt)?;
-        write_ass(&doc, &ass, 1920, 1080)?;
-        write_md(&doc, &md)?;
-        Ok(AutoResult {
-            pid_dir,
-            srt,
-            vtt,
-            ass,
-            md,
-            word_count: doc.all_words().len(),
-            paragraph_count: doc.paragraphs.len(),
-        })
+        persist_transcription_result(doc, pid_dir)
     })
     .await?;
     report("completed", 100, None);
@@ -728,12 +1701,17 @@ pub struct TranscriptionJobStatus {
     pub mlx_active_memory_mb: Option<u64>,
     #[serde(default)]
     pub mlx_cache_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
     pub error: Option<String>,
 }
 
 struct TranscriptionJob {
     status: TranscriptionJobStatus,
     cancel: Arc<AtomicBool>,
+    status_path: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -771,6 +1749,7 @@ fn load_recovered_transcription_status(
             "the previous transcription was interrupted when lumen-cut closed; retry to start it again"
                 .into(),
         );
+        status.updated_at = Some(unix_timestamp_seconds());
         save_transcription_status(path, &status)?;
     }
     Ok(status)
@@ -797,7 +1776,8 @@ fn update_transcription_job(
             );
         }
         job.status.phase = phase.to_string();
-        job.status.progress = progress;
+        job.status.progress = advance_progress(job.status.progress, progress);
+        job.status.updated_at = Some(unix_timestamp_seconds());
         if let Some(details) = details {
             job.status.current = details.current;
             job.status.total = details.total;
@@ -830,6 +1810,7 @@ pub async fn transcription_start(
     let remove_incomplete_url_project = (args.media.starts_with("http://")
         || args.media.starts_with("https://"))
         && !job_dir.join("doc.json").exists();
+    let now = unix_timestamp_seconds();
     let status = TranscriptionJobStatus {
         pid: pid.clone(),
         state: "running".into(),
@@ -844,6 +1825,8 @@ pub async fn transcription_start(
         memory_limit_mb: None,
         mlx_active_memory_mb: None,
         mlx_cache_memory_mb: None,
+        started_at: Some(now),
+        updated_at: Some(now),
         error: None,
     };
     {
@@ -861,6 +1844,7 @@ pub async fn transcription_start(
             TranscriptionJob {
                 status: status.clone(),
                 cancel: cancel.clone(),
+                status_path: status_path.clone(),
             },
         );
     }
@@ -916,8 +1900,16 @@ pub async fn transcription_start(
                     status.error = Some(error.to_string());
                 }
             }
+            status.updated_at = Some(unix_timestamp_seconds());
             status
         };
+        if let Some(job) = jobs
+            .lock()
+            .expect("transcription state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         let persisted = final_status.clone();
         if let Err(error) = persist_background_status(
             "save final transcription status",
@@ -955,14 +1947,41 @@ pub async fn transcription_status(
     pid: String,
     state: tauri::State<'_, TranscriptionState>,
 ) -> AppResult<TranscriptionJobStatus> {
-    if let Some(status) = state
+    let active = state
         .jobs
         .lock()
         .expect("transcription state poisoned")
         .get(&pid)
-        .map(|job| job.status.clone())
-    {
-        return Ok(status);
+        .map(|job| (job.status.clone(), job.status_path.clone()));
+    if let Some((status, path)) = active {
+        persist_background_status(
+            "checkpoint transcription status",
+            path.clone(),
+            status.clone(),
+            save_transcription_status,
+        )
+        .await?;
+        let latest = state
+            .jobs
+            .lock()
+            .expect("transcription state poisoned")
+            .get(&pid)
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| status.clone());
+        if latest.state != status.state
+            || latest.phase != status.phase
+            || latest.progress != status.progress
+            || latest.updated_at != status.updated_at
+        {
+            persist_background_status(
+                "checkpoint latest transcription status",
+                path,
+                latest.clone(),
+                save_transcription_status,
+            )
+            .await?;
+        }
+        return Ok(latest);
     }
     let status_path = transcription_status_path(&pid, None)?;
     run_blocking("load transcription status", move || {
@@ -981,16 +2000,56 @@ pub async fn transcription_cancel(
     pid: String,
     state: tauri::State<'_, TranscriptionState>,
 ) -> AppResult<TranscriptionJobStatus> {
-    let mut jobs = state.jobs.lock().expect("transcription state poisoned");
-    let job = jobs
-        .get_mut(&pid)
-        .ok_or_else(|| AppError::Schema("no transcription job for this project".into()))?;
-    if job.status.state == "running" {
-        job.cancel.store(true, Ordering::Relaxed);
-        job.status.state = "cancelling".into();
-        job.status.phase = "cancelling".into();
-    }
-    Ok(job.status.clone())
+    let (status, path) = {
+        let mut jobs = state.jobs.lock().expect("transcription state poisoned");
+        let job = jobs
+            .get_mut(&pid)
+            .ok_or_else(|| AppError::Schema("no transcription job for this project".into()))?;
+        if job.status.state == "running" {
+            job.cancel.store(true, Ordering::Relaxed);
+            job.status.state = "cancelling".into();
+            job.status.phase = "cancelling".into();
+            job.status.updated_at = Some(unix_timestamp_seconds());
+        }
+        (job.status.clone(), job.status_path.clone())
+    };
+    persist_background_status(
+        "checkpoint transcription cancellation",
+        path,
+        status.clone(),
+        save_transcription_status,
+    )
+    .await?;
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn transcription_retry(
+    pid: String,
+    state: tauri::State<'_, TranscriptionState>,
+) -> AppResult<TranscriptionJobStatus> {
+    let dir = resolve_project_dir(&pid, None)?;
+    let (media, lang, title) = run_blocking("transcription retry preparation", move || {
+        let doc = Doc::load(&dir)?;
+        Ok((
+            doc.media.path.to_string_lossy().into_owned(),
+            doc.meta.language,
+            Some(doc.meta.title),
+        ))
+    })
+    .await?;
+    transcription_start(
+        AutoArgs {
+            media,
+            pid: Some(pid),
+            lang,
+            title,
+            out: None,
+            model: None,
+        },
+        state,
+    )
+    .await
 }
 
 // ============================================================================
@@ -1022,13 +2081,25 @@ async fn launch_prepared_task(
     pid: String,
     task: crate::agent::task::PreparedTask,
 ) -> AppResult<(u16, bool, usize)> {
+    run_blocking("AI provider preflight", || {
+        validate_ai_provider_preflight(&crate::data::modelconfig::load())
+    })
+    .await?;
     let key = format!("{}::{}", task.project_dir.display(), task.kind);
     let (agent_port, allocator) = ensure_agent_server(state, None).await?;
+    let pause = Arc::new(AtomicBool::new(false));
     {
         let mut active = state.active_tasks.lock().expect("state poisoned");
-        if !active.insert(key.clone()) {
+        if active.contains_key(&key) {
             return Ok((agent_port, false, 0));
         }
+        active.insert(
+            key.clone(),
+            ActiveAgentTask {
+                pause: pause.clone(),
+                task: task.clone(),
+            },
+        );
     }
     let restore_allocator = allocator.clone();
     let restore_task = task.clone();
@@ -1063,11 +2134,12 @@ async fn launch_prepared_task(
         "pipeline job started"
     );
     tokio::spawn(async move {
-        let result = crate::agent::task::wait_and_apply_with_lock(
+        let result = crate::agent::task::wait_and_apply_with_lock_and_pause(
             allocator,
             task,
             std::time::Duration::from_secs(30 * 60),
             project_mutation,
+            pause,
         )
         .await;
         let terminal_state = match &result {
@@ -1119,7 +2191,9 @@ pub async fn task_start(
     let kind = args.kind;
     let lang = args.lang;
     let task = run_blocking("task preparation", move || {
-        if let Some(task) = crate::agent::task::load_recoverable_task(&dir, &kind)? {
+        if let Some(task) =
+            crate::agent::task::load_matching_recoverable_task(&dir, &kind, lang.as_deref())?
+        {
             Ok(task)
         } else {
             crate::agent::task::prepare_task_with_task_options(
@@ -1161,7 +2235,7 @@ pub async fn task_resume(
 ) -> AppResult<TaskResumeResult> {
     let dir = resolve_project_dir(&pid, root)?;
     let tasks = run_blocking("load recoverable tasks", move || {
-        crate::agent::task::load_recoverable_tasks(&dir)
+        crate::agent::task::load_resumable_tasks(&dir)
     })
     .await?;
     let mut resumed = 0;
@@ -1182,16 +2256,154 @@ pub async fn task_resume(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskKindStatus {
-    pub kind: String,
-    pub lang: Option<String>,
-    pub state: String,
-    pub calls: usize,
-    pub pending: usize,
-    pub done: usize,
-    pub failed: usize,
-    pub last_error: Option<String>,
-    pub updated_at: Option<u64>,
+pub struct TaskPauseResult {
+    pub paused: usize,
+    pub queued_calls: usize,
+    pub in_flight_calls: usize,
+}
+
+#[tauri::command]
+pub async fn task_pause(
+    state: tauri::State<'_, AgentServerState>,
+    pid: String,
+    kind: Option<String>,
+    root: Option<PathBuf>,
+) -> AppResult<TaskPauseResult> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let prefix = format!("{}::", dir.display());
+    let active = state
+        .active_tasks
+        .lock()
+        .expect("state poisoned")
+        .iter()
+        .filter(|(key, task)| {
+            key.starts_with(&prefix) && kind.as_deref().is_none_or(|kind| task.task.kind == kind)
+        })
+        .map(|(_, task)| task.clone())
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(TaskPauseResult {
+            paused: 0,
+            queued_calls: 0,
+            in_flight_calls: 0,
+        });
+    }
+
+    let allocator = state
+        .allocator
+        .lock()
+        .expect("state poisoned")
+        .as_ref()
+        .map(|handle| handle.allocator.clone());
+    let mut queued_calls = 0;
+    let mut in_flight_calls = 0;
+    for item in &active {
+        item.pause.store(true, Ordering::Relaxed);
+        if let Some(allocator) = allocator.as_ref() {
+            let ids = item
+                .task
+                .calls
+                .iter()
+                .map(|prepared| prepared.call.id.clone())
+                .collect::<HashSet<_>>();
+            let (queued, in_flight) = allocator.pause_calls(&ids);
+            queued_calls += queued;
+            in_flight_calls += in_flight;
+        }
+    }
+    let tasks = active
+        .iter()
+        .map(|item| item.task.clone())
+        .collect::<Vec<_>>();
+    run_blocking("persist paused tasks", move || {
+        for task in &tasks {
+            crate::agent::task::set_task_state(
+                task,
+                "paused",
+                Some("Paused by user; in-flight model requests may finish and will be preserved."),
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
+
+    Ok(TaskPauseResult {
+        paused: active.len(),
+        queued_calls,
+        in_flight_calls,
+    })
+}
+
+#[tauri::command]
+pub async fn task_retry(
+    state: tauri::State<'_, AgentServerState>,
+    pid: String,
+    kind: String,
+    root: Option<PathBuf>,
+) -> AppResult<TaskStartResult> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let key = format!("{}::{kind}", dir.display());
+    if state
+        .active_tasks
+        .lock()
+        .expect("state poisoned")
+        .contains_key(&key)
+    {
+        return Err(AppError::Schema(format!(
+            "task {kind} is still running; pause it before retrying"
+        )));
+    }
+    let task = run_blocking("retry task preparation", move || {
+        crate::agent::task::prepare_retry_task(&dir, &kind)
+    })
+    .await?;
+    let pending = task.calls.len();
+    let ai_dir = task.ai_dir.clone();
+    let (agent_port, _, _) = launch_prepared_task(&state, pid, task).await?;
+    Ok(TaskStartResult {
+        pending,
+        ai_dir,
+        agent_port,
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPrioritizeResult {
+    pub moved_calls: usize,
+}
+
+#[tauri::command]
+pub async fn task_prioritize(
+    state: tauri::State<'_, AgentServerState>,
+    pid: String,
+    kind: String,
+    root: Option<PathBuf>,
+) -> AppResult<TaskPrioritizeResult> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let key = format!("{}::{kind}", dir.display());
+    let task = state
+        .active_tasks
+        .lock()
+        .expect("state poisoned")
+        .get(&key)
+        .map(|active| active.task.clone())
+        .ok_or_else(|| AppError::Schema(format!("task {kind} is not currently running")))?;
+    let allocator = state
+        .allocator
+        .lock()
+        .expect("state poisoned")
+        .as_ref()
+        .map(|handle| handle.allocator.clone())
+        .ok_or_else(|| AppError::Schema("agent allocator is not running".into()))?;
+    let ids = task
+        .calls
+        .iter()
+        .map(|prepared| prepared.call.id.clone())
+        .collect::<HashSet<_>>();
+    Ok(TaskPrioritizeResult {
+        moved_calls: allocator.prioritize_calls(&ids),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1199,134 +2411,19 @@ pub struct TaskKindStatus {
 pub struct TaskStatus {
     pub pending: usize,
     pub done: usize,
-    pub kinds: Vec<TaskKindStatus>,
+    pub failed: usize,
+    pub kinds: Vec<crate::agent::task::TaskKindStatus>,
     pub polish_quality: Option<crate::pipeline::polish::PolishQualityArtifact>,
-}
-
-fn task_kind_statuses(project_dir: &std::path::Path) -> Vec<TaskKindStatus> {
-    let ai_dir = project_dir.join("ai");
-    let Ok(entries) = std::fs::read_dir(ai_dir) else {
-        return vec![];
-    };
-    let mut statuses: Vec<TaskKindStatus> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| {
-            let dir = entry.path();
-            let kind = entry.file_name().to_string_lossy().into_owned();
-            let task_json = std::fs::read_to_string(dir.join("task.json"))
-                .ok()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-            let active_prefix = task_json
-                .as_ref()
-                .and_then(|value| value.get("runId"))
-                .and_then(|value| value.as_str())
-                .map(|run_id| format!("{kind}-{run_id}-"));
-            let entries_for = |name: &str| {
-                std::fs::read_dir(dir.join(name))
-                    .map(|entries| {
-                        entries
-                            .filter_map(Result::ok)
-                            .filter(|entry| {
-                                active_prefix.as_ref().is_none_or(|prefix| {
-                                    entry.file_name().to_string_lossy().starts_with(prefix)
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-            let done_entries = entries_for("done");
-            let failed_entries = entries_for("failed");
-            let pending_entries = entries_for("pending");
-            let done = done_entries.len();
-            let failed = failed_entries.len();
-            let failed_names: std::collections::BTreeSet<std::ffi::OsString> = failed_entries
-                .iter()
-                .map(|entry| entry.file_name())
-                .collect();
-            let done_names: std::collections::BTreeSet<std::ffi::OsString> =
-                done_entries.iter().map(|entry| entry.file_name()).collect();
-            let pending = pending_entries
-                .iter()
-                .filter(|entry| {
-                    !failed_names.contains(&entry.file_name())
-                        && !done_names.contains(&entry.file_name())
-                })
-                .count();
-            if pending + done + failed == 0 && !dir.join("task.json").exists() {
-                return None;
-            }
-            let lang = task_json
-                .as_ref()
-                .and_then(|value| value.get("lang"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-            let state = task_json
-                .as_ref()
-                .and_then(|value| value.get("state"))
-                .and_then(|value| value.as_str())
-                .unwrap_or(if pending > 0 { "running" } else { "completed" })
-                .to_string();
-            let calls = task_json
-                .as_ref()
-                .and_then(|value| value.get("calls"))
-                .and_then(|value| value.as_u64())
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(pending + done + failed);
-            let last_error = task_json
-                .as_ref()
-                .and_then(|value| value.get("error"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .or_else(|| {
-                    failed_entries
-                        .iter()
-                        .max_by_key(|entry| {
-                            entry
-                                .metadata()
-                                .ok()
-                                .and_then(|metadata| metadata.modified().ok())
-                        })
-                        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
-                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
-                });
-            let updated_at = std::fs::metadata(dir.join("task.json"))
-                .or_else(|_| std::fs::metadata(&dir))
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs());
-            Some(TaskKindStatus {
-                kind,
-                lang,
-                state,
-                calls,
-                pending,
-                done,
-                failed,
-                last_error,
-                updated_at,
-            })
-        })
-        .collect();
-    statuses.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.kind.cmp(&right.kind))
-    });
-    statuses
 }
 
 #[tauri::command]
 pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskStatus> {
     let project_dir = resolve_project_dir(&pid, root)?;
     run_blocking("task status", move || {
-        let kinds = task_kind_statuses(&project_dir);
+        let kinds = crate::agent::task::task_kind_statuses(&project_dir);
         let pending = kinds.iter().map(|status| status.pending).sum();
         let done = kinds.iter().map(|status| status.done).sum();
+        let failed = kinds.iter().map(|status| status.failed).sum();
         let polish_quality = crate::pipeline::polish::PolishQualityArtifact::load(
             &project_dir.join("ai/polish-quality.json"),
         )
@@ -1334,6 +2431,7 @@ pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskSt
         Ok(TaskStatus {
             pending,
             done,
+            failed,
             kinds,
             polish_quality,
         })
@@ -1348,6 +2446,7 @@ pub async fn task_status(pid: String, root: Option<PathBuf>) -> AppResult<TaskSt
 #[tauri::command]
 pub async fn finish_check_pid(
     pid: String,
+    settings: Option<crate::data::export_settings::VideoExportSettings>,
     root: Option<PathBuf>,
 ) -> AppResult<Vec<FinishCheckItem>> {
     let dir = resolve_project_dir(&pid, root)?;
@@ -1360,13 +2459,22 @@ pub async fn finish_check_pid(
             ClipCuts::new()
         };
         let broll = crate::data::broll::load(&dir)?;
-        let items = finish_check_emit_for_project(
+        let mut items = finish_check_emit_for_project(
             &doc,
             &cuts,
             &broll,
             &dir,
             working_head_is_committed(&dir, &doc)?,
         );
+        if settings.is_some() {
+            for item in &mut items {
+                item.blockers.retain(|finding| {
+                    finding.code == Code::TranslationEmpty
+                        || finding.code.section() != Section::Translation
+                });
+                item.pass = item.blockers.is_empty();
+            }
+        }
         Ok(items
             .into_iter()
             .map(|i| FinishCheckItem {
@@ -1393,16 +2501,171 @@ pub async fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("automatic cut save", move || {
-        let doc = Doc::load(&dir)?;
-        let cuts_path = dir.join("cuts.json");
-        let mut cuts: ClipCuts = if cuts_path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-        } else {
-            ClipCuts::new()
-        };
-        let added = crate::pipeline::cleanup::apply(&doc, &mut cuts);
-        crate::data::storage::write_json(&cuts_path, &cuts)?;
-        Ok(added)
+        crate::data::edit_history::record(
+            &dir,
+            "Apply suggested cuts",
+            || {
+                let doc = Doc::load(&dir)?;
+                let cuts_path = dir.join("cuts.json");
+                let mut cuts: ClipCuts = if cuts_path.exists() {
+                    serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+                } else {
+                    ClipCuts::new()
+                };
+                let added = crate::pipeline::cleanup::apply(&doc, &mut cuts);
+                if added > 0 {
+                    crate::data::storage::write_json(&cuts_path, &cuts)?;
+                }
+                Ok(added)
+            },
+            |added| *added > 0,
+        )
+    })
+    .await
+}
+
+#[derive(Debug)]
+struct ManualCutCandidate {
+    a_word: String,
+    b_word: String,
+    end: f64,
+    note: String,
+    start: f64,
+}
+
+fn add_manual_cuts(dir: &std::path::Path, cue_ids: Vec<String>) -> AppResult<usize> {
+    if cue_ids.is_empty() {
+        return Err(AppError::Schema("select at least one subtitle".into()));
+    }
+    let label = if cue_ids.len() == 1 {
+        "Remove timeline region"
+    } else {
+        "Remove timeline regions"
+    };
+    crate::data::edit_history::record(
+        dir,
+        label,
+        || {
+            let doc = Doc::load(dir)?;
+            let mut seen = HashSet::new();
+            let mut candidates = Vec::with_capacity(cue_ids.len());
+            for cue_id in cue_ids {
+                if !seen.insert(cue_id.clone()) {
+                    continue;
+                }
+                let sentence = doc
+                    .paragraphs
+                    .iter()
+                    .flat_map(|paragraph| paragraph.sentences.iter())
+                    .find(|sentence| sentence.id == cue_id)
+                    .ok_or_else(|| {
+                        AppError::Schema(format!("subtitle {cue_id} is no longer available"))
+                    })?;
+                let first = sentence
+                    .words
+                    .first()
+                    .ok_or_else(|| AppError::Schema("subtitle has no timed words".into()))?;
+                let last = sentence
+                    .words
+                    .last()
+                    .ok_or_else(|| AppError::Schema("subtitle has no timed words".into()))?;
+                candidates.push(ManualCutCandidate {
+                    a_word: first.id.clone(),
+                    b_word: last.id.clone(),
+                    end: last.end,
+                    note: sentence.text.clone(),
+                    start: first.start,
+                });
+            }
+            candidates.sort_by(|left, right| {
+                left.start
+                    .partial_cmp(&right.start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Adjacent or overlapping subtitle selections are one contiguous
+            // removal. Keeping them as separate cuts would double-count their
+            // overlap in duration checks and make one user action harder to
+            // reason about.
+            let mut groups: Vec<ManualCutCandidate> = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                if let Some(previous) = groups.last_mut() {
+                    if candidate.start <= previous.end + 0.001 {
+                        if candidate.end > previous.end {
+                            previous.end = candidate.end;
+                            previous.b_word = candidate.b_word;
+                        }
+                        if !candidate.note.is_empty() {
+                            if !previous.note.is_empty() {
+                                previous.note.push(' ');
+                            }
+                            previous.note.push_str(&candidate.note);
+                        }
+                        continue;
+                    }
+                }
+                groups.push(candidate);
+            }
+
+            let cuts_path = dir.join("cuts.json");
+            let mut cuts: ClipCuts = if cuts_path.exists() {
+                serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+            } else {
+                ClipCuts::new()
+            };
+            let existing = cuts
+                .cuts
+                .iter()
+                .filter_map(|cut| cut.resolved_interval(&doc))
+                .collect::<Vec<_>>();
+            if groups.iter().any(|candidate| {
+                existing.iter().any(|(cut_start, cut_end)| {
+                    candidate.start < *cut_end && *cut_start < candidate.end
+                })
+            }) {
+                return Err(AppError::Schema(
+                    "the selected subtitles overlap an existing removed region".into(),
+                ));
+            }
+
+            let added = groups.len();
+            for candidate in groups {
+                cuts.add(crate::data::Cut {
+                    id: format!("manual-{}", uuid::Uuid::new_v4().simple()),
+                    note: (!candidate.note.is_empty()).then_some(candidate.note),
+                    a_word: candidate.a_word,
+                    b_word: candidate.b_word,
+                    kind: crate::data::CutKind::Manual,
+                    duration: (candidate.end - candidate.start).max(0.0),
+                });
+            }
+            crate::data::storage::write_json(&cuts_path, &cuts)?;
+            Ok(added)
+        },
+        |added| *added > 0,
+    )
+}
+
+#[tauri::command]
+pub async fn cut_manual(pid: String, cue_id: String, root: Option<PathBuf>) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("manual timeline cut", move || {
+        Ok(add_manual_cuts(&dir, vec![cue_id])? > 0)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn cut_manual_many(
+    pid: String,
+    cue_ids: Vec<String>,
+    root: Option<PathBuf>,
+) -> AppResult<usize> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("manual timeline cuts", move || {
+        add_manual_cuts(&dir, cue_ids)
     })
     .await
 }
@@ -1412,17 +2675,24 @@ pub async fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> 
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("cut restore", move || {
-        let cuts_path = dir.join("cuts.json");
-        let mut cuts: ClipCuts = if cuts_path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
-        } else {
-            return Ok(false);
-        };
-        let removed = cuts.restore(&cut_id);
-        if removed {
-            crate::data::storage::write_json(&cuts_path, &cuts)?;
-        }
-        Ok(removed)
+        crate::data::edit_history::record(
+            &dir,
+            "Restore timeline region",
+            || {
+                let cuts_path = dir.join("cuts.json");
+                let mut cuts: ClipCuts = if cuts_path.exists() {
+                    serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+                } else {
+                    return Ok(false);
+                };
+                let removed = cuts.restore(&cut_id);
+                if removed {
+                    crate::data::storage::write_json(&cuts_path, &cuts)?;
+                }
+                Ok(removed)
+            },
+            |changed| *changed,
+        )
     })
     .await
 }
@@ -1473,6 +2743,10 @@ pub async fn cut_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<CutSu
 pub struct SettingsPayload {
     pub asr_model: String,
     pub asr_aligner: String,
+    pub asr_engine: crate::data::modelconfig::AsrEngine,
+    pub asr_cloud_endpoint: String,
+    pub asr_cloud_api_key: String,
+    pub asr_cloud_model: String,
     pub diarize_model: String,
     pub hf_token: String,
     pub llm_endpoint: String,
@@ -1489,6 +2763,10 @@ impl Default for SettingsPayload {
         Self {
             asr_model: config.asr_model,
             asr_aligner: config.asr_aligner,
+            asr_engine: config.asr_engine,
+            asr_cloud_endpoint: config.asr_cloud_endpoint,
+            asr_cloud_api_key: config.asr_cloud_api_key,
+            asr_cloud_model: config.asr_cloud_model,
             diarize_model: config.diarize_model,
             hf_token: config.hf_token,
             llm_endpoint: config.llm_endpoint,
@@ -1508,10 +2786,22 @@ pub async fn settings_export(
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
-    // Secrets are write-only to the webview. An empty field means "leave the
-    // stored token unchanged", so an unrelated save cannot erase it.
+    // Secrets are write-only to the webview. An empty field preserves a key
+    // only while its matching endpoint is unchanged; switching providers must
+    // never silently reuse credentials issued for the previous host.
+    let previous = crate::data::modelconfig::load();
     if settings.hf_token.trim().is_empty() {
-        settings.hf_token = crate::data::modelconfig::load().hf_token;
+        settings.hf_token = previous.hf_token;
+    }
+    if settings.llm_api_key.trim().is_empty()
+        && settings.llm_endpoint.trim() == previous.llm_endpoint.trim()
+    {
+        settings.llm_api_key = previous.llm_api_key;
+    }
+    if settings.asr_cloud_api_key.trim().is_empty()
+        && settings.asr_cloud_endpoint.trim() == previous.asr_cloud_endpoint.trim()
+    {
+        settings.asr_cloud_api_key = previous.asr_cloud_api_key;
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1677,7 +2967,13 @@ pub struct AgentServerState {
     pub built_in_workers_started: Mutex<bool>,
     /// Project/kind pairs with a live apply loop. Durable task recovery may be
     /// requested repeatedly as views mount; this prevents duplicate enqueue.
-    pub active_tasks: Arc<Mutex<HashSet<String>>>,
+    active_tasks: Arc<Mutex<HashMap<String, ActiveAgentTask>>>,
+}
+
+#[derive(Clone)]
+struct ActiveAgentTask {
+    pause: Arc<AtomicBool>,
+    task: crate::agent::task::PreparedTask,
 }
 
 /// One app-wide microphone capture. Recording is intentionally separate from
@@ -1709,6 +3005,10 @@ impl Drop for RecordingState {
         if let Ok(slot) = self.session.get_mut() {
             if let Some(session) = slot.as_mut() {
                 let _ = session.child.start_kill();
+                let _ = std::fs::remove_file(&session.wav);
+                if let Some(dir) = session.wav.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
             }
         }
     }
@@ -1720,7 +3020,7 @@ impl Default for AgentServerState {
             allocator: Mutex::new(None),
             worker_count: Mutex::new(crate::agent::DEFAULT_CAPACITY),
             built_in_workers_started: Mutex::new(false),
-            active_tasks: Arc::new(Mutex::new(HashSet::new())),
+            active_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1898,7 +3198,7 @@ pub async fn subtitle_list(
     let dir = resolve_project_dir(&pid, root)?;
     run_blocking("subtitle list", move || {
         let doc = Doc::load(&dir)?;
-        let hidden = crate::data::subtitle::load_hidden(&dir);
+        let hidden = crate::data::subtitle::load_hidden_checked(&dir)?;
         Ok(crate::data::subtitle::list(&doc, &hidden, None))
     })
     .await
@@ -1914,12 +3214,215 @@ pub async fn subtitle_set(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle update", move || {
-        let mut doc = Doc::load(&dir)?;
-        let changed = crate::data::subtitle::set(&mut doc, &id, &text);
-        if changed {
-            doc.save(&dir)?;
-        }
-        Ok(changed)
+        crate::data::edit_history::record(
+            &dir,
+            "Edit transcript",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let changed = crate::data::subtitle::set(&mut doc, &id, &text);
+                if changed {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn subtitle_timing_set(
+    pid: String,
+    id: String,
+    start: f64,
+    end: f64,
+    root: Option<PathBuf>,
+) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle timing update", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Adjust subtitle timing",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let changed = crate::data::subtitle::set_timing(&mut doc, &id, start, end)?;
+                if changed {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed,
+        )
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleUpdate {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleUpdateResult {
+    pub changed: usize,
+    pub sentences: Vec<crate::data::Sentence>,
+}
+
+#[tauri::command]
+pub async fn subtitle_update_many(
+    pid: String,
+    updates: Vec<SubtitleUpdate>,
+    root: Option<PathBuf>,
+) -> AppResult<SubtitleUpdateResult> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle batch update with timing", move || {
+        crate::data::edit_history::record(
+            &dir,
+            if updates.len() == 1 {
+                "Edit transcript"
+            } else {
+                "Edit transcript lines"
+            },
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let sentence_ids = doc
+                    .paragraphs
+                    .iter()
+                    .flat_map(|paragraph| paragraph.sentences.iter())
+                    .map(|sentence| sentence.id.as_str())
+                    .collect::<HashSet<_>>();
+                let unknown_ids = updates
+                    .iter()
+                    .filter(|update| !sentence_ids.contains(update.id.as_str()))
+                    .map(|update| update.id.clone())
+                    .collect::<Vec<_>>();
+                if !unknown_ids.is_empty() {
+                    return Err(AppError::Schema(format!(
+                        "transcript cues not found: {}",
+                        unknown_ids.join(", ")
+                    )));
+                }
+
+                let updates_by_id = updates
+                    .iter()
+                    .map(|update| (update.id.as_str(), update.text.as_str()))
+                    .collect::<HashMap<_, _>>();
+                let changed = crate::data::subtitle::set_many(&mut doc, &updates_by_id);
+                if changed > 0 {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                let by_id = doc
+                    .paragraphs
+                    .iter()
+                    .flat_map(|paragraph| paragraph.sentences.iter())
+                    .map(|sentence| (sentence.id.as_str(), sentence))
+                    .collect::<HashMap<_, _>>();
+                let sentences = updates
+                    .iter()
+                    .filter_map(|update| {
+                        by_id
+                            .get(update.id.as_str())
+                            .map(|sentence| (*sentence).clone())
+                    })
+                    .collect();
+                Ok(SubtitleUpdateResult { changed, sentences })
+            },
+            |result| result.changed > 0,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn subtitle_set_many(
+    pid: String,
+    updates: Vec<SubtitleUpdate>,
+    root: Option<PathBuf>,
+) -> AppResult<usize> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("subtitle batch update", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Edit transcript lines",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let sentence_ids = doc
+                    .paragraphs
+                    .iter()
+                    .flat_map(|paragraph| paragraph.sentences.iter())
+                    .map(|sentence| sentence.id.as_str())
+                    .collect::<HashSet<_>>();
+                let unknown_ids = updates
+                    .iter()
+                    .filter(|update| !sentence_ids.contains(update.id.as_str()))
+                    .map(|update| update.id.clone())
+                    .collect::<Vec<_>>();
+                if !unknown_ids.is_empty() {
+                    return Err(AppError::Schema(format!(
+                        "transcript cues not found: {}",
+                        unknown_ids.join(", ")
+                    )));
+                }
+
+                let updates_by_id = updates
+                    .iter()
+                    .map(|update| (update.id.as_str(), update.text.as_str()))
+                    .collect::<HashMap<_, _>>();
+                let changed = crate::data::subtitle::set_many(&mut doc, &updates_by_id);
+                if changed > 0 {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed > 0,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn chapter_list(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<crate::data::chapter::ChapterRow>> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("chapter list", move || {
+        let doc = Doc::load(&dir)?;
+        let chapters = crate::data::chapter::load(&dir)?;
+        crate::data::chapter::rows(&doc, &chapters)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn chapter_set_many(
+    pid: String,
+    chapters: Vec<crate::data::chapter::Chapter>,
+    root: Option<PathBuf>,
+) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("chapter update", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Edit chapters",
+            || {
+                let doc = Doc::load(&dir)?;
+                crate::data::chapter::replace(&dir, &doc, chapters)
+            },
+            |changed| *changed,
+        )
     })
     .await
 }
@@ -1935,12 +3438,91 @@ pub async fn translation_set(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("translation update", move || {
-        let mut doc = Doc::load(&dir)?;
-        let changed = crate::data::subtitle::set_translation(&mut doc, &lang, &id, &text);
-        if changed {
-            doc.save(&dir)?;
-        }
-        Ok(changed)
+        crate::data::edit_history::record(
+            &dir,
+            "Edit translation",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let changed = crate::data::subtitle::set_translation(&mut doc, &lang, &id, &text);
+                if changed {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed,
+        )
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationUpdate {
+    pub id: String,
+    pub text: String,
+}
+
+#[tauri::command]
+pub async fn translation_set_many(
+    pid: String,
+    lang: String,
+    updates: Vec<TranslationUpdate>,
+    root: Option<PathBuf>,
+) -> AppResult<usize> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("translation batch update", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Edit translations",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let sentence_ids = doc
+                    .paragraphs
+                    .iter()
+                    .flat_map(|paragraph| paragraph.sentences.iter())
+                    .map(|sentence| sentence.id.as_str())
+                    .collect::<HashSet<_>>();
+                let unknown_ids = updates
+                    .iter()
+                    .filter(|update| !sentence_ids.contains(update.id.as_str()))
+                    .map(|update| update.id.clone())
+                    .collect::<Vec<_>>();
+                if !unknown_ids.is_empty() {
+                    return Err(AppError::Schema(format!(
+                        "translation cues not found: {}",
+                        unknown_ids.join(", ")
+                    )));
+                }
+
+                let mut changed = 0;
+                for update in &updates {
+                    let previous = doc
+                        .translations
+                        .get(&lang)
+                        .and_then(|track| track.get(&update.id))
+                        .map(|translation| translation.text.as_str());
+                    if previous == Some(update.text.as_str()) {
+                        continue;
+                    }
+                    if crate::data::subtitle::set_translation(
+                        &mut doc,
+                        &lang,
+                        &update.id,
+                        &update.text,
+                    ) {
+                        changed += 1;
+                    }
+                }
+                if changed > 0 {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed > 0,
+        )
     })
     .await
 }
@@ -1955,11 +3537,22 @@ pub async fn subtitle_visibility(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle visibility", move || {
-        if hidden {
-            crate::data::subtitle::hide(&dir, &id)
-        } else {
-            crate::data::subtitle::restore(&dir, &id)
-        }
+        crate::data::edit_history::record(
+            &dir,
+            if hidden {
+                "Hide subtitle"
+            } else {
+                "Restore subtitle"
+            },
+            || {
+                if hidden {
+                    crate::data::subtitle::hide(&dir, &id)
+                } else {
+                    crate::data::subtitle::restore(&dir, &id)
+                }
+            },
+            |changed| *changed,
+        )
     })
     .await
 }
@@ -1975,14 +3568,55 @@ pub async fn subtitle_replace(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle replacement", move || {
-        let mut doc = Doc::load(&dir)?;
-        let changed = crate::data::edit::find_replace(&mut doc, &query, &replacement, regex)?;
-        if changed > 0 {
-            doc.save(&dir)?;
-        }
-        Ok(changed)
+        crate::data::edit_history::record(
+            &dir,
+            "Replace transcript text",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let changed =
+                    crate::data::edit::find_replace(&mut doc, &query, &replacement, regex)?;
+                if changed > 0 {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed > 0,
+        )
     })
     .await
+}
+
+#[tauri::command]
+pub async fn edit_history_status(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::edit_history::EditHistoryStatus> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("edit history status", move || {
+        crate::data::edit_history::status(&dir)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn edit_undo(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::edit_history::EditHistoryAction> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("editor undo", move || crate::data::edit_history::undo(&dir)).await
+}
+
+#[tauri::command]
+pub async fn edit_redo(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::edit_history::EditHistoryAction> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("editor redo", move || crate::data::edit_history::redo(&dir)).await
 }
 
 #[tauri::command]
@@ -2039,12 +3673,20 @@ pub async fn speaker_rename(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("speaker rename", move || {
-        let mut doc = Doc::load(&dir)?;
-        let changed = crate::data::speakers::rename(&mut doc, &from, &to);
-        if changed > 0 {
-            doc.save(&dir)?;
-        }
-        Ok(changed)
+        crate::data::edit_history::record(
+            &dir,
+            "Rename speaker",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let changed = crate::data::speakers::rename(&mut doc, &from, &to);
+                if changed > 0 {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed > 0,
+        )
     })
     .await
 }
@@ -2066,29 +3708,37 @@ pub async fn speaker_merge(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("speaker merge", move || {
-        let original = Doc::load(&dir)?;
-        let mut doc = original.clone();
-        let changed = crate::data::speakers::merge(&mut doc, &from, &into);
-        if changed > 0 {
-            if !working_head_is_committed(&dir, &original)? {
-                let mut lineage = crate::data::version::Lineage::load(&dir)?;
-                let branch = lineage
-                    .active_branch
-                    .clone()
-                    .unwrap_or_else(|| "main".into());
-                crate::data::version::commit_snapshot(
-                    &dir,
-                    &original,
-                    &mut lineage,
-                    &branch,
-                    "Before speaker merge",
-                    "automatic recovery snapshot",
-                    crate::data::version::VersionKind::Auto,
-                )?;
-            }
-            doc.save(&dir)?;
-        }
-        Ok(changed)
+        crate::data::edit_history::record(
+            &dir,
+            "Merge speakers",
+            || {
+                let original = Doc::load(&dir)?;
+                let mut doc = original.clone();
+                let changed = crate::data::speakers::merge(&mut doc, &from, &into);
+                if changed > 0 {
+                    if !working_head_is_committed(&dir, &original)? {
+                        let mut lineage = crate::data::version::Lineage::load(&dir)?;
+                        let branch = lineage
+                            .active_branch
+                            .clone()
+                            .unwrap_or_else(|| "main".into());
+                        crate::data::version::commit_snapshot(
+                            &dir,
+                            &original,
+                            &mut lineage,
+                            &branch,
+                            "Before speaker merge",
+                            "automatic recovery snapshot",
+                            crate::data::version::VersionKind::Auto,
+                        )?;
+                    }
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed > 0,
+        )
     })
     .await
 }
@@ -2115,14 +3765,29 @@ pub async fn speaker_assign(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("speaker assignment", move || {
-        let mut doc = Doc::load(&dir)?;
-        if !crate::data::speakers::assign(&mut doc, input.paragraph_id, speaker.as_deref()) {
-            return Err(AppError::Schema(format!(
-                "paragraph {} was not found",
-                input.paragraph_id
-            )));
-        }
-        doc.save(&dir)
+        crate::data::edit_history::record(
+            &dir,
+            "Assign speaker",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let paragraph = doc
+                    .paragraphs
+                    .iter_mut()
+                    .find(|paragraph| paragraph.id == input.paragraph_id)
+                    .ok_or_else(|| {
+                        AppError::Schema(format!("paragraph {} was not found", input.paragraph_id))
+                    })?;
+                let changed = paragraph.speaker != speaker;
+                if changed {
+                    paragraph.speaker = speaker;
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed,
+        )
+        .map(|_| ())
     })
     .await
 }
@@ -2169,6 +3834,10 @@ pub struct SpeakerAnalysisJobStatus {
     pub peak_memory_mb: Option<u64>,
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
     pub error: Option<String>,
     pub preview: Option<SpeakerReidentifyPreview>,
 }
@@ -2176,6 +3845,7 @@ pub struct SpeakerAnalysisJobStatus {
 struct SpeakerAnalysisJob {
     status: SpeakerAnalysisJobStatus,
     cancel: Arc<AtomicBool>,
+    status_path: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -2212,6 +3882,7 @@ fn load_recovered_speaker_analysis_status(
             "the previous speaker analysis was interrupted when lumen-cut closed; start it again"
                 .into(),
         );
+        status.updated_at = Some(unix_timestamp_seconds());
         save_speaker_analysis_status(path, &status)?;
     }
     Ok(status)
@@ -2236,7 +3907,7 @@ fn update_speaker_analysis_job(
             );
         }
         job.status.phase = progress.phase;
-        job.status.progress = progress.progress;
+        job.status.progress = advance_progress(job.status.progress, progress.progress);
         job.status.current = progress.current;
         job.status.total = progress.total;
         job.status.device = progress.device;
@@ -2244,6 +3915,7 @@ fn update_speaker_analysis_job(
         job.status.cpu_percent = progress.cpu_percent;
         job.status.peak_memory_mb = progress.peak_memory_mb;
         job.status.memory_limit_mb = progress.memory_limit_mb;
+        job.status.updated_at = Some(unix_timestamp_seconds());
     }
 }
 
@@ -2258,6 +3930,8 @@ fn paragraph_bounds(paragraph: &crate::data::Paragraph) -> Option<(f64, f64)> {
 }
 
 fn speaker_preview_matches_doc(doc: &Doc, preview: &SpeakerReidentifyPreview) -> bool {
+    let mut doc = doc.clone();
+    crate::diarize::normalize_speaker_paragraphs(&mut doc);
     preview.proposals.iter().all(|proposal| {
         doc.paragraphs
             .iter()
@@ -2312,10 +3986,11 @@ async fn speaker_reidentify_preview_impl(
     let audio_mutation = lock_project_mutation(&dir).await;
     let load_dir = dir.clone();
     let (doc, model) = run_blocking("speaker preview preparation", move || {
-        Ok((
-            Doc::load(&load_dir)?,
-            crate::data::modelconfig::load().diarize_model,
-        ))
+        let mut doc = Doc::load(&load_dir)?;
+        crate::diarize::normalize_speaker_paragraphs(&mut doc);
+        let model = crate::data::modelconfig::load().diarize_model;
+        validate_speaker_preflight(&model)?;
+        Ok((doc, model))
     })
     .await?;
     let wav = dir.join("audio.wav");
@@ -2417,6 +4092,7 @@ pub async fn speaker_reidentify_start(
 ) -> AppResult<SpeakerAnalysisJobStatus> {
     let status_path = speaker_analysis_status_path(&pid, root.clone())?;
     let cancel = Arc::new(AtomicBool::new(false));
+    let now = unix_timestamp_seconds();
     let status = SpeakerAnalysisJobStatus {
         pid: pid.clone(),
         state: "running".into(),
@@ -2429,6 +4105,8 @@ pub async fn speaker_reidentify_start(
         cpu_percent: None,
         peak_memory_mb: None,
         memory_limit_mb: None,
+        started_at: Some(now),
+        updated_at: Some(now),
         error: None,
         preview: None,
     };
@@ -2447,6 +4125,7 @@ pub async fn speaker_reidentify_start(
             SpeakerAnalysisJob {
                 status: status.clone(),
                 cancel: cancel.clone(),
+                status_path: status_path.clone(),
             },
         );
     }
@@ -2506,8 +4185,16 @@ pub async fn speaker_reidentify_start(
                     status.error = Some(error.to_string());
                 }
             }
+            status.updated_at = Some(unix_timestamp_seconds());
             status
         };
+        if let Some(job) = jobs
+            .lock()
+            .expect("speaker analysis state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         let persisted = final_status.clone();
         if let Err(error) = persist_background_status(
             "save final speaker analysis status",
@@ -2545,45 +4232,88 @@ pub async fn speaker_reidentify_status(
     pid: String,
     state: tauri::State<'_, SpeakerAnalysisState>,
 ) -> AppResult<SpeakerAnalysisJobStatus> {
-    let memory_status = state
+    let active = state
         .jobs
         .lock()
         .expect("speaker analysis state poisoned")
         .get(&pid)
-        .map(|job| job.status.clone());
-    let project_dir = resolve_project_dir(&pid, None)?;
-    let status_path = speaker_analysis_status_path(&pid, None)?;
+        .map(|job| (job.status.clone(), job.status_path.clone()));
+    let status_path = active
+        .as_ref()
+        .map(|(_, path)| path.clone())
+        .unwrap_or(speaker_analysis_status_path(&pid, None)?);
+    let project_dir = if active.is_some() {
+        status_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|root| root.join(&pid))
+            .ok_or_else(|| AppError::Schema("invalid speaker analysis status path".into()))?
+    } else {
+        resolve_project_dir(&pid, None)?
+    };
+    if let Some((memory_status, _)) = active {
+        let checked_path = status_path.clone();
+        let checked = run_blocking("checkpoint speaker analysis status", move || {
+            let mut status = memory_status;
+            if let Some(preview) = status.preview.as_ref() {
+                let doc = Doc::load(&project_dir)?;
+                if !speaker_preview_matches_doc(&doc, preview) {
+                    status.preview = None;
+                }
+            }
+            save_speaker_analysis_status(&checked_path, &status)?;
+            Ok(status)
+        })
+        .await?;
+        let latest = state
+            .jobs
+            .lock()
+            .expect("speaker analysis state poisoned")
+            .get(&pid)
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| checked.clone());
+        if latest.state != checked.state
+            || latest.phase != checked.phase
+            || latest.progress != checked.progress
+            || latest.updated_at != checked.updated_at
+        {
+            persist_background_status(
+                "checkpoint latest speaker analysis status",
+                status_path,
+                latest.clone(),
+                save_speaker_analysis_status,
+            )
+            .await?;
+            return Ok(latest);
+        }
+        if let Some(job) = state
+            .jobs
+            .lock()
+            .expect("speaker analysis state poisoned")
+            .get_mut(&pid)
+        {
+            job.status = checked.clone();
+        }
+        return Ok(checked);
+    }
     let status = run_blocking("load speaker analysis status", move || {
         let mut status =
-            match memory_status {
-                Some(status) => status,
-                None => load_recovered_speaker_analysis_status(&status_path).map_err(|error| {
-                    match error {
-                        AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                            AppError::Schema("no speaker analysis job for this project".into())
-                        }
-                        other => other,
-                    }
-                })?,
-            };
+            load_recovered_speaker_analysis_status(&status_path).map_err(|error| match error {
+                AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    AppError::Schema("no speaker analysis job for this project".into())
+                }
+                other => other,
+            })?;
         if let Some(preview) = status.preview.as_ref() {
             let doc = Doc::load(&project_dir)?;
             if !speaker_preview_matches_doc(&doc, preview) {
                 status.preview = None;
-                save_speaker_analysis_status(&status_path, &status)?;
             }
         }
+        save_speaker_analysis_status(&status_path, &status)?;
         Ok(status)
     })
     .await?;
-    if let Some(job) = state
-        .jobs
-        .lock()
-        .expect("speaker analysis state poisoned")
-        .get_mut(&pid)
-    {
-        job.status = status.clone();
-    }
     Ok(status)
 }
 
@@ -2592,16 +4322,27 @@ pub async fn speaker_reidentify_cancel(
     pid: String,
     state: tauri::State<'_, SpeakerAnalysisState>,
 ) -> AppResult<SpeakerAnalysisJobStatus> {
-    let mut jobs = state.jobs.lock().expect("speaker analysis state poisoned");
-    let job = jobs
-        .get_mut(&pid)
-        .ok_or_else(|| AppError::Schema("no speaker analysis job for this project".into()))?;
-    if job.status.state == "running" {
-        job.cancel.store(true, Ordering::Relaxed);
-        job.status.state = "cancelling".into();
-        job.status.phase = "cancelling".into();
-    }
-    Ok(job.status.clone())
+    let (status, path) = {
+        let mut jobs = state.jobs.lock().expect("speaker analysis state poisoned");
+        let job = jobs
+            .get_mut(&pid)
+            .ok_or_else(|| AppError::Schema("no speaker analysis job for this project".into()))?;
+        if job.status.state == "running" {
+            job.cancel.store(true, Ordering::Relaxed);
+            job.status.state = "cancelling".into();
+            job.status.phase = "cancelling".into();
+            job.status.updated_at = Some(unix_timestamp_seconds());
+        }
+        (job.status.clone(), job.status_path.clone())
+    };
+    persist_background_status(
+        "checkpoint speaker analysis cancellation",
+        path,
+        status.clone(),
+        save_speaker_analysis_status,
+    )
+    .await?;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2628,73 +4369,82 @@ pub async fn speaker_reidentify_apply(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("speaker proposal apply", move || {
-        let original = Doc::load(&dir)?;
-        let mut doc = original.clone();
-        for proposal in &proposals {
-            let paragraph = doc
-                .paragraphs
-                .iter()
-                .find(|paragraph| paragraph.id == proposal.paragraph_id)
-                .ok_or_else(|| {
-                    AppError::Schema(format!(
-                        "speaker proposal is stale: paragraph {} is missing",
-                        proposal.paragraph_id
-                    ))
-                })?;
-            let bounds = paragraph_bounds(paragraph).ok_or_else(|| {
-                AppError::Schema(format!(
-                    "speaker proposal is stale: paragraph {} has no timed words",
-                    proposal.paragraph_id
-                ))
-            })?;
-            let current_text = paragraph
-                .sentences
-                .iter()
-                .map(|sentence| sentence.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if paragraph.speaker != proposal.current
-                || (bounds.0 - proposal.start).abs() > 0.001
-                || (bounds.1 - proposal.end).abs() > 0.001
-                || current_text != proposal.text
-            {
-                return Err(AppError::Schema(
-                    "speaker proposal is stale; run identification again".into(),
-                ));
-            }
-        }
-        if !working_head_is_committed(&dir, &original)? {
-            let mut lineage = crate::data::version::Lineage::load(&dir)?;
-            let branch = lineage
-                .active_branch
-                .clone()
-                .unwrap_or_else(|| "main".into());
-            crate::data::version::commit_snapshot(
-                &dir,
-                &original,
-                &mut lineage,
-                &branch,
-                "Before speaker re-identification",
-                "automatic recovery snapshot",
-                crate::data::version::VersionKind::Auto,
-            )?;
-        }
-        let mut changed = 0;
-        for proposal in proposals {
-            let paragraph = doc
-                .paragraphs
-                .iter_mut()
-                .find(|paragraph| paragraph.id == proposal.paragraph_id)
-                .expect("speaker proposals were validated");
-            if paragraph.speaker.as_deref() != Some(proposal.proposed.as_str()) {
-                paragraph.speaker = Some(proposal.proposed);
-                changed += 1;
-            }
-        }
-        if changed > 0 {
-            doc.save(&dir)?;
-        }
-        Ok(changed)
+        crate::data::edit_history::record(
+            &dir,
+            "Apply speaker analysis",
+            || {
+                let original = Doc::load(&dir)?;
+                let mut doc = original.clone();
+                crate::diarize::normalize_speaker_paragraphs(&mut doc);
+                for proposal in &proposals {
+                    let paragraph = doc
+                        .paragraphs
+                        .iter()
+                        .find(|paragraph| paragraph.id == proposal.paragraph_id)
+                        .ok_or_else(|| {
+                            AppError::Schema(format!(
+                                "speaker proposal is stale: paragraph {} is missing",
+                                proposal.paragraph_id
+                            ))
+                        })?;
+                    let bounds = paragraph_bounds(paragraph).ok_or_else(|| {
+                        AppError::Schema(format!(
+                            "speaker proposal is stale: paragraph {} has no timed words",
+                            proposal.paragraph_id
+                        ))
+                    })?;
+                    let current_text = paragraph
+                        .sentences
+                        .iter()
+                        .map(|sentence| sentence.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if paragraph.speaker != proposal.current
+                        || (bounds.0 - proposal.start).abs() > 0.001
+                        || (bounds.1 - proposal.end).abs() > 0.001
+                        || current_text != proposal.text
+                    {
+                        return Err(AppError::Schema(
+                            "speaker proposal is stale; run identification again".into(),
+                        ));
+                    }
+                }
+                if !working_head_is_committed(&dir, &original)? {
+                    let mut lineage = crate::data::version::Lineage::load(&dir)?;
+                    let branch = lineage
+                        .active_branch
+                        .clone()
+                        .unwrap_or_else(|| "main".into());
+                    crate::data::version::commit_snapshot(
+                        &dir,
+                        &original,
+                        &mut lineage,
+                        &branch,
+                        "Before speaker re-identification",
+                        "automatic recovery snapshot",
+                        crate::data::version::VersionKind::Auto,
+                    )?;
+                }
+                let mut changed = 0;
+                for proposal in proposals {
+                    let paragraph = doc
+                        .paragraphs
+                        .iter_mut()
+                        .find(|paragraph| paragraph.id == proposal.paragraph_id)
+                        .expect("speaker proposals were validated");
+                    if paragraph.speaker.as_deref() != Some(proposal.proposed.as_str()) {
+                        paragraph.speaker = Some(proposal.proposed);
+                        changed += 1;
+                    }
+                }
+                if changed > 0 {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(changed)
+            },
+            |changed| *changed > 0,
+        )
     })
     .await
 }
@@ -2716,6 +4466,10 @@ pub struct BrollPreviewJobStatus {
     pub current: Option<f64>,
     pub total: Option<f64>,
     pub encoder: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
     pub error: Option<String>,
     pub paths: Vec<String>,
 }
@@ -2723,6 +4477,7 @@ pub struct BrollPreviewJobStatus {
 struct BrollPreviewJob {
     status: BrollPreviewJobStatus,
     cancel: Arc<AtomicBool>,
+    status_path: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -2769,8 +4524,63 @@ fn load_recovered_broll_preview_status(path: &std::path::Path) -> AppResult<Brol
             "the previous B-roll preview was interrupted when lumen-cut closed; start it again"
                 .into(),
         );
+        status.updated_at = Some(unix_timestamp_seconds());
         save_broll_preview_status(path, &status)?;
     }
+    Ok(status)
+}
+
+fn validated_broll_preview_paths(
+    project_dir: PathBuf,
+    candidates: Vec<String>,
+) -> AppResult<Vec<PathBuf>> {
+    let project_dir = std::fs::canonicalize(project_dir)?;
+    Ok(candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let path = std::fs::canonicalize(candidate).ok()?;
+            let name = path.file_name()?.to_string_lossy();
+            (path.is_file()
+                && path.starts_with(&project_dir)
+                && name.starts_with("broll-preview-")
+                && path.extension().and_then(|value| value.to_str()) == Some("png"))
+            .then_some(path)
+        })
+        .collect())
+}
+
+async fn restore_broll_preview_assets(
+    pid: &str,
+    mut status: BrollPreviewJobStatus,
+    app: &tauri::AppHandle,
+    state: &BrollPreviewState,
+) -> AppResult<BrollPreviewJobStatus> {
+    if status.state != "completed" || status.paths.is_empty() {
+        return Ok(status);
+    }
+    let project_dir = resolve_project_dir(pid, None)?;
+    let candidates = status.paths.clone();
+    let valid = run_blocking("validate recovered B-roll preview assets", move || {
+        validated_broll_preview_paths(project_dir, candidates)
+    })
+    .await?;
+    let scope = app.asset_protocol_scope();
+    let mut current = state.current.lock().expect("B-roll preview state poisoned");
+    for previous in current.iter().filter(|path| !valid.contains(path)) {
+        scope
+            .forbid_file(previous)
+            .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
+    }
+    for path in &valid {
+        scope
+            .allow_file(path)
+            .map_err(|error| AppError::Schema(format!("B-roll preview scope: {error}")))?;
+    }
+    *current = valid.clone();
+    status.paths = valid
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
     Ok(status)
 }
 
@@ -2793,12 +4603,13 @@ fn update_broll_preview_job(
             );
         }
         job.status.phase = progress.phase;
-        job.status.progress = progress.progress;
+        job.status.progress = advance_progress(job.status.progress, progress.progress);
         job.status.current = progress.current;
         job.status.total = progress.total;
         if progress.encoder.is_some() {
             job.status.encoder = progress.encoder;
         }
+        job.status.updated_at = Some(unix_timestamp_seconds());
     }
 }
 
@@ -2811,9 +4622,800 @@ pub struct BrollPlacementInput {
     pub mode: Option<crate::data::broll::PlacementMode>,
     pub fit: Option<crate::data::broll::FitMode>,
     pub background: Option<crate::data::broll::BackgroundMode>,
+    pub rect: Option<crate::data::broll::Rect>,
     pub source_start: Option<f64>,
     pub radius: Option<u32>,
     pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitleClipInput {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+    pub x: f64,
+    pub y: f64,
+    pub font_size: u32,
+    pub color: String,
+    pub background: String,
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
+}
+
+fn title_from_input(
+    input: TitleClipInput,
+    id: String,
+    duration: f64,
+) -> AppResult<crate::data::title::TitleClip> {
+    let title = crate::data::title::TitleClip {
+        id,
+        text: input.text.trim().to_owned(),
+        start: input.start,
+        end: input.end,
+        x: input.x,
+        y: input.y,
+        font_size: input.font_size,
+        color: input.color.to_ascii_uppercase(),
+        background: input.background.to_ascii_uppercase(),
+        fade_in: input.fade_in,
+        fade_out: input.fade_out,
+    };
+    title.validate()?;
+    if duration > 0.0 && title.end > duration {
+        return Err(AppError::Schema(format!(
+            "title end {:.2}s exceeds media duration {duration:.2}s",
+            title.end
+        )));
+    }
+    Ok(title)
+}
+
+#[tauri::command]
+pub async fn title_list(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<crate::data::title::TitleClip>> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("title list", move || {
+        Doc::load(&dir)?;
+        crate::data::title::load(&dir)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn title_add(
+    pid: String,
+    input: TitleClipInput,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::title::TitleClip> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("title add", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Add title",
+            || {
+                let doc = Doc::load(&dir)?;
+                let mut titles = crate::data::title::load(&dir)?;
+                let title = title_from_input(
+                    input,
+                    format!("title-{}", uuid::Uuid::new_v4().simple()),
+                    doc.media.duration_seconds,
+                )?;
+                titles.push(title.clone());
+                crate::data::title::save(&dir, &titles)?;
+                Ok(title)
+            },
+            |_| true,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn title_update(
+    pid: String,
+    id: String,
+    input: TitleClipInput,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::title::TitleClip> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("title update", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Adjust title",
+            || {
+                let doc = Doc::load(&dir)?;
+                let mut titles = crate::data::title::load(&dir)?;
+                let index = titles
+                    .iter()
+                    .position(|title| title.id == id)
+                    .ok_or_else(|| AppError::Schema(format!("title id {id} not found")))?;
+                let replacement = title_from_input(input, id, doc.media.duration_seconds)?;
+                let changed = titles[index] != replacement;
+                titles[index] = replacement.clone();
+                if changed {
+                    crate::data::title::save(&dir, &titles)?;
+                }
+                Ok((replacement, changed))
+            },
+            |(_, changed)| *changed,
+        )
+        .map(|(title, _)| title)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn title_remove(pid: String, id: String, root: Option<PathBuf>) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("title remove", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Remove title",
+            || {
+                let mut titles = crate::data::title::load(&dir)?;
+                let before = titles.len();
+                titles.retain(|title| title.id != id);
+                if titles.len() == before {
+                    return Ok(false);
+                }
+                crate::data::title::save(&dir, &titles)?;
+                Ok(true)
+            },
+            |changed| *changed,
+        )
+    })
+    .await
+}
+
+fn load_project_cuts(dir: &std::path::Path) -> AppResult<ClipCuts> {
+    let cuts_path = dir.join("cuts.json");
+    if cuts_path.exists() {
+        Ok(serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?)
+    } else {
+        Ok(ClipCuts::new())
+    }
+}
+
+fn project_edited_duration(dir: &std::path::Path, doc: &Doc) -> AppResult<f64> {
+    let cuts = load_project_cuts(dir)?;
+    Ok(crate::export::project::kept_intervals(doc, &cuts.cuts)
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum())
+}
+
+#[tauri::command]
+pub async fn audio_mix_get(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::audio_mix::AudioMix> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("audio mix load", move || {
+        let doc = Doc::load(&dir)?;
+        crate::data::audio_mix::load(&dir)?.fit_to_duration(project_edited_duration(&dir, &doc)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn audio_mix_set(
+    pid: String,
+    mix: crate::data::audio_mix::AudioMix,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::audio_mix::AudioMix> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("audio mix update", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Adjust audio mix",
+            || {
+                let doc = Doc::load(&dir)?;
+                let duration = project_edited_duration(&dir, &doc)?;
+                let mut mix = mix;
+                for track in &mut mix.music {
+                    track.path = std::fs::canonicalize(&track.path)?;
+                    if !track.path.is_file() {
+                        return Err(AppError::ProjectNotFound(track.path.clone()));
+                    }
+                }
+                mix.validate(duration)?;
+                let changed = crate::data::audio_mix::load(&dir)? != mix;
+                if changed {
+                    crate::data::audio_mix::save(&dir, &mix, duration)?;
+                }
+                Ok((mix, changed))
+            },
+            |(_, changed)| *changed,
+        )
+        .map(|(mix, _)| mix)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn export_settings_get(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::export_settings::VideoExportSettings> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("export settings load", move || {
+        Doc::load(&dir)?;
+        crate::data::export_settings::load(&dir)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn export_settings_set(
+    pid: String,
+    settings: crate::data::export_settings::VideoExportSettings,
+    root: Option<PathBuf>,
+) -> AppResult<crate::data::export_settings::VideoExportSettings> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("export settings update", move || {
+        Doc::load(&dir)?;
+        crate::data::export_settings::save(&dir, &settings)?;
+        Ok(settings)
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreflightItem {
+    pub code: String,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreflightSummary {
+    pub duration_seconds: f64,
+    pub visible_captions: usize,
+    pub hidden_captions: usize,
+    pub broll_items: usize,
+    pub title_items: usize,
+    pub encoder: String,
+    pub estimated_min_mb: u64,
+    pub estimated_max_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreflightReport {
+    pub ready: bool,
+    pub items: Vec<ExportPreflightItem>,
+    pub summary: ExportPreflightSummary,
+}
+
+fn push_export_preflight_item(
+    items: &mut Vec<ExportPreflightItem>,
+    code: &str,
+    level: &str,
+    message: String,
+) {
+    items.push(ExportPreflightItem {
+        code: code.into(),
+        level: level.into(),
+        message,
+    });
+}
+
+fn export_size_estimate_mb(
+    settings: &crate::data::export_settings::VideoExportSettings,
+    duration_seconds: f64,
+    dimensions: Option<(u32, u32)>,
+    has_audio: bool,
+) -> (u64, u64) {
+    use crate::data::export_settings::{ExportAudioCodec, ExportVideoCodec};
+    let pixel_scale = dimensions
+        .map(|(width, height)| {
+            (f64::from(width) * f64::from(height) / (1920.0 * 1080.0)).clamp(0.25, 4.0)
+        })
+        .unwrap_or(1.0);
+    let video_mbps = match settings.video_codec {
+        ExportVideoCodec::H264 => 8.0 * pixel_scale,
+        ExportVideoCodec::Hevc => 5.0 * pixel_scale,
+        ExportVideoCodec::Prores => 220.0 * pixel_scale,
+    };
+    let audio_mbps = if !has_audio {
+        0.0
+    } else {
+        match settings.audio_codec {
+            ExportAudioCodec::Aac => 0.192,
+            ExportAudioCodec::Pcm => 1.536,
+        }
+    };
+    let nominal_mb = duration_seconds.max(0.0) * (video_mbps + audio_mbps) / 8.0;
+    (
+        (nominal_mb * 0.65).ceil().max(1.0) as u64,
+        (nominal_mb * 1.5).ceil().max(1.0) as u64,
+    )
+}
+
+async fn export_preflight_impl(
+    pid: &str,
+    settings: crate::data::export_settings::VideoExportSettings,
+    root: Option<PathBuf>,
+) -> AppResult<ExportPreflightReport> {
+    let dir = resolve_project_dir(pid, root)?;
+    let snapshot_dir = dir.clone();
+    let (
+        doc,
+        cuts_result,
+        broll_result,
+        hidden_result,
+        titles_result,
+        audio_mix_result,
+        style_result,
+    ) = run_blocking("export preflight snapshot", move || {
+        let doc = Doc::load(&snapshot_dir)?;
+        let cuts = load_project_cuts(&snapshot_dir);
+        let broll = crate::data::broll::load(&snapshot_dir);
+        let hidden = crate::data::subtitle::load_hidden_checked(&snapshot_dir);
+        let titles = crate::data::title::load(&snapshot_dir);
+        let audio_mix = crate::data::audio_mix::load(&snapshot_dir);
+        let style = crate::data::substyle::SubStyle::load(&snapshot_dir);
+        Ok((doc, cuts, broll, hidden, titles, audio_mix, style))
+    })
+    .await?;
+
+    let mut items = Vec::new();
+    let cuts = match cuts_result {
+        Ok(cuts) => cuts,
+        Err(error) => {
+            push_export_preflight_item(
+                &mut items,
+                "timeline-data",
+                "blocker",
+                format!("timeline edits cannot be read: {error}"),
+            );
+            ClipCuts::new()
+        }
+    };
+    let broll = match broll_result {
+        Ok(broll) => broll,
+        Err(error) => {
+            push_export_preflight_item(
+                &mut items,
+                "broll",
+                "blocker",
+                format!("B-roll placements cannot be read: {error}"),
+            );
+            Vec::new()
+        }
+    };
+    let titles = match titles_result {
+        Ok(titles) => titles,
+        Err(error) => {
+            push_export_preflight_item(
+                &mut items,
+                "titles",
+                "blocker",
+                format!("titles cannot be read: {error}"),
+            );
+            Vec::new()
+        }
+    };
+    let hidden = match hidden_result {
+        Ok(hidden) => hidden,
+        Err(error) => {
+            push_export_preflight_item(
+                &mut items,
+                "caption-state",
+                "blocker",
+                format!("caption visibility cannot be read: {error}"),
+            );
+            Default::default()
+        }
+    };
+    if let Err(error) = style_result {
+        push_export_preflight_item(
+            &mut items,
+            "style",
+            "blocker",
+            format!("subtitle style cannot be read: {error}"),
+        );
+    }
+    if let Err(error) = settings.validate() {
+        push_export_preflight_item(&mut items, "settings", "blocker", error.to_string());
+    } else {
+        items.push(ExportPreflightItem {
+            code: "settings".into(),
+            level: "pass".into(),
+            message: format!(
+                "{} / {:?} settings are compatible",
+                settings.extension().to_uppercase(),
+                settings.video_codec
+            ),
+        });
+    }
+
+    let media_info = if !doc.media.path.is_file() {
+        push_export_preflight_item(
+            &mut items,
+            "media",
+            "blocker",
+            format!("source media is missing: {}", doc.media.path.display()),
+        );
+        None
+    } else {
+        match crate::media::probe(&doc.media.path).await {
+            Ok(info)
+                if info.duration_seconds > 0.001
+                    && info.width.is_some_and(|width| width > 0)
+                    && info.height.is_some_and(|height| height > 0) =>
+            {
+                items.push(ExportPreflightItem {
+                    code: "media".into(),
+                    level: "pass".into(),
+                    message: format!(
+                        "source media is readable ({}×{}, {:.1}s)",
+                        info.width.unwrap_or_default(),
+                        info.height.unwrap_or_default(),
+                        info.duration_seconds
+                    ),
+                });
+                if (info.duration_seconds - doc.media.duration_seconds).abs()
+                    > (info.duration_seconds * 0.01).max(0.25)
+                {
+                    items.push(ExportPreflightItem {
+                        code: "media-duration".into(),
+                        level: "warning".into(),
+                        message: format!(
+                            "project duration {:.1}s differs from source duration {:.1}s",
+                            doc.media.duration_seconds, info.duration_seconds
+                        ),
+                    });
+                }
+                Some(info)
+            }
+            Ok(_) => {
+                push_export_preflight_item(
+                    &mut items,
+                    "media",
+                    "blocker",
+                    "source media has no decodable video stream or duration".into(),
+                );
+                None
+            }
+            Err(error) => {
+                push_export_preflight_item(
+                    &mut items,
+                    "media",
+                    "blocker",
+                    format!("source media cannot be decoded: {error}"),
+                );
+                None
+            }
+        }
+    };
+
+    let duration_seconds: f64 = crate::export::project::kept_intervals(&doc, &cuts.cuts)
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum();
+    if duration_seconds <= 0.001 {
+        push_export_preflight_item(
+            &mut items,
+            "timeline",
+            "blocker",
+            "the current cuts remove the entire media timeline".into(),
+        );
+    } else {
+        items.push(ExportPreflightItem {
+            code: "timeline".into(),
+            level: "pass".into(),
+            message: format!("edited duration is {duration_seconds:.1}s"),
+        });
+    }
+
+    if !items
+        .iter()
+        .any(|item| item.code == "titles" && item.level == "blocker")
+    {
+        let invalid_titles = titles
+            .iter()
+            .filter(|title| title.end > doc.media.duration_seconds + 0.05)
+            .map(|title| {
+                format!(
+                    "{}: title ends after the source timeline ({:.1}s > {:.1}s)",
+                    title.id, title.end, doc.media.duration_seconds
+                )
+            })
+            .collect::<Vec<_>>();
+        if invalid_titles.is_empty() {
+            items.push(ExportPreflightItem {
+                code: "titles".into(),
+                level: "pass".into(),
+                message: format!("{} title item(s) are ready", titles.len()),
+            });
+        } else {
+            push_export_preflight_item(&mut items, "titles", "blocker", invalid_titles.join("; "));
+        }
+    }
+
+    let has_background_music = audio_mix_result
+        .as_ref()
+        .ok()
+        .is_some_and(|mix| !mix.music.is_empty());
+    match audio_mix_result.and_then(|mix| mix.fit_to_duration(duration_seconds)) {
+        Ok(mix) => {
+            let mut music_ready = 0usize;
+            for track in &mix.music {
+                if !track.path.is_file() {
+                    push_export_preflight_item(
+                        &mut items,
+                        "audio",
+                        "blocker",
+                        format!(
+                            "background music {} is missing: {}",
+                            track.id,
+                            track.path.display()
+                        ),
+                    );
+                } else {
+                    match crate::media::probe(&track.path).await {
+                        Ok(info)
+                            if info.duration_seconds > 0.001
+                                && info.channels.is_some_and(|channels| channels > 0) =>
+                        {
+                            music_ready += 1;
+                        }
+                        Ok(_) => push_export_preflight_item(
+                            &mut items,
+                            "audio",
+                            "blocker",
+                            format!(
+                                "background music {} has no decodable audio stream",
+                                track.id
+                            ),
+                        ),
+                        Err(error) => push_export_preflight_item(
+                            &mut items,
+                            "audio",
+                            "blocker",
+                            format!("background music {} cannot be decoded: {error}", track.id),
+                        ),
+                    }
+                }
+            }
+            if music_ready == mix.music.len() && music_ready > 0 {
+                items.push(ExportPreflightItem {
+                    code: "audio".into(),
+                    level: "pass".into(),
+                    message: format!(
+                        "audio mix and {music_ready} background music clip(s) are ready"
+                    ),
+                });
+            } else if mix.music.is_empty() {
+                items.push(ExportPreflightItem {
+                    code: "audio".into(),
+                    level: "pass".into(),
+                    message: if mix.muted {
+                        "program audio will be muted".into()
+                    } else {
+                        format!(
+                            "audio mix is ready ({}%, {:.1}s in / {:.1}s out)",
+                            (mix.volume * 100.0).round(),
+                            mix.fade_in,
+                            mix.fade_out
+                        )
+                    },
+                });
+            }
+        }
+        Err(error) => push_export_preflight_item(
+            &mut items,
+            "audio",
+            "blocker",
+            format!("audio mix cannot be used: {error}"),
+        ),
+    }
+
+    let visible_captions = doc
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.sentences.iter())
+        .filter(|sentence| !sentence.words.is_empty() && !hidden.contains(&sentence.id))
+        .count();
+    let hidden_captions = doc
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.sentences.iter())
+        .filter(|sentence| !sentence.words.is_empty() && hidden.contains(&sentence.id))
+        .count();
+    if settings.subtitle_mode == crate::data::export_settings::ExportSubtitleMode::None {
+        items.push(ExportPreflightItem {
+            code: "captions".into(),
+            level: "pass".into(),
+            message: "video export is configured without captions".into(),
+        });
+    } else {
+        match crate::data::export_settings::project_caption_doc_with_hidden(
+            &doc,
+            settings.subtitle_language.as_deref(),
+            settings.bilingual_subtitles,
+            &hidden,
+        ) {
+            Ok(_) => items.push(ExportPreflightItem {
+                code: "captions".into(),
+                level: "pass".into(),
+                message: format!("{visible_captions} visible caption line(s) are ready"),
+            }),
+            Err(error) => {
+                push_export_preflight_item(&mut items, "captions", "blocker", error.to_string())
+            }
+        }
+    }
+    if hidden_captions > 0 {
+        items.push(ExportPreflightItem {
+            code: "hidden-captions".into(),
+            level: "warning".into(),
+            message: format!("{hidden_captions} hidden caption line(s) will not be exported"),
+        });
+    }
+
+    let mut invalid_broll = Vec::new();
+    for placement in &broll {
+        if let Err(error) = placement.validate() {
+            invalid_broll.push(format!("{}: {error}", placement.id));
+        } else if placement.end > doc.media.duration_seconds + 0.05 {
+            invalid_broll.push(format!(
+                "{}: placement ends after the source timeline ({:.1}s > {:.1}s)",
+                placement.id, placement.end, doc.media.duration_seconds
+            ));
+        } else if !placement.file.is_file() {
+            invalid_broll.push(format!(
+                "{}: asset is missing ({})",
+                placement.id,
+                placement.file.display()
+            ));
+        } else {
+            match crate::media::probe(&placement.file).await {
+                Ok(info)
+                    if info.width.is_some_and(|width| width > 0)
+                        && info.height.is_some_and(|height| height > 0) =>
+                {
+                    if !is_still_image(&placement.file)
+                        && info.duration_seconds + 0.05
+                            < placement.source_start + (placement.end - placement.start)
+                    {
+                        invalid_broll.push(format!(
+                            "{}: source range ends at {:.1}s but the asset is only {:.1}s",
+                            placement.id,
+                            placement.source_start + (placement.end - placement.start),
+                            info.duration_seconds
+                        ));
+                    }
+                }
+                Ok(_) => invalid_broll.push(format!(
+                    "{}: asset has no decodable visual stream",
+                    placement.id
+                )),
+                Err(error) => invalid_broll.push(format!(
+                    "{}: asset cannot be decoded ({error})",
+                    placement.id
+                )),
+            }
+        }
+    }
+    for (index, placement) in broll.iter().enumerate() {
+        if broll[index + 1..]
+            .iter()
+            .any(|other| placement.start < other.end && other.start < placement.end)
+        {
+            invalid_broll.push(format!(
+                "{}: placement overlaps another B-roll item",
+                placement.id
+            ));
+        }
+    }
+    if !items
+        .iter()
+        .any(|item| item.code == "broll" && item.level == "blocker")
+    {
+        if invalid_broll.is_empty() {
+            items.push(ExportPreflightItem {
+                code: "broll".into(),
+                level: "pass".into(),
+                message: format!("{} B-roll item(s) are available", broll.len()),
+            });
+        } else {
+            push_export_preflight_item(&mut items, "broll", "blocker", invalid_broll.join("; "));
+        }
+    }
+
+    let encoder = match crate::export::video::encoder_for_settings(&settings) {
+        Ok(encoder) => {
+            match crate::proc::run(
+                "ffmpeg",
+                &["-hide_banner", "-loglevel", "error", "-encoders"],
+            )
+            .await
+            {
+                Ok(encoders) if encoders.contains(&encoder) => items.push(ExportPreflightItem {
+                    code: "encoder".into(),
+                    level: "pass".into(),
+                    message: format!("{encoder} is available"),
+                }),
+                Ok(_) => push_export_preflight_item(
+                    &mut items,
+                    "encoder",
+                    "blocker",
+                    format!("FFmpeg does not provide the selected encoder `{encoder}`"),
+                ),
+                Err(error) => push_export_preflight_item(
+                    &mut items,
+                    "encoder",
+                    "blocker",
+                    format!("FFmpeg is unavailable: {error}"),
+                ),
+            }
+            encoder
+        }
+        Err(_) => "unavailable".into(),
+    };
+
+    let source_dimensions = media_info
+        .as_ref()
+        .and_then(|info| info.width.zip(info.height));
+    let dimensions = settings
+        .target_dimensions(source_dimensions)
+        .or(source_dimensions);
+    let (estimated_min_mb, estimated_max_mb) = export_size_estimate_mb(
+        &settings,
+        duration_seconds,
+        dimensions,
+        media_info
+            .as_ref()
+            .and_then(|info| info.channels)
+            .or(doc.media.channels)
+            .is_some_and(|channels| channels > 0)
+            || has_background_music,
+    );
+    items.push(ExportPreflightItem {
+        code: "size-estimate".into(),
+        level: "warning".into(),
+        message: format!(
+            "estimated output size is {estimated_min_mb}–{estimated_max_mb} MB; actual size depends on content"
+        ),
+    });
+    let ready = !items.iter().any(|item| item.level == "blocker");
+    Ok(ExportPreflightReport {
+        ready,
+        items,
+        summary: ExportPreflightSummary {
+            duration_seconds,
+            visible_captions,
+            hidden_captions,
+            broll_items: broll.len(),
+            title_items: titles.len(),
+            encoder,
+            estimated_min_mb,
+            estimated_max_mb,
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn export_preflight(
+    pid: String,
+    settings: crate::data::export_settings::VideoExportSettings,
+    root: Option<PathBuf>,
+) -> AppResult<ExportPreflightReport> {
+    export_preflight_impl(&pid, settings, root).await
 }
 
 static PROJECT_MUTATIONS: OnceLock<
@@ -2902,7 +5504,8 @@ fn broll_placement_from_input(
         start: input.start,
         end: input.end,
         mode,
-        rect: (mode == crate::data::broll::PlacementMode::Pip).then_some(default_pip_rect()),
+        rect: (mode == crate::data::broll::PlacementMode::Pip)
+            .then(|| input.rect.unwrap_or_else(default_pip_rect)),
         fit: input.fit.unwrap_or_default(),
         background: input.background.unwrap_or_default(),
         source_start: input.source_start.unwrap_or_default(),
@@ -2930,6 +5533,15 @@ pub async fn broll_list(pid: String, root: Option<PathBuf>) -> AppResult<BrollOv
             errors.push(format!("placements: {error}"));
             Vec::new()
         });
+        for placement in &accepted {
+            if !placement.file.is_file() {
+                errors.push(format!(
+                    "placement {}: media is missing or was moved ({})",
+                    placement.id,
+                    placement.file.display()
+                ));
+            }
+        }
         Ok(BrollOverview {
             suggestions,
             accepted,
@@ -2948,14 +5560,23 @@ pub async fn broll_add(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll add", move || {
-        let doc = Doc::load(&dir)?;
-        let mut placements = crate::data::broll::load(&dir)?;
-        let placement =
-            broll_placement_from_input(input, format!("br-{}", uuid::Uuid::new_v4().simple()))?;
-        validate_broll_span(&doc, &placements, placement.start, placement.end, None)?;
-        placements.push(placement.clone());
-        crate::data::broll::save(&dir, &placements)?;
-        Ok(placement)
+        crate::data::edit_history::record(
+            &dir,
+            "Add B-roll",
+            || {
+                let doc = Doc::load(&dir)?;
+                let mut placements = crate::data::broll::load(&dir)?;
+                let placement = broll_placement_from_input(
+                    input,
+                    format!("br-{}", uuid::Uuid::new_v4().simple()),
+                )?;
+                validate_broll_span(&doc, &placements, placement.start, placement.end, None)?;
+                placements.push(placement.clone());
+                crate::data::broll::save(&dir, &placements)?;
+                Ok(placement)
+            },
+            |_| true,
+        )
     })
     .await
 }
@@ -2970,69 +5591,85 @@ pub async fn broll_accept_suggestion(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll suggestion accept", move || {
-        let doc = Doc::load(&dir)?;
-        let suggestions = crate::pipeline::broll::load_artifact(&dir)?;
-        let suggestion = suggestions
-            .iter()
-            .find(|candidate| **candidate == suggestion)
-            .ok_or_else(|| {
-                AppError::Schema(
-                    "B-roll suggestions changed while choosing an asset; refresh and try again"
-                        .into(),
-                )
-            })?;
-        let placements = crate::data::broll::load(&dir)?;
-        let existing = placements
-            .iter()
-            .map(|placement| (placement.start, placement.end))
-            .collect::<Vec<_>>();
-        let problems =
-            crate::pipeline::broll::lint(&doc, std::slice::from_ref(suggestion), &existing);
-        if !problems.is_empty() {
-            return Err(AppError::Schema(
-                problems
+        crate::data::edit_history::record(
+            &dir,
+            "Add suggested B-roll",
+            || {
+                let doc = Doc::load(&dir)?;
+                let suggestions = crate::pipeline::broll::load_artifact(&dir)?;
+                let suggestion = suggestions
                     .iter()
-                    .map(|problem| format!("{}: {}", problem.loc, problem.problem))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
-        let words = doc
-            .all_words()
-            .into_iter()
-            .map(|word| (word.id.as_str(), (word.start, word.end)))
-            .collect::<HashMap<_, _>>();
-        let start = words
-            .get(suggestion.start.as_str())
-            .map(|times| times.0)
-            .ok_or_else(|| AppError::Schema("B-roll suggestion start word is missing".into()))?;
-        let end = words
-            .get(suggestion.end.as_str())
-            .map(|times| times.1)
-            .ok_or_else(|| AppError::Schema("B-roll suggestion end word is missing".into()))?;
-        let mode = match suggestion.mode {
-            crate::pipeline::broll::BrollMode::Fullscreen => {
-                crate::data::broll::PlacementMode::Fullscreen
-            }
-            crate::pipeline::broll::BrollMode::Pip => crate::data::broll::PlacementMode::Pip,
-        };
-        let input = BrollPlacementInput {
-            file,
-            start,
-            end,
-            mode: Some(mode),
-            fit: None,
-            background: None,
-            source_start: None,
-            radius: None,
-            name: Some(suggestion.query.clone()),
-        };
-        let placement =
-            broll_placement_from_input(input, format!("br-{}", uuid::Uuid::new_v4().simple()))?;
-        let mut placements = placements;
-        placements.push(placement.clone());
-        crate::data::broll::save(&dir, &placements)?;
-        Ok(placement)
+                    .find(|candidate| **candidate == suggestion)
+                    .ok_or_else(|| {
+                        AppError::Schema(
+                            "B-roll suggestions changed while choosing an asset; refresh and try again"
+                                .into(),
+                        )
+                    })?;
+                let placements = crate::data::broll::load(&dir)?;
+                let existing = placements
+                    .iter()
+                    .map(|placement| (placement.start, placement.end))
+                    .collect::<Vec<_>>();
+                let problems =
+                    crate::pipeline::broll::lint(&doc, std::slice::from_ref(suggestion), &existing);
+                if !problems.is_empty() {
+                    return Err(AppError::Schema(
+                        problems
+                            .iter()
+                            .map(|problem| format!("{}: {}", problem.loc, problem.problem))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ));
+                }
+                let words = doc
+                    .all_words()
+                    .into_iter()
+                    .map(|word| (word.id.as_str(), (word.start, word.end)))
+                    .collect::<HashMap<_, _>>();
+                let start = words
+                    .get(suggestion.start.as_str())
+                    .map(|times| times.0)
+                    .ok_or_else(|| {
+                        AppError::Schema("B-roll suggestion start word is missing".into())
+                    })?;
+                let end = words
+                    .get(suggestion.end.as_str())
+                    .map(|times| times.1)
+                    .ok_or_else(|| {
+                        AppError::Schema("B-roll suggestion end word is missing".into())
+                    })?;
+                let mode = match suggestion.mode {
+                    crate::pipeline::broll::BrollMode::Fullscreen => {
+                        crate::data::broll::PlacementMode::Fullscreen
+                    }
+                    crate::pipeline::broll::BrollMode::Pip => {
+                        crate::data::broll::PlacementMode::Pip
+                    }
+                };
+                let input = BrollPlacementInput {
+                    file,
+                    start,
+                    end,
+                    mode: Some(mode),
+                    fit: None,
+                    background: None,
+                    rect: None,
+                    source_start: None,
+                    radius: None,
+                    name: Some(suggestion.query.clone()),
+                };
+                let placement = broll_placement_from_input(
+                    input,
+                    format!("br-{}", uuid::Uuid::new_v4().simple()),
+                )?;
+                let mut placements = placements;
+                placements.push(placement.clone());
+                crate::data::broll::save(&dir, &placements)?;
+                Ok(placement)
+            },
+            |_| true,
+        )
     })
     .await
 }
@@ -3047,32 +5684,44 @@ pub async fn broll_update(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll update", move || {
-        let doc = Doc::load(&dir)?;
-        let mut placements = crate::data::broll::load(&dir)?;
-        if !placements.iter().any(|placement| placement.id == id) {
-            return Err(AppError::Schema(format!("B-roll id {id} not found")));
-        }
-        let mut replacement = broll_placement_from_input(input, id.clone())?;
-        validate_broll_span(
-            &doc,
-            &placements,
-            replacement.start,
-            replacement.end,
-            Some(&id),
-        )?;
-        let index = placements
-            .iter()
-            .position(|placement| placement.id == id)
-            .ok_or_else(|| AppError::Schema(format!("B-roll id {id} disappeared")))?;
-        replacement.rect = match replacement.mode {
-            crate::data::broll::PlacementMode::Fullscreen => None,
-            crate::data::broll::PlacementMode::Pip => {
-                placements[index].rect.or(Some(default_pip_rect()))
-            }
-        };
-        placements[index] = replacement.clone();
-        crate::data::broll::save(&dir, &placements)?;
-        Ok(replacement)
+        crate::data::edit_history::record(
+            &dir,
+            "Adjust B-roll",
+            || {
+                let doc = Doc::load(&dir)?;
+                let mut placements = crate::data::broll::load(&dir)?;
+                if !placements.iter().any(|placement| placement.id == id) {
+                    return Err(AppError::Schema(format!("B-roll id {id} not found")));
+                }
+                let requested_rect = input.rect;
+                let mut replacement = broll_placement_from_input(input, id.clone())?;
+                validate_broll_span(
+                    &doc,
+                    &placements,
+                    replacement.start,
+                    replacement.end,
+                    Some(&id),
+                )?;
+                let index = placements
+                    .iter()
+                    .position(|placement| placement.id == id)
+                    .ok_or_else(|| AppError::Schema(format!("B-roll id {id} disappeared")))?;
+                replacement.rect = match replacement.mode {
+                    crate::data::broll::PlacementMode::Fullscreen => None,
+                    crate::data::broll::PlacementMode::Pip => requested_rect
+                        .or(placements[index].rect)
+                        .or(Some(default_pip_rect())),
+                };
+                let changed = placements[index] != replacement;
+                placements[index] = replacement.clone();
+                if changed {
+                    crate::data::broll::save(&dir, &placements)?;
+                }
+                Ok((replacement, changed))
+            },
+            |(_, changed)| *changed,
+        )
+        .map(|(placement, _)| placement)
     })
     .await
 }
@@ -3082,36 +5731,47 @@ pub async fn broll_remove(pid: String, id: String, root: Option<PathBuf>) -> App
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("B-roll remove", move || {
-        let mut placements = crate::data::broll::load(&dir)?;
-        let before = placements.len();
-        placements.retain(|placement| placement.id != id);
-        if placements.len() == before {
-            return Ok(false);
-        }
-        crate::data::broll::save(&dir, &placements)?;
-        Ok(true)
+        crate::data::edit_history::record(
+            &dir,
+            "Remove B-roll",
+            || {
+                let mut placements = crate::data::broll::load(&dir)?;
+                let before = placements.len();
+                placements.retain(|placement| placement.id != id);
+                if placements.len() == before {
+                    return Ok(false);
+                }
+                crate::data::broll::save(&dir, &placements)?;
+                Ok(true)
+            },
+            |changed| *changed,
+        )
     })
     .await
 }
 
-fn broll_preview_timestamps(
+fn broll_preview_points(
     doc: &Doc,
     cuts: &ClipCuts,
     placements: &[crate::data::broll::BrollPlacement],
-) -> Vec<f64> {
+) -> Vec<(f64, f64, usize)> {
     let intervals = crate::export::cut_intervals(doc, &cuts.cuts);
+    let kept = crate::export::kept_intervals(doc, &cuts.cuts);
     placements
         .iter()
-        .filter_map(|placement| {
-            if intervals
+        .enumerate()
+        .filter_map(|(index, placement)| {
+            let (source_start, source_end) = kept
                 .iter()
-                .any(|(start, end)| *start <= placement.start && placement.end <= *end)
-            {
-                return None;
-            }
-            let start = crate::export::retime(placement.start, &intervals);
-            let end = crate::export::retime(placement.end, &intervals);
-            (end > start).then_some((start + end) / 2.0)
+                .filter_map(|(start, end)| {
+                    let overlap_start = placement.start.max(*start);
+                    let overlap_end = placement.end.min(*end);
+                    (overlap_end > overlap_start).then_some((overlap_start, overlap_end))
+                })
+                .max_by(|left, right| (left.1 - left.0).total_cmp(&(right.1 - right.0)))?;
+            let source_time = (source_start + source_end) / 2.0;
+            let program_time = crate::export::retime(source_time, &intervals);
+            Some((program_time, source_time, index))
         })
         .collect()
 }
@@ -3155,22 +5815,38 @@ async fn broll_preview_impl(
         });
     }
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_project_mutation(&dir).await;
     let prepare_dir = dir.clone();
-    let (doc, cuts, placements, ass) = run_blocking("B-roll preview preparation", move || {
-        let doc = Doc::load(&prepare_dir)?;
-        let cuts: ClipCuts = std::fs::read_to_string(prepare_dir.join("cuts.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
-        let placements = crate::data::broll::load(&prepare_dir)?;
-        let ass = prepare_dir.join("broll-preview.ass");
-        if !placements.is_empty() {
-            crate::export::write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
-        }
-        Ok((doc, cuts, placements, ass))
-    })
-    .await?;
+    let has_custom_timestamps = !at.is_empty();
+    let (doc, cuts, placements, ass) = {
+        let _mutation = lock_project_mutation(&dir).await;
+        run_blocking("B-roll preview preparation", move || {
+            let doc = Doc::load(&prepare_dir)?;
+            let cuts = load_project_cuts(&prepare_dir)?;
+            let placements = crate::data::broll::load(&prepare_dir)?;
+            let ass = prepare_dir.join("broll-preview.ass");
+            if !placements.is_empty() && has_custom_timestamps {
+                let style = crate::data::substyle::SubStyle::load(&prepare_dir)?;
+                let settings = crate::data::export_settings::load(&prepare_dir)?;
+                let hidden = crate::data::subtitle::load_hidden_checked(&prepare_dir)?;
+                let caption_doc = crate::data::export_settings::project_caption_doc_with_hidden(
+                    &doc,
+                    settings.subtitle_language.as_deref(),
+                    settings.bilingual_subtitles,
+                    &hidden,
+                )?;
+                crate::export::write_ass_with_style(
+                    &caption_doc,
+                    &cuts.cuts,
+                    &style,
+                    &ass,
+                    1920,
+                    1080,
+                )?;
+            }
+            Ok((doc, cuts, placements, ass))
+        })
+        .await?
+    };
     if placements.is_empty() {
         let scope = app.asset_protocol_scope();
         let mut current = state.current.lock().expect("B-roll preview state poisoned");
@@ -3191,47 +5867,70 @@ async fn broll_preview_impl(
         }
         return Ok(Vec::new());
     }
-    let video = dir.join("broll-preview.mp4");
-    let render_report = on_progress.clone();
-    crate::export::video::render_video_with_broll_progress(
-        &doc,
-        &cuts.cuts,
-        &ass,
-        &video,
-        &placements,
-        crate::export::video::RenderPurpose::Preview,
-        render_report.map(|callback| {
-            Arc::new(move |progress: crate::export::video::VideoRenderProgress| {
-                callback(BrollPreviewProgress {
-                    phase: "encoding".into(),
-                    progress: 5 + ((u16::from(progress.progress) * 85) / 100) as u8,
-                    current: Some(progress.current_seconds),
-                    total: Some(progress.total_seconds),
-                    encoder: Some(progress.encoder),
-                });
-            }) as crate::export::video::VideoRenderProgressCallback
-        }),
-    )
-    .await?;
-    let timestamps = if at.is_empty() {
-        broll_preview_timestamps(&doc, &cuts, &placements)
-    } else {
-        at
-    };
     let mut outputs = Vec::new();
-    let frame_total = timestamps.len();
-    for (index, timestamp) in timestamps.into_iter().enumerate() {
-        let output = dir.join(format!("broll-preview-{timestamp:.1}.png"));
-        crate::media::extract_frame(&video, timestamp, &output).await?;
-        outputs.push(output.to_string_lossy().into_owned());
-        if let Some(callback) = on_progress.as_ref() {
-            callback(BrollPreviewProgress {
-                phase: "frames".into(),
-                progress: 90 + (((index + 1) * 9) / frame_total.max(1)) as u8,
-                current: Some((index + 1) as f64),
-                total: Some(frame_total as f64),
-                encoder: None,
-            });
+    if at.is_empty() {
+        let points = broll_preview_points(&doc, &cuts, &placements);
+        let frame_total = points.len();
+        for (index, (program_time, source_time, placement_index)) in points.into_iter().enumerate()
+        {
+            let output = dir.join(format!(
+                "broll-preview-{program_time:.1}-{placement_index}.png"
+            ));
+            crate::export::video::render_broll_snapshot(
+                &doc,
+                &placements[placement_index],
+                source_time,
+                &output,
+            )
+            .await?;
+            outputs.push(output.to_string_lossy().into_owned());
+            if let Some(callback) = on_progress.as_ref() {
+                callback(BrollPreviewProgress {
+                    phase: "frames".into(),
+                    progress: 5 + (((index + 1) * 94) / frame_total.max(1)) as u8,
+                    current: Some((index + 1) as f64),
+                    total: Some(frame_total as f64),
+                    encoder: None,
+                });
+            }
+        }
+    } else {
+        let video = dir.join("broll-preview.mp4");
+        let render_report = on_progress.clone();
+        crate::export::video::render_video_with_broll_progress(
+            &doc,
+            &cuts.cuts,
+            &ass,
+            &video,
+            &placements,
+            crate::export::video::RenderPurpose::Preview,
+            render_report.map(|callback| {
+                Arc::new(move |progress: crate::export::video::VideoRenderProgress| {
+                    callback(BrollPreviewProgress {
+                        phase: "encoding".into(),
+                        progress: 5 + ((u16::from(progress.progress) * 85) / 100) as u8,
+                        current: Some(progress.current_seconds),
+                        total: Some(progress.total_seconds),
+                        encoder: Some(progress.encoder),
+                    });
+                }) as crate::export::video::VideoRenderProgressCallback
+            }),
+        )
+        .await?;
+        let frame_total = at.len();
+        for (index, timestamp) in at.into_iter().enumerate() {
+            let output = dir.join(format!("broll-preview-{timestamp:.1}.png"));
+            crate::media::extract_frame(&video, timestamp, &output).await?;
+            outputs.push(output.to_string_lossy().into_owned());
+            if let Some(callback) = on_progress.as_ref() {
+                callback(BrollPreviewProgress {
+                    phase: "frames".into(),
+                    progress: 90 + (((index + 1) * 9) / frame_total.max(1)) as u8,
+                    current: Some((index + 1) as f64),
+                    total: Some(frame_total as f64),
+                    encoder: None,
+                });
+            }
         }
     }
     let scope = app.asset_protocol_scope();
@@ -3271,6 +5970,7 @@ pub async fn broll_preview_start(
 ) -> AppResult<BrollPreviewJobStatus> {
     let status_path = broll_preview_status_path(&pid, None)?;
     let cancel = Arc::new(AtomicBool::new(false));
+    let now = unix_timestamp_seconds();
     let status = BrollPreviewJobStatus {
         pid: pid.clone(),
         state: "running".into(),
@@ -3279,6 +5979,8 @@ pub async fn broll_preview_start(
         current: None,
         total: None,
         encoder: None,
+        started_at: Some(now),
+        updated_at: Some(now),
         error: None,
         paths: vec![],
     };
@@ -3297,6 +5999,7 @@ pub async fn broll_preview_start(
             BrollPreviewJob {
                 status: status.clone(),
                 cancel: cancel.clone(),
+                status_path: status_path.clone(),
             },
         );
     }
@@ -3358,8 +6061,16 @@ pub async fn broll_preview_start(
                     status.error = Some(error.to_string());
                 }
             }
+            status.updated_at = Some(unix_timestamp_seconds());
             status
         };
+        if let Some(job) = jobs
+            .lock()
+            .expect("B-roll preview state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         let persisted = final_status.clone();
         if let Err(error) = persist_background_status(
             "save final B-roll preview status",
@@ -3395,19 +6106,70 @@ pub async fn broll_preview_start(
 #[tauri::command]
 pub async fn broll_preview_status(
     pid: String,
+    restore_assets: Option<bool>,
+    app: tauri::AppHandle,
     state: tauri::State<'_, BrollPreviewState>,
 ) -> AppResult<BrollPreviewJobStatus> {
-    if let Some(status) = state
+    let active = state
         .jobs
         .lock()
         .expect("B-roll preview state poisoned")
         .get(&pid)
-        .map(|job| job.status.clone())
-    {
-        return Ok(status);
+        .map(|job| (job.status.clone(), job.status_path.clone()));
+    if let Some((status, path)) = active {
+        persist_background_status(
+            "checkpoint B-roll preview status",
+            path.clone(),
+            status.clone(),
+            save_broll_preview_status,
+        )
+        .await?;
+        let latest = state
+            .jobs
+            .lock()
+            .expect("B-roll preview state poisoned")
+            .get(&pid)
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| status.clone());
+        if latest.state != status.state
+            || latest.phase != status.phase
+            || latest.progress != status.progress
+            || latest.updated_at != status.updated_at
+        {
+            persist_background_status(
+                "checkpoint latest B-roll preview status",
+                path.clone(),
+                latest.clone(),
+                save_broll_preview_status,
+            )
+            .await?;
+        }
+        if !restore_assets.unwrap_or(false) {
+            return Ok(latest);
+        }
+        let latest_paths = latest.paths.clone();
+        let restored = restore_broll_preview_assets(&pid, latest, &app, state.inner()).await?;
+        if restored.paths != latest_paths {
+            persist_background_status(
+                "save recovered B-roll preview status",
+                path,
+                restored.clone(),
+                save_broll_preview_status,
+            )
+            .await?;
+            if let Some(job) = state
+                .jobs
+                .lock()
+                .expect("B-roll preview state poisoned")
+                .get_mut(&pid)
+            {
+                job.status = restored.clone();
+            }
+        }
+        return Ok(restored);
     }
     let path = broll_preview_status_path(&pid, None)?;
-    run_blocking("load B-roll preview status", move || {
+    let loaded = run_blocking("load B-roll preview status", move || {
         load_recovered_broll_preview_status(&path).map_err(|error| match error {
             AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                 AppError::Schema("no B-roll preview job for this project".into())
@@ -3415,7 +6177,23 @@ pub async fn broll_preview_status(
             other => other,
         })
     })
-    .await
+    .await?;
+    if !restore_assets.unwrap_or(false) {
+        return Ok(loaded);
+    }
+    let original_paths = loaded.paths.clone();
+    let restored = restore_broll_preview_assets(&pid, loaded, &app, state.inner()).await?;
+    if restored.paths != original_paths {
+        let path = broll_preview_status_path(&pid, None)?;
+        persist_background_status(
+            "save recovered B-roll preview status",
+            path,
+            restored.clone(),
+            save_broll_preview_status,
+        )
+        .await?;
+    }
+    Ok(restored)
 }
 
 #[tauri::command]
@@ -3423,16 +6201,27 @@ pub async fn broll_preview_cancel(
     pid: String,
     state: tauri::State<'_, BrollPreviewState>,
 ) -> AppResult<BrollPreviewJobStatus> {
-    let mut jobs = state.jobs.lock().expect("B-roll preview state poisoned");
-    let job = jobs
-        .get_mut(&pid)
-        .ok_or_else(|| AppError::Schema("no B-roll preview job for this project".into()))?;
-    if job.status.state == "running" {
-        job.cancel.store(true, Ordering::Relaxed);
-        job.status.state = "cancelling".into();
-        job.status.phase = "cancelling".into();
-    }
-    Ok(job.status.clone())
+    let (status, path) = {
+        let mut jobs = state.jobs.lock().expect("B-roll preview state poisoned");
+        let job = jobs
+            .get_mut(&pid)
+            .ok_or_else(|| AppError::Schema("no B-roll preview job for this project".into()))?;
+        if job.status.state == "running" {
+            job.cancel.store(true, Ordering::Relaxed);
+            job.status.state = "cancelling".into();
+            job.status.phase = "cancelling".into();
+            job.status.updated_at = Some(unix_timestamp_seconds());
+        }
+        (job.status.clone(), job.status_path.clone())
+    };
+    persist_background_status(
+        "checkpoint B-roll preview cancellation",
+        path,
+        status.clone(),
+        save_broll_preview_status,
+    )
+    .await?;
+    Ok(status)
 }
 
 #[derive(Debug, Serialize)]
@@ -3445,23 +6234,27 @@ pub struct DiarizeResult {
 pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<DiarizeResult> {
     let _heavy_work = crate::performance::acquire_heavy("speaker-analysis-cli").await?;
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_project_mutation(&dir).await;
     let load_dir = dir.clone();
-    let (mut doc, model) = run_blocking("diarization preparation", move || {
-        Ok((
-            Doc::load(&load_dir)?,
-            crate::data::modelconfig::load().diarize_model,
-        ))
+    let (media_path, model) = run_blocking("diarization preparation", move || {
+        let doc = Doc::load(&load_dir)?;
+        let model = crate::data::modelconfig::load().diarize_model;
+        validate_speaker_preflight(&model)?;
+        Ok((doc.media.path, model))
     })
     .await?;
     let wav = dir.join("audio.wav");
-    if !tokio::fs::try_exists(&wav).await? {
-        extract_audio_wav(&doc.media.path, &wav).await?;
+    {
+        let _audio_mutation = lock_project_mutation(&dir).await;
+        if !tokio::fs::try_exists(&wav).await? {
+            extract_audio_wav(&media_path, &wav).await?;
+        }
     }
     let out = crate::diarize::diarize_file_with_model(&wav, &model).await?;
     let segments = out.segments;
     let segment_count = segments.len();
+    let _mutation = lock_project_mutation(&dir).await;
     let paragraphs_assigned = run_blocking("diarization save", move || {
+        let mut doc = Doc::load(&dir)?;
         let original = doc.clone();
         let paragraphs_assigned = crate::diarize::assign_speakers(&mut doc, &segments);
         if paragraphs_assigned > 0 && doc != original {
@@ -3483,6 +6276,7 @@ pub async fn diarize_pid(pid: String, root: Option<PathBuf>) -> AppResult<Diariz
             }
             doc.meta.updated_at = chrono::Utc::now();
             doc.save(&dir)?;
+            crate::data::activity::touch(&dir)?;
         }
         Ok(paragraphs_assigned)
     })
@@ -3520,6 +6314,7 @@ pub async fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<Stri
             }
             doc.meta.updated_at = chrono::Utc::now();
             doc.save(&dir)?;
+            crate::data::activity::touch(&dir)?;
         }
         Ok(format!("{} fix(es)", rep.total()))
     })
@@ -3561,6 +6356,7 @@ fn derive_models_endpoint(endpoint: &str) -> AppResult<String> {
         "/text/chatcompletion_v2",
         "/messages",
         "/responses",
+        "/audio/transcriptions",
     ]
     .iter()
     .find_map(|suffix| path.strip_suffix(suffix))
@@ -3600,6 +6396,24 @@ fn parse_llm_models(body: &str) -> AppResult<Vec<String>> {
 /// short asynchronous network request and never runs on the UI thread.
 #[tauri::command]
 pub async fn llm_models_list(endpoint: String, api_key: String) -> AppResult<Vec<String>> {
+    let api_key = if api_key.trim().is_empty() {
+        let requested_endpoint = endpoint.trim().to_string();
+        run_blocking("settings credential lookup", move || {
+            let config = crate::data::modelconfig::load();
+            Ok(if config.llm_endpoint.trim() == requested_endpoint {
+                config.llm_api_key
+            } else {
+                String::new()
+            })
+        })
+        .await?
+    } else {
+        api_key
+    };
+    models_list_impl(endpoint, api_key).await
+}
+
+async fn models_list_impl(endpoint: String, api_key: String) -> AppResult<Vec<String>> {
     let catalog_url = derive_models_endpoint(&endpoint)?;
     let anthropic = reqwest::Url::parse(&catalog_url)
         .ok()
@@ -3640,6 +6454,25 @@ pub async fn llm_models_list(endpoint: String, api_key: String) -> AppResult<Vec
     parse_llm_models(&body)
 }
 
+#[tauri::command]
+pub async fn asr_models_list(endpoint: String, api_key: String) -> AppResult<Vec<String>> {
+    let api_key = if api_key.trim().is_empty() {
+        let requested_endpoint = endpoint.trim().to_string();
+        run_blocking("ASR credential lookup", move || {
+            let config = crate::data::modelconfig::load();
+            Ok(if config.asr_cloud_endpoint.trim() == requested_endpoint {
+                config.asr_cloud_api_key
+            } else {
+                String::new()
+            })
+        })
+        .await?
+    } else {
+        api_key
+    };
+    models_list_impl(endpoint, api_key).await
+}
+
 /// Report whether local ASR can really run. This imports the Python package
 /// and validates complete model snapshots instead of checking directory names.
 #[tauri::command]
@@ -3677,12 +6510,17 @@ pub struct SetupJobStatus {
     pub kind: String,
     pub state: String,
     pub phase: String,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
     pub error: Option<String>,
 }
 
 struct SetupJob {
     status: SetupJobStatus,
     cancel: Arc<AtomicBool>,
+    status_path: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -3713,6 +6551,7 @@ fn load_recovered_setup_status(path: &std::path::Path) -> AppResult<SetupJobStat
         status.error = Some(
             "the previous setup task was interrupted when lumen-cut closed; start it again".into(),
         );
+        status.updated_at = Some(unix_timestamp_seconds());
         save_setup_status(path, &status)?;
     }
     Ok(status)
@@ -3734,10 +6573,13 @@ pub async fn setup_job_start(
     let phase =
         setup_phase(&kind).ok_or_else(|| AppError::Schema(format!("unknown setup job: {kind}")))?;
     let cancel = Arc::new(AtomicBool::new(false));
+    let now = unix_timestamp_seconds();
     let status = SetupJobStatus {
         kind: kind.clone(),
         state: "running".into(),
         phase: "waiting".into(),
+        started_at: Some(now),
+        updated_at: Some(now),
         error: None,
     };
     {
@@ -3753,6 +6595,7 @@ pub async fn setup_job_start(
         *active = Some(SetupJob {
             status: status.clone(),
             cancel: cancel.clone(),
+            status_path: setup_status_path(),
         });
     }
     let path = setup_status_path();
@@ -3772,6 +6615,7 @@ pub async fn setup_job_start(
     tauri::async_runtime::spawn(async move {
         if let Some(active) = job.lock().expect("setup job state poisoned").as_mut() {
             active.status.phase = phase.into();
+            active.status.updated_at = Some(unix_timestamp_seconds());
         }
         let work = async {
             match kind.as_str() {
@@ -3806,8 +6650,12 @@ pub async fn setup_job_start(
                     status.error = Some(error.to_string());
                 }
             }
+            status.updated_at = Some(unix_timestamp_seconds());
             status
         };
+        if let Some(active) = job.lock().expect("setup job state poisoned").as_mut() {
+            active.status = final_status.clone();
+        }
         let persisted = final_status.clone();
         if let Err(error) = persist_background_status(
             "save final setup status",
@@ -3838,14 +6686,40 @@ pub async fn setup_job_start(
 
 #[tauri::command]
 pub async fn setup_job_status(state: tauri::State<'_, SetupJobState>) -> AppResult<SetupJobStatus> {
-    if let Some(status) = state
+    let active = state
         .job
         .lock()
         .expect("setup job state poisoned")
         .as_ref()
-        .map(|job| job.status.clone())
-    {
-        return Ok(status);
+        .map(|job| (job.status.clone(), job.status_path.clone()));
+    if let Some((status, path)) = active {
+        persist_background_status(
+            "checkpoint setup status",
+            path.clone(),
+            status.clone(),
+            save_setup_status,
+        )
+        .await?;
+        let latest = state
+            .job
+            .lock()
+            .expect("setup job state poisoned")
+            .as_ref()
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| status.clone());
+        if latest.state != status.state
+            || latest.phase != status.phase
+            || latest.updated_at != status.updated_at
+        {
+            persist_background_status(
+                "checkpoint latest setup status",
+                path,
+                latest.clone(),
+                save_setup_status,
+            )
+            .await?;
+        }
+        return Ok(latest);
     }
     let path = setup_status_path();
     run_blocking("load setup status", move || {
@@ -3861,16 +6735,27 @@ pub async fn setup_job_status(state: tauri::State<'_, SetupJobState>) -> AppResu
 
 #[tauri::command]
 pub async fn setup_job_cancel(state: tauri::State<'_, SetupJobState>) -> AppResult<SetupJobStatus> {
-    let mut job = state.job.lock().expect("setup job state poisoned");
-    let active = job
-        .as_mut()
-        .ok_or_else(|| AppError::Schema("no setup job is running".into()))?;
-    if active.status.state == "running" {
-        active.cancel.store(true, Ordering::Relaxed);
-        active.status.state = "cancelling".into();
-        active.status.phase = "cancelling".into();
-    }
-    Ok(active.status.clone())
+    let (status, path) = {
+        let mut job = state.job.lock().expect("setup job state poisoned");
+        let active = job
+            .as_mut()
+            .ok_or_else(|| AppError::Schema("no setup job is running".into()))?;
+        if active.status.state == "running" {
+            active.cancel.store(true, Ordering::Relaxed);
+            active.status.state = "cancelling".into();
+            active.status.phase = "cancelling".into();
+            active.status.updated_at = Some(unix_timestamp_seconds());
+        }
+        (active.status.clone(), active.status_path.clone())
+    };
+    persist_background_status(
+        "checkpoint setup cancellation",
+        path,
+        status.clone(),
+        save_setup_status,
+    )
+    .await?;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -3911,39 +6796,6 @@ pub async fn logs_reveal() -> AppResult<String> {
         )));
     }
     Ok(dir.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
-pub async fn record_audio(pid: String, seconds: u32, root: Option<PathBuf>) -> AppResult<String> {
-    let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_project_mutation(&dir).await;
-    tokio::fs::create_dir_all(&dir).await?;
-    let wav = dir.join("audio.wav");
-    let st = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "avfoundation",
-            "-i",
-            ":0",
-            "-t",
-            &seconds.to_string(),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-        ])
-        .arg(&wav)
-        .status()
-        .await
-        .map_err(|e| AppError::Io(std::io::Error::other(format!("ffmpeg: {e}"))))?;
-    if st.success() {
-        Ok(wav.to_string_lossy().into_owned())
-    } else {
-        Err(AppError::Schema("ffmpeg recording failed".into()))
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -4165,6 +7017,21 @@ pub async fn run_doctor() -> AppResult<Vec<crate::doctor::Check>> {
     run_blocking("environment health checks", || Ok(crate::doctor::checks())).await
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceStatus {
+    pub active_pipeline: Option<String>,
+    pub waiting_pipelines: usize,
+}
+
+#[tauri::command]
+pub async fn performance_status() -> PerformanceStatus {
+    PerformanceStatus {
+        active_pipeline: crate::performance::active_heavy_label(),
+        waiting_pipelines: crate::performance::waiting_heavy_count(),
+    }
+}
+
 /// Burn-in export: write export.ass then ffmpeg → export.mp4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4172,12 +7039,18 @@ pub struct VideoExportJobStatus {
     pub pid: String,
     #[serde(default = "default_video_export_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub settings: crate::data::export_settings::VideoExportSettings,
     pub state: String,
     pub phase: String,
     pub progress: u8,
     pub current_seconds: Option<f64>,
     pub total_seconds: Option<f64>,
     pub encoder: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
     pub error: Option<String>,
     pub path: Option<String>,
 }
@@ -4189,6 +7062,7 @@ fn default_video_export_mode() -> String {
 struct VideoExportJob {
     status: VideoExportJobStatus,
     cancel: Arc<AtomicBool>,
+    status_path: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -4211,7 +7085,13 @@ fn save_video_export_status(
 }
 
 fn load_video_export_status(path: &std::path::Path) -> AppResult<VideoExportJobStatus> {
-    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let has_settings = value.get("settings").is_some();
+    let mut status: VideoExportJobStatus = serde_json::from_value(value)?;
+    if !has_settings && status.mode == "quality" {
+        status.settings.encoding_speed = crate::data::export_settings::ExportEncodingSpeed::Quality;
+    }
+    Ok(status)
 }
 
 fn load_recovered_video_export_status(path: &std::path::Path) -> AppResult<VideoExportJobStatus> {
@@ -4223,6 +7103,7 @@ fn load_recovered_video_export_status(path: &std::path::Path) -> AppResult<Video
             "the previous video export was interrupted when lumen-cut closed; start it again"
                 .into(),
         );
+        status.updated_at = Some(unix_timestamp_seconds());
         save_video_export_status(path, &status)?;
     }
     Ok(status)
@@ -4247,39 +7128,118 @@ fn update_video_export_job(
             );
         }
         job.status.phase = "encoding".into();
-        job.status.progress = progress.progress;
+        job.status.progress = advance_progress(job.status.progress, progress.progress);
         job.status.current_seconds = Some(progress.current_seconds);
         job.status.total_seconds = Some(progress.total_seconds);
         job.status.encoder = Some(progress.encoder);
+        job.status.updated_at = Some(unix_timestamp_seconds());
     }
 }
 
 async fn export_video_impl(
     pid: String,
     root: Option<PathBuf>,
-    mode: Option<String>,
+    requested_settings: Option<crate::data::export_settings::VideoExportSettings>,
     on_progress: Option<crate::export::video::VideoRenderProgressCallback>,
 ) -> AppResult<String> {
     let _heavy_work = crate::performance::acquire_heavy("video-export").await?;
     let dir = resolve_project_dir(&pid, root)?;
-    let _mutation = lock_project_mutation(&dir).await;
-    let prepare_dir = dir.clone();
-    let (doc, cuts, ass, broll) = run_blocking("video export preparation", move || {
-        let doc = Doc::load(&prepare_dir)?;
-        let cuts_path = prepare_dir.join("cuts.json");
-        let cuts: ClipCuts = if cuts_path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
-        } else {
-            ClipCuts::new()
-        };
-        let ass = prepare_dir.join("export.ass");
-        crate::export::write_ass_with(&doc, &cuts.cuts, &ass, 1920, 1080)?;
-        let broll = crate::data::broll::load(&prepare_dir)?;
-        Ok((doc, cuts, ass, broll))
+    let probe_dir = dir.clone();
+    let media_path = run_blocking("load video export media", move || {
+        Ok(Doc::load(&probe_dir)?.media.path)
     })
     .await?;
-    let mp4 = dir.join("export.mp4");
-    let in_progress = dir.join("export.in-progress.mp4");
+    let media_info = crate::media::probe(&media_path).await?;
+    let source_dimensions = media_info.width.zip(media_info.height);
+    let prepare_dir = dir.clone();
+    let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings) = {
+        // Hold the project mutation lock only while taking an export snapshot.
+        // Encoding may take minutes and must not stall transcript editing.
+        let _mutation = lock_project_mutation(&dir).await;
+        run_blocking("video export preparation", move || {
+            let doc = Doc::load(&prepare_dir)?;
+            let settings = match requested_settings {
+                Some(settings) => settings,
+                None => crate::data::export_settings::load(&prepare_dir)?,
+            };
+            settings.validate()?;
+            let cuts = load_project_cuts(&prepare_dir)?;
+            let ass = prepare_dir.join("export.ass");
+            let titles = crate::data::title::load(&prepare_dir)?;
+            let style = crate::data::substyle::SubStyle::load(&prepare_dir)?;
+            let hidden = crate::data::subtitle::load_hidden_checked(&prepare_dir)?;
+            let caption_doc = if settings.subtitle_mode
+                == crate::data::export_settings::ExportSubtitleMode::None
+            {
+                doc.clone()
+            } else {
+                crate::data::export_settings::project_caption_doc_with_hidden(
+                    &doc,
+                    settings.subtitle_language.as_deref(),
+                    settings.bilingual_subtitles,
+                    &hidden,
+                )?
+            };
+            let (canvas_width, canvas_height) =
+                settings.subtitle_canvas_dimensions(source_dimensions);
+            let include_ass = match settings.subtitle_mode {
+                crate::data::export_settings::ExportSubtitleMode::Burn => {
+                    crate::export::write_ass_with_style_and_titles(
+                        &caption_doc,
+                        &cuts.cuts,
+                        &style,
+                        &titles,
+                        &ass,
+                        canvas_width,
+                        canvas_height,
+                    )?;
+                    true
+                }
+                crate::data::export_settings::ExportSubtitleMode::Soft
+                | crate::data::export_settings::ExportSubtitleMode::None
+                    if !titles.is_empty() =>
+                {
+                    crate::export::write_ass_titles_only_with_style(
+                        &doc,
+                        &cuts.cuts,
+                        &style,
+                        &titles,
+                        &ass,
+                        canvas_width,
+                        canvas_height,
+                    )?;
+                    true
+                }
+                _ => false,
+            };
+            let soft_subtitle = (settings.subtitle_mode
+                == crate::data::export_settings::ExportSubtitleMode::Soft)
+                .then(|| prepare_dir.join("export-soft.srt"));
+            if let Some(path) = &soft_subtitle {
+                crate::export::write_srt_with(&caption_doc, &cuts.cuts, path)?;
+            }
+            let broll = crate::data::broll::load(&prepare_dir)?;
+            let audio_mix = crate::data::audio_mix::load(&prepare_dir)?.fit_to_duration(
+                crate::export::project::kept_intervals(&doc, &cuts.cuts)
+                    .iter()
+                    .map(|(start, end)| end - start)
+                    .sum(),
+            )?;
+            Ok((
+                doc,
+                cuts,
+                ass,
+                soft_subtitle,
+                include_ass,
+                broll,
+                audio_mix,
+                settings,
+            ))
+        })
+        .await?
+    };
+    let output = dir.join(format!("export.{}", settings.extension()));
+    let in_progress = dir.join(format!("export.in-progress.{}", settings.extension()));
     let _ = tokio::fs::remove_file(&in_progress).await;
     let render = crate::export::video::render_video_with_broll_options(
         &doc,
@@ -4289,8 +7249,12 @@ async fn export_video_impl(
         &broll,
         crate::export::video::VideoRenderOptions {
             purpose: crate::export::video::RenderPurpose::Final,
-            mode,
+            mode: None,
             on_progress,
+            audio_mix,
+            settings: Some(settings),
+            soft_subtitle,
+            include_ass,
         },
     )
     .await;
@@ -4298,7 +7262,7 @@ async fn export_video_impl(
         let _ = tokio::fs::remove_file(&in_progress).await;
         return Err(error);
     }
-    let final_path = mp4.clone();
+    let final_path = output.clone();
     run_blocking("finalize video export", move || {
         std::fs::File::open(&in_progress)?.sync_all()?;
         std::fs::rename(&in_progress, &final_path)?;
@@ -4307,7 +7271,7 @@ async fn export_video_impl(
         Ok(())
     })
     .await?;
-    Ok(mp4.to_string_lossy().into_owned())
+    Ok(output.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -4318,21 +7282,58 @@ pub async fn export_video(pid: String, root: Option<PathBuf>) -> AppResult<Strin
 #[tauri::command]
 pub async fn video_export_start(
     pid: String,
-    mode: String,
+    settings: Option<crate::data::export_settings::VideoExportSettings>,
+    mode: Option<String>,
     state: tauri::State<'_, VideoExportState>,
 ) -> AppResult<VideoExportJobStatus> {
-    crate::export::video::encoder_for_mode(Some(&mode))?;
+    let settings = settings.unwrap_or_else(|| crate::data::export_settings::VideoExportSettings {
+        encoding_speed: if mode.as_deref() == Some("quality") {
+            crate::data::export_settings::ExportEncodingSpeed::Quality
+        } else {
+            crate::data::export_settings::ExportEncodingSpeed::Fast
+        },
+        ..Default::default()
+    });
+    settings.validate()?;
+    crate::export::video::encoder_for_settings(&settings)?;
+    let mode = settings.legacy_mode().to_string();
+    let project_dir = resolve_project_dir(&pid, None)?;
+    let settings_to_save = settings.clone();
+    {
+        let _mutation = lock_project_mutation(&project_dir).await;
+        run_blocking("save video export settings", move || {
+            crate::data::export_settings::save(&project_dir, &settings_to_save)
+        })
+        .await?;
+    }
+    let preflight = export_preflight_impl(&pid, settings.clone(), None).await?;
+    if !preflight.ready {
+        let blockers = preflight
+            .items
+            .iter()
+            .filter(|item| item.level == "blocker")
+            .map(|item| item.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(AppError::Schema(format!(
+            "video export preflight failed: {blockers}"
+        )));
+    }
     let status_path = video_export_status_path(&pid, None)?;
     let cancel = Arc::new(AtomicBool::new(false));
+    let now = unix_timestamp_seconds();
     let status = VideoExportJobStatus {
         pid: pid.clone(),
         mode: mode.clone(),
+        settings: settings.clone(),
         state: "running".into(),
         phase: "preparing".into(),
         progress: 0,
         current_seconds: None,
         total_seconds: None,
         encoder: None,
+        started_at: Some(now),
+        updated_at: Some(now),
         error: None,
         path: None,
     };
@@ -4351,6 +7352,7 @@ pub async fn video_export_start(
             VideoExportJob {
                 status: status.clone(),
                 cancel: cancel.clone(),
+                status_path: status_path.clone(),
             },
         );
     }
@@ -4379,13 +7381,14 @@ pub async fn video_export_start(
             .get_mut(&task_pid)
         {
             job.status.phase = "waiting".into();
+            job.status.updated_at = Some(unix_timestamp_seconds());
         }
         let progress_jobs = jobs.clone();
         let progress_pid = task_pid.clone();
         let work = export_video_impl(
             task_pid.clone(),
             None,
-            Some(mode),
+            Some(settings),
             Some(Arc::new(move |progress| {
                 update_video_export_job(&progress_jobs, &progress_pid, progress);
             })),
@@ -4416,8 +7419,16 @@ pub async fn video_export_start(
                     status.error = Some(error.to_string());
                 }
             }
+            status.updated_at = Some(unix_timestamp_seconds());
             status
         };
+        if let Some(job) = jobs
+            .lock()
+            .expect("video export state poisoned")
+            .get_mut(&task_pid)
+        {
+            job.status = final_status.clone();
+        }
         let persisted = final_status.clone();
         if let Err(error) = persist_background_status(
             "save final video export status",
@@ -4455,14 +7466,41 @@ pub async fn video_export_status(
     pid: String,
     state: tauri::State<'_, VideoExportState>,
 ) -> AppResult<VideoExportJobStatus> {
-    if let Some(status) = state
+    let active = state
         .jobs
         .lock()
         .expect("video export state poisoned")
         .get(&pid)
-        .map(|job| job.status.clone())
-    {
-        return Ok(status);
+        .map(|job| (job.status.clone(), job.status_path.clone()));
+    if let Some((status, path)) = active {
+        persist_background_status(
+            "checkpoint video export status",
+            path.clone(),
+            status.clone(),
+            save_video_export_status,
+        )
+        .await?;
+        let latest = state
+            .jobs
+            .lock()
+            .expect("video export state poisoned")
+            .get(&pid)
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| status.clone());
+        if latest.state != status.state
+            || latest.phase != status.phase
+            || latest.progress != status.progress
+            || latest.updated_at != status.updated_at
+        {
+            persist_background_status(
+                "checkpoint latest video export status",
+                path,
+                latest.clone(),
+                save_video_export_status,
+            )
+            .await?;
+        }
+        return Ok(latest);
     }
     let status_path = video_export_status_path(&pid, None)?;
     run_blocking("load video export status", move || {
@@ -4481,16 +7519,27 @@ pub async fn video_export_cancel(
     pid: String,
     state: tauri::State<'_, VideoExportState>,
 ) -> AppResult<VideoExportJobStatus> {
-    let mut jobs = state.jobs.lock().expect("video export state poisoned");
-    let job = jobs
-        .get_mut(&pid)
-        .ok_or_else(|| AppError::Schema("no video export job for this project".into()))?;
-    if job.status.state == "running" {
-        job.cancel.store(true, Ordering::Relaxed);
-        job.status.state = "cancelling".into();
-        job.status.phase = "cancelling".into();
-    }
-    Ok(job.status.clone())
+    let (status, path) = {
+        let mut jobs = state.jobs.lock().expect("video export state poisoned");
+        let job = jobs
+            .get_mut(&pid)
+            .ok_or_else(|| AppError::Schema("no video export job for this project".into()))?;
+        if job.status.state == "running" {
+            job.cancel.store(true, Ordering::Relaxed);
+            job.status.state = "cancelling".into();
+            job.status.phase = "cancelling".into();
+            job.status.updated_at = Some(unix_timestamp_seconds());
+        }
+        (job.status.clone(), job.status_path.clone())
+    };
+    persist_background_status(
+        "checkpoint video export cancellation",
+        path,
+        status.clone(),
+        save_video_export_status,
+    )
+    .await?;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -4499,15 +7548,13 @@ pub async fn export_fcp(pid: String, root: Option<PathBuf>) -> AppResult<String>
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("Final Cut export", move || {
         let doc = Doc::load(&dir)?;
-        let cuts_path = dir.join("cuts.json");
-        let cuts: ClipCuts = if cuts_path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(cuts_path)?)?
-        } else {
-            ClipCuts::new()
-        };
+        let cuts = load_project_cuts(&dir)?;
         let path = dir.join("export.fcpxml");
         let broll = crate::data::broll::load(&dir)?;
-        crate::export::write_fcp_with_broll(&doc, &cuts.cuts, &broll, &path, 1920, 1080)?;
+        let titles = crate::data::title::load(&dir)?;
+        crate::export::write_fcp_with_broll_titles(
+            &doc, &cuts.cuts, &broll, &titles, &path, 1920, 1080,
+        )?;
         Ok(path.to_string_lossy().into_owned())
     })
     .await
@@ -4519,19 +7566,32 @@ pub async fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<V
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle export", move || {
         let doc = Doc::load(&dir)?;
-        let cuts: ClipCuts = std::fs::read_to_string(dir.join("cuts.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let cuts = load_project_cuts(&dir)?;
         let paths = [
             dir.join("export.srt"),
             dir.join("export.vtt"),
             dir.join("export.ass"),
             dir.join("export.md"),
         ];
-        crate::export::write_srt_with(&doc, &cuts.cuts, &paths[0])?;
-        crate::export::write_vtt_with(&doc, &cuts.cuts, &paths[1])?;
-        crate::export::write_ass_with(&doc, &cuts.cuts, &paths[2], 1920, 1080)?;
+        let style = crate::data::substyle::SubStyle::load(&dir)?;
+        let settings = crate::data::export_settings::load(&dir)?;
+        let hidden = crate::data::subtitle::load_hidden_checked(&dir)?;
+        let caption_doc = crate::data::export_settings::project_caption_doc_with_hidden(
+            &doc,
+            settings.subtitle_language.as_deref(),
+            settings.bilingual_subtitles,
+            &hidden,
+        )?;
+        crate::export::write_srt_with(&caption_doc, &cuts.cuts, &paths[0])?;
+        crate::export::write_vtt_with(&caption_doc, &cuts.cuts, &paths[1])?;
+        crate::export::write_ass_with_style(
+            &caption_doc,
+            &cuts.cuts,
+            &style,
+            &paths[2],
+            1920,
+            1080,
+        )?;
         crate::export::write_md_with_chapters(&doc, &cuts.cuts, &dir, &paths[3])?;
         Ok(paths
             .into_iter()
@@ -4593,7 +7653,7 @@ pub async fn version_commit(
             .active_branch
             .clone()
             .unwrap_or_else(|| "main".into());
-        crate::data::version::commit_snapshot(
+        let id = crate::data::version::commit_snapshot(
             &dir,
             &doc,
             &mut lineage,
@@ -4601,7 +7661,9 @@ pub async fn version_commit(
             name,
             note.trim(),
             crate::data::version::VersionKind::Manual,
-        )
+        )?;
+        crate::data::activity::touch(&dir)?;
+        Ok(id)
     })
     .await
 }
@@ -4628,7 +7690,9 @@ pub async fn version_restore(pid: String, id: String, root: Option<PathBuf>) -> 
                 crate::data::version::VersionKind::Auto,
             )?;
         }
-        crate::data::version::restore_snapshot(&dir, &mut lineage, &id)
+        crate::data::version::restore_snapshot(&dir, &mut lineage, &id)?;
+        crate::data::activity::touch(&dir)?;
+        Ok(())
     })
     .await
 }
@@ -4661,6 +7725,7 @@ pub async fn branch_create(pid: String, name: String, root: Option<PathBuf>) -> 
         }
         let id = crate::data::version::create_branch(&dir, &mut lineage, name, "")?;
         crate::data::version::switch_branch(&dir, &mut lineage, &id)?;
+        crate::data::activity::touch(&dir)?;
         Ok(id)
     })
     .await
@@ -4678,7 +7743,9 @@ pub async fn branch_switch(pid: String, id: String, root: Option<PathBuf>) -> Ap
             ));
         }
         let mut lineage = crate::data::version::Lineage::load(&dir)?;
-        crate::data::version::switch_branch(&dir, &mut lineage, &id)
+        crate::data::version::switch_branch(&dir, &mut lineage, &id)?;
+        crate::data::activity::touch(&dir)?;
+        Ok(())
     })
     .await
 }
@@ -4695,12 +7762,20 @@ pub async fn split_line(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle split", move || {
-        let mut doc = Doc::load(&dir)?;
-        let ok = crate::data::edit::split_sentence(&mut doc, &id, at);
-        if ok {
-            doc.save(&dir)?;
-        }
-        Ok(ok)
+        crate::data::edit_history::record(
+            &dir,
+            "Split subtitle",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let ok = crate::data::edit::split_sentence(&mut doc, &id, at);
+                if ok {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(ok)
+            },
+            |changed| *changed,
+        )
     })
     .await
 }
@@ -4715,12 +7790,20 @@ pub async fn merge_lines(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle merge", move || {
-        let mut doc = Doc::load(&dir)?;
-        let ok = crate::data::edit::merge_sentences(&mut doc, &id1, &id2);
-        if ok {
-            doc.save(&dir)?;
-        }
-        Ok(ok)
+        crate::data::edit_history::record(
+            &dir,
+            "Merge subtitles",
+            || {
+                let mut doc = Doc::load(&dir)?;
+                let ok = crate::data::edit::merge_sentences(&mut doc, &id1, &id2);
+                if ok {
+                    doc.meta.updated_at = chrono::Utc::now();
+                    doc.save(&dir)?;
+                }
+                Ok(ok)
+            },
+            |changed| *changed,
+        )
     })
     .await
 }
@@ -4768,6 +7851,8 @@ mod transcription_status_tests {
                 memory_limit_mb: Some(6144),
                 mlx_active_memory_mb: Some(1900),
                 mlx_cache_memory_mb: Some(240),
+                started_at: Some(10),
+                updated_at: Some(20),
                 error: None,
             },
         )
@@ -4777,6 +7862,7 @@ mod transcription_status_tests {
         assert_eq!(recovered.state, "failed");
         assert_eq!(recovered.phase, "failed");
         assert_eq!(recovered.progress, 52);
+        assert!(recovered.updated_at.unwrap() > 20);
         assert!(recovered.error.unwrap().contains("retry"));
 
         let persisted = load_recovered_transcription_status(&path).unwrap();
@@ -4809,6 +7895,8 @@ mod speaker_analysis_status_tests {
                 cpu_percent: Some(87),
                 peak_memory_mb: Some(2431),
                 memory_limit_mb: Some(6144),
+                started_at: Some(10),
+                updated_at: Some(20),
                 error: None,
                 preview: None,
             },
@@ -4819,6 +7907,7 @@ mod speaker_analysis_status_tests {
         assert_eq!(recovered.state, "failed");
         assert_eq!(recovered.phase, "failed");
         assert_eq!(recovered.progress, 81);
+        assert!(recovered.updated_at.unwrap() > 20);
         assert!(recovered.error.unwrap().contains("start it again"));
 
         let persisted = load_recovered_speaker_analysis_status(&path).unwrap();
@@ -4828,8 +7917,15 @@ mod speaker_analysis_status_tests {
 
 #[cfg(test)]
 mod background_status_persistence_tests {
-    use super::persist_background_status;
+    use super::{advance_progress, persist_background_status};
     use crate::error::AppError;
+
+    #[test]
+    fn pipeline_progress_is_bounded_and_never_moves_backwards() {
+        assert_eq!(advance_progress(45, 20), 45);
+        assert_eq!(advance_progress(45, 72), 72);
+        assert_eq!(advance_progress(99, 255), 100);
+    }
 
     #[tokio::test]
     async fn a_final_status_write_failure_is_never_reported_as_success() {
@@ -4862,12 +7958,15 @@ mod video_export_status_tests {
             &VideoExportJobStatus {
                 pid: "project-1".into(),
                 mode: "fast".into(),
+                settings: Default::default(),
                 state: "running".into(),
                 phase: "encoding".into(),
                 progress: 47,
                 current_seconds: Some(14.2),
                 total_seconds: Some(30.0),
                 encoder: Some("h264_videotoolbox".into()),
+                started_at: Some(10),
+                updated_at: Some(20),
                 error: None,
                 path: None,
             },
@@ -4878,7 +7977,37 @@ mod video_export_status_tests {
         assert_eq!(recovered.state, "failed");
         assert_eq!(recovered.phase, "failed");
         assert_eq!(recovered.progress, 47);
+        assert!(recovered.updated_at.unwrap() > 20);
         assert!(recovered.error.unwrap().contains("start it again"));
+    }
+
+    #[test]
+    fn legacy_video_export_status_recovers_with_backward_compatible_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-export.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "pid":"project-1",
+                "mode":"quality",
+                "state":"completed",
+                "phase":"completed",
+                "progress":100,
+                "currentSeconds":30.0,
+                "totalSeconds":30.0,
+                "encoder":"libx264",
+                "error":null,
+                "path":"/tmp/export.mp4"
+            }"#,
+        )
+        .unwrap();
+
+        let recovered = load_recovered_video_export_status(&path).unwrap();
+        assert_eq!(
+            recovered.settings.encoding_speed,
+            crate::data::export_settings::ExportEncodingSpeed::Quality
+        );
+        assert_eq!(recovered.mode, "quality");
     }
 }
 
@@ -4896,12 +8025,15 @@ mod setup_job_status_tests {
                 kind: "asr-models".into(),
                 state: "running".into(),
                 phase: "downloading".into(),
+                started_at: Some(10),
+                updated_at: Some(20),
                 error: None,
             },
         )
         .unwrap();
         let recovered = load_recovered_setup_status(&path).unwrap();
         assert_eq!(recovered.state, "failed");
+        assert!(recovered.updated_at.unwrap() > 20);
         assert!(recovered.error.unwrap().contains("start it again"));
     }
 }
@@ -4909,7 +8041,8 @@ mod setup_job_status_tests {
 #[cfg(test)]
 mod broll_preview_status_tests {
     use super::{
-        load_recovered_broll_preview_status, save_broll_preview_status, BrollPreviewJobStatus,
+        load_recovered_broll_preview_status, save_broll_preview_status,
+        validated_broll_preview_paths, BrollPreviewJobStatus,
     };
 
     #[test]
@@ -4926,6 +8059,8 @@ mod broll_preview_status_tests {
                 current: Some(20.0),
                 total: Some(30.0),
                 encoder: Some("h264_videotoolbox".into()),
+                started_at: Some(10),
+                updated_at: Some(20),
                 error: None,
                 paths: vec![],
             },
@@ -4934,7 +8069,37 @@ mod broll_preview_status_tests {
         let recovered = load_recovered_broll_preview_status(&path).unwrap();
         assert_eq!(recovered.state, "failed");
         assert_eq!(recovered.progress, 63);
+        assert!(recovered.updated_at.unwrap() > 20);
         assert!(recovered.error.unwrap().contains("start it again"));
+    }
+
+    #[test]
+    fn recovered_preview_scope_accepts_only_generated_project_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project-1");
+        std::fs::create_dir_all(&project).unwrap();
+        let valid = project.join("broll-preview-1.0-0.png");
+        let unrelated = project.join("private.png");
+        let outside = temp.path().join("broll-preview-outside.png");
+        std::fs::write(&valid, b"preview").unwrap();
+        std::fs::write(&unrelated, b"private").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let paths = validated_broll_preview_paths(
+            project,
+            vec![
+                valid.to_string_lossy().into_owned(),
+                unrelated.to_string_lossy().into_owned(),
+                outside.to_string_lossy().into_owned(),
+                temp.path()
+                    .join("missing.png")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![std::fs::canonicalize(valid).unwrap()]);
     }
 }
 
@@ -5013,7 +8178,7 @@ pub async fn style_get(
 ) -> AppResult<crate::data::substyle::SubStyle> {
     let dir = resolve_project_dir(&pid, root)?;
     run_blocking("subtitle style load", move || {
-        Ok(crate::data::substyle::SubStyle::load_or_default(&dir))
+        crate::data::substyle::SubStyle::load(&dir)
     })
     .await
 }
@@ -5027,17 +8192,69 @@ pub async fn style_set(
     let dir = resolve_project_dir(&pid, root)?;
     let _mutation = lock_project_mutation(&dir).await;
     run_blocking("subtitle style save", move || {
-        crate::data::storage::write_json(&dir.join("style.json"), &style)
+        let nonempty = |value: &str| !value.trim().is_empty();
+        let ass_color = |value: &str| {
+            value
+                .strip_prefix("&H")
+                .is_some_and(|hex| hex.len() == 8 && hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+        };
+        if !nonempty(&style.name)
+            || !nonempty(&style.fontname)
+            || !(8..=200).contains(&style.fontsize)
+            || !(1..=9).contains(&style.alignment)
+            || style.outline > 20
+            || style.shadow > 20
+            || style.margin_l > 2_000
+            || style.margin_r > 2_000
+            || style.margin_v > 2_000
+            || !ass_color(&style.primary_colour)
+            || !ass_color(&style.outline_colour)
+        {
+            return Err(AppError::Schema(
+                "subtitle style contains an invalid font, colour, alignment, effect, or margin"
+                    .into(),
+            ));
+        }
+        let previous = crate::data::substyle::SubStyle::load(&dir)?;
+        crate::data::edit_history::record(
+            &dir,
+            "Change subtitle style",
+            || crate::data::storage::write_json(&dir.join("style.json"), &style),
+            |_| previous != style,
+        )
     })
     .await
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicModelConfig {
+    #[serde(flatten)]
+    config: crate::data::modelconfig::ModelConfig,
+    hf_token_set: bool,
+    llm_api_key_set: bool,
+    asr_cloud_api_key_set: bool,
+}
+
+fn redact_model_config(mut config: crate::data::modelconfig::ModelConfig) -> PublicModelConfig {
+    let hf_token_set = !config.hf_token.trim().is_empty();
+    let llm_api_key_set = !config.llm_api_key.trim().is_empty();
+    let asr_cloud_api_key_set = !config.asr_cloud_api_key.trim().is_empty();
+    config.hf_token.clear();
+    config.llm_api_key.clear();
+    config.asr_cloud_api_key.clear();
+    PublicModelConfig {
+        config,
+        hf_token_set,
+        llm_api_key_set,
+        asr_cloud_api_key_set,
+    }
+}
+
 #[tauri::command]
-pub async fn config_show() -> AppResult<crate::data::modelconfig::ModelConfig> {
+pub async fn config_show() -> AppResult<PublicModelConfig> {
     run_blocking("settings load", || {
-        let mut config = crate::data::modelconfig::load();
-        config.hf_token.clear();
-        Ok(config)
+        Ok(redact_model_config(crate::data::modelconfig::load()))
     })
     .await
 }
@@ -5049,6 +8266,87 @@ mod tests {
     #[test]
     fn version_constant_is_nonempty() {
         assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn ai_provider_preflight_rejects_missing_and_invalid_endpoints() {
+        let mut config = crate::data::modelconfig::ModelConfig {
+            llm_model: "test-model".into(),
+            ..Default::default()
+        };
+        let missing = validate_ai_provider_preflight(&config).unwrap_err();
+        assert!(missing.to_string().contains("not configured"));
+
+        config.llm_endpoint = "file:///tmp/provider".into();
+        let invalid = validate_ai_provider_preflight(&config).unwrap_err();
+        assert!(invalid.to_string().contains("http or https"));
+
+        config.llm_endpoint = "http://127.0.0.1:11434/v1/chat/completions".into();
+        validate_ai_provider_preflight(&config).unwrap();
+    }
+
+    #[test]
+    fn cloud_transcription_preflight_requires_complete_credentials() {
+        let mut config = crate::data::modelconfig::ModelConfig {
+            asr_engine: crate::data::modelconfig::AsrEngine::OpenaiCompatible,
+            ..Default::default()
+        };
+        let error = validate_transcription_preflight(&config, None).unwrap_err();
+        assert!(error.to_string().contains("endpoint, API key, and model"));
+
+        config.asr_cloud_api_key = "secret".into();
+        validate_transcription_preflight(&config, None).unwrap();
+    }
+
+    #[test]
+    fn timeline_contact_sheet_uses_fast_seeks_instead_of_decoding_the_full_video() {
+        let args = contact_sheet_args("/tmp/input.mp4", 120.0, "/tmp/sheet.jpg");
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-ss").count(), 12);
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-i").count(), 12);
+        assert!(args.iter().any(|arg| arg.contains("hstack=inputs=12")));
+        assert!(!args.iter().any(|arg| arg.starts_with("fps=")));
+    }
+
+    #[test]
+    fn broll_quick_preview_chooses_one_kept_midpoint_per_placement() {
+        let now = chrono::Utc::now();
+        let doc = Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: "/tmp/source.mp4".into(),
+                duration_seconds: 10.0,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: "Preview".into(),
+                description: String::new(),
+                language: None,
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![],
+            translations: Default::default(),
+        };
+        let placements = vec![crate::data::broll::BrollPlacement {
+            id: "br-1".into(),
+            file: "/tmp/asset.png".into(),
+            start: 2.0,
+            end: 6.0,
+            mode: crate::data::broll::PlacementMode::Pip,
+            rect: None,
+            fit: crate::data::broll::FitMode::Cover,
+            background: crate::data::broll::BackgroundMode::Black,
+            source_start: 0.0,
+            radius: 0,
+            name: None,
+        }];
+
+        assert_eq!(
+            broll_preview_points(&doc, &ClipCuts::default(), &placements),
+            vec![(4.0, 4.0, 0)]
+        );
     }
 
     #[test]
@@ -5086,6 +8384,119 @@ mod tests {
 
         normalize_transcription_doc(&mut doc, Some("Chinese".into()));
         assert_eq!(doc.meta.language.as_deref(), Some("Chinese"));
+    }
+
+    #[test]
+    fn retranscription_creates_recovery_and_invalidates_only_cue_derived_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let now = chrono::Utc::now();
+        let sentence = |id: &str, word_id: &str, text: &str| crate::data::doc::Sentence {
+            id: id.into(),
+            text: text.into(),
+            words: vec![crate::data::doc::Word {
+                id: word_id.into(),
+                text: text.into(),
+                start: 0.0,
+                end: 1.0,
+            }],
+        };
+        let mut old = Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: tmp.path().join("source.mp4"),
+                duration_seconds: 10.0,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+            },
+            meta: Meta {
+                title: "Interview".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: Some("Alice".into()),
+                sentences: vec![sentence("old-s1", "old-w1", "Old")],
+            }],
+            translations: Default::default(),
+        };
+        crate::data::subtitle::set_translation(&mut old, "zh", "old-s1", "旧");
+        old.save(&project).unwrap();
+        std::fs::write(project.join("hidden.json"), r#"{"hidden":["old-s1"]}"#).unwrap();
+        std::fs::write(project.join("cuts.json"), r#"{"cuts":[]}"#).unwrap();
+        std::fs::write(project.join("chapters.json"), "[]").unwrap();
+        std::fs::create_dir_all(project.join("ai/translate/pending")).unwrap();
+        std::fs::write(project.join("ai/translate/task.json"), "{}").unwrap();
+        std::fs::create_dir_all(project.join(".lumen-cut/edit-history")).unwrap();
+        std::fs::write(project.join(".lumen-cut/edit-history/history.json"), "{}").unwrap();
+        for (name, contents) in [
+            ("style.json", r#"{"keep":"style"}"#),
+            ("titles.json", r#"{"keep":"titles"}"#),
+            ("audio-mix.json", r#"{"keep":"audio"}"#),
+            ("broll.json", r#"{"keep":"broll"}"#),
+        ] {
+            std::fs::write(project.join(name), contents).unwrap();
+        }
+
+        let fresh = Doc {
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![sentence("new-s1", "new-w1", "Fresh")],
+            }],
+            translations: Default::default(),
+            ..old.clone()
+        };
+        let result = persist_transcription_result(fresh, project.clone()).unwrap();
+        assert_eq!(result.word_count, 1);
+
+        let saved = Doc::load(&project).unwrap();
+        assert_eq!(saved.paragraphs[0].sentences[0].id, "new-s1");
+        assert!(saved.paragraphs[0].speaker.is_none());
+        assert!(saved.translations.is_empty());
+        for name in ["hidden.json", "cuts.json", "chapters.json"] {
+            assert!(!project.join(name).exists(), "{name} should be invalidated");
+        }
+        assert!(!project.join("ai").exists());
+        assert!(!project.join(".lumen-cut/edit-history").exists());
+        for (name, expected) in [
+            ("style.json", r#"{"keep":"style"}"#),
+            ("titles.json", r#"{"keep":"titles"}"#),
+            ("audio-mix.json", r#"{"keep":"audio"}"#),
+            ("broll.json", r#"{"keep":"broll"}"#),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(project.join(name)).unwrap(),
+                expected
+            );
+        }
+
+        let lineage = crate::data::version::Lineage::load(&project).unwrap();
+        let recovery = lineage.head().unwrap();
+        assert_eq!(recovery.name, "Before retranscription");
+        assert_eq!(recovery.kind, crate::data::version::VersionKind::Auto);
+        let restored = Doc::load(
+            crate::data::version::snapshot_path(&project, &recovery.id)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.paragraphs[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(restored.translations["zh"]["old-s1"].text, "旧");
+        assert!(crate::data::version::snapshot_path(&project, &recovery.id)
+            .parent()
+            .unwrap()
+            .join("cuts.json")
+            .exists());
+        assert!(crate::data::version::snapshot_path(&project, &recovery.id)
+            .parent()
+            .unwrap()
+            .join("chapters.json")
+            .exists());
     }
 
     #[tokio::test]
@@ -5185,6 +8596,807 @@ mod tests {
         )
         .await
         .is_err());
+        assert_eq!(
+            edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .undo_label
+                .as_deref(),
+            Some("Edit project details")
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(Doc::load(&project).unwrap().meta.title, "Draft");
+    }
+
+    #[tokio::test]
+    async fn project_media_status_reports_a_moved_file_without_losing_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("source.mp4");
+        let project = tmp.path().join("p1");
+        let now = chrono::Utc::now();
+        let doc = Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: media.clone(),
+                duration_seconds: 12.5,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+            },
+            meta: Meta {
+                title: "Interview".into(),
+                description: String::new(),
+                language: None,
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![],
+            translations: Default::default(),
+        };
+        doc.save(&project).unwrap();
+
+        let missing = project_media_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(!missing.available);
+        assert!(missing.issue.unwrap().contains("missing"));
+        assert_eq!(Doc::load(&project).unwrap().id, "p1");
+
+        std::fs::write(&media, b"media").unwrap();
+        let restored = project_media_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(restored.available);
+        assert_eq!(restored.file_size, Some(5));
+    }
+
+    #[tokio::test]
+    async fn project_media_status_suggests_only_one_nearby_same_named_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let missing = tmp.path().join("detached").join("source.mp4");
+        let now = chrono::Utc::now();
+        Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: missing,
+                duration_seconds: 12.5,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+            },
+            meta: Meta {
+                title: "Interview".into(),
+                description: String::new(),
+                language: None,
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![],
+            translations: Default::default(),
+        }
+        .save(&project)
+        .unwrap();
+        let nearby = tmp.path().join("recovered").join("source.mp4");
+        std::fs::create_dir_all(nearby.parent().unwrap()).unwrap();
+        std::fs::write(&nearby, b"media").unwrap();
+
+        let status = project_media_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(
+            status.suggested_path,
+            Some(std::fs::canonicalize(&nearby).unwrap())
+        );
+
+        let duplicate = tmp.path().join("another").join("source.mp4");
+        std::fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+        std::fs::write(duplicate, b"media").unwrap();
+        let ambiguous = project_media_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(ambiguous.suggested_path, None);
+    }
+
+    #[tokio::test]
+    async fn manual_translation_and_style_changes_are_durable_and_undoable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let now = chrono::Utc::now();
+        Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: tmp.path().join("source.mp4"),
+                duration_seconds: 2.0,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+            },
+            meta: Meta {
+                title: "Interview".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![crate::data::doc::Sentence {
+                    id: "s1".into(),
+                    text: "Hello".into(),
+                    words: vec![crate::data::doc::Word {
+                        id: "w1".into(),
+                        text: "Hello".into(),
+                        start: 0.0,
+                        end: 1.0,
+                    }],
+                }],
+            }],
+            translations: Default::default(),
+        }
+        .save(&project)
+        .unwrap();
+
+        assert!(translation_set(
+            "p1".into(),
+            "zh".into(),
+            "s1".into(),
+            "你好".into(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            Doc::load(&project).unwrap().translations["zh"]["s1"].text,
+            "你好"
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(Doc::load(&project).unwrap().translations.is_empty());
+        assert!(translation_set(
+            "p1".into(),
+            "zh-Hans".into(),
+            "s1".into(),
+            "你好".into(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap());
+
+        let style = crate::data::substyle::SubStyle {
+            name: "Creator".into(),
+            fontname: "Arial".into(),
+            fontsize: 58,
+            bold: true,
+            ..Default::default()
+        };
+        style_set("p1".into(), style, Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        export_settings_set(
+            "p1".into(),
+            crate::data::export_settings::VideoExportSettings {
+                subtitle_language: Some("zh-Hans".into()),
+                bilingual_subtitles: true,
+                ..Default::default()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!(project.join("style.json").exists());
+        export_subtitles("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        let exported_ass = std::fs::read_to_string(project.join("export.ass")).unwrap();
+        assert!(exported_ass.contains("Style: Default,Arial,58,"));
+        assert!(exported_ass.contains(",-1,0,0,0,100,100"));
+        assert!(exported_ass.contains("Hello\\N你好"));
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(!project.join("style.json").exists());
+    }
+
+    #[tokio::test]
+    async fn transcript_and_translation_batch_updates_are_atomic_and_undoable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let now = chrono::Utc::now();
+        Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: tmp.path().join("source.mp4"),
+                duration_seconds: 2.0,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+            },
+            meta: Meta {
+                title: "Interview".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![
+                    crate::data::doc::Sentence {
+                        id: "s1".into(),
+                        text: "Hello".into(),
+                        words: vec![crate::data::doc::Word {
+                            id: "w1".into(),
+                            text: "Hello".into(),
+                            start: 0.0,
+                            end: 1.0,
+                        }],
+                    },
+                    crate::data::doc::Sentence {
+                        id: "s2".into(),
+                        text: "World".into(),
+                        words: vec![crate::data::doc::Word {
+                            id: "w2".into(),
+                            text: "World".into(),
+                            start: 1.0,
+                            end: 2.0,
+                        }],
+                    },
+                ],
+            }],
+            translations: Default::default(),
+        }
+        .save(&project)
+        .unwrap();
+
+        let result = subtitle_update_many(
+            "p1".into(),
+            vec![
+                SubtitleUpdate {
+                    id: "s1".into(),
+                    text: "Hello there".into(),
+                },
+                SubtitleUpdate {
+                    id: "s2".into(),
+                    text: "World again".into(),
+                },
+            ],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.changed, 2);
+        assert_eq!(result.sentences.len(), 2);
+        assert_eq!(result.sentences[0].text, "Hello there");
+        let saved = Doc::load(&project).unwrap();
+        assert_eq!(saved.paragraphs[0].sentences[0].text, "Hello there");
+        assert_eq!(saved.paragraphs[0].sentences[1].text, "World again");
+        assert_eq!(
+            result.sentences[0].words,
+            saved.paragraphs[0].sentences[0].words
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            Doc::load(&project).unwrap().paragraphs[0].sentences[0].text,
+            "Hello"
+        );
+
+        assert!(subtitle_timing_set(
+            "p1".into(),
+            "s1".into(),
+            0.2,
+            0.8,
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap());
+        let retimed = Doc::load(&project).unwrap();
+        assert_eq!(
+            (
+                retimed.paragraphs[0].sentences[0].words[0].start,
+                retimed.paragraphs[0].sentences[0].words[0].end,
+            ),
+            (0.2, 0.8)
+        );
+        assert!(crate::export::to_srt(&retimed).contains("00:00:00,200 --> 00:00:00,800"));
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        let restored = Doc::load(&project).unwrap();
+        assert_eq!(
+            (
+                restored.paragraphs[0].sentences[0].words[0].start,
+                restored.paragraphs[0].sentences[0].words[0].end,
+            ),
+            (0.0, 1.0)
+        );
+
+        let error = subtitle_update_many(
+            "p1".into(),
+            vec![
+                SubtitleUpdate {
+                    id: "s1".into(),
+                    text: "Must not persist".into(),
+                },
+                SubtitleUpdate {
+                    id: "missing".into(),
+                    text: "Missing".into(),
+                },
+            ],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing"));
+        assert_eq!(
+            Doc::load(&project).unwrap().paragraphs[0].sentences[0].text,
+            "Hello"
+        );
+
+        assert!(chapter_set_many(
+            "p1".into(),
+            vec![
+                crate::data::chapter::Chapter {
+                    title: "Introduction".into(),
+                    start_seg: "s1".into(),
+                },
+                crate::data::chapter::Chapter {
+                    title: "Main topic".into(),
+                    start_seg: "s2".into(),
+                },
+            ],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap());
+        let rows = chapter_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].start, 0.0);
+        assert_eq!(rows[0].end, 1.0);
+        assert_eq!(rows[1].preview, "World");
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(!project.join("chapters.json").exists());
+        let native: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join("doc.json")).unwrap())
+                .unwrap();
+        assert!(native.get("chapters").is_none());
+        let error = chapter_set_many(
+            "p1".into(),
+            vec![
+                crate::data::chapter::Chapter {
+                    title: "Introduction".into(),
+                    start_seg: "s1".into(),
+                },
+                crate::data::chapter::Chapter {
+                    title: "Missing".into(),
+                    start_seg: "missing".into(),
+                },
+            ],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing"));
+        assert!(!project.join("chapters.json").exists());
+
+        let changed = translation_set_many(
+            "p1".into(),
+            "zh".into(),
+            vec![
+                TranslationUpdate {
+                    id: "s1".into(),
+                    text: "你好".into(),
+                },
+                TranslationUpdate {
+                    id: "s2".into(),
+                    text: "世界".into(),
+                },
+            ],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed, 2);
+        let saved = Doc::load(&project).unwrap();
+        assert_eq!(saved.translations["zh"]["s1"].text, "你好");
+        assert_eq!(saved.translations["zh"]["s2"].text, "世界");
+
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(Doc::load(&project).unwrap().translations.is_empty());
+
+        let error = translation_set_many(
+            "p1".into(),
+            "zh".into(),
+            vec![
+                TranslationUpdate {
+                    id: "s1".into(),
+                    text: "不应保存".into(),
+                },
+                TranslationUpdate {
+                    id: "missing".into(),
+                    text: "缺失".into(),
+                },
+            ],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing"));
+        assert!(Doc::load(&project).unwrap().translations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_preflight_uses_the_same_caption_asset_and_encoder_rules_as_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let media = tmp.path().join("source.mp4");
+        crate::proc::run(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x180:d=0.4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                &media.display().to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: media,
+                duration_seconds: 0.4,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: "Preflight".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![crate::data::doc::Sentence {
+                    id: "s1".into(),
+                    text: "Hello".into(),
+                    words: vec![crate::data::doc::Word {
+                        id: "w1".into(),
+                        text: "Hello".into(),
+                        start: 0.0,
+                        end: 0.3,
+                    }],
+                }],
+            }],
+            translations: Default::default(),
+        }
+        .save(&project)
+        .unwrap();
+        let settings = crate::data::export_settings::VideoExportSettings {
+            subtitle_language: Some("zh".into()),
+            encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
+            ..Default::default()
+        };
+        let blocked = export_preflight_impl("p1", settings.clone(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(!blocked.ready);
+        assert!(blocked
+            .items
+            .iter()
+            .any(|item| item.code == "captions" && item.level == "blocker"));
+
+        crate::data::subtitle::hide(&project, "s1").unwrap();
+        let ready = export_preflight_impl("p1", settings, Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(ready.ready, "{:?}", ready.items);
+        assert_eq!(ready.summary.visible_captions, 0);
+        assert!(ready.summary.estimated_max_mb >= ready.summary.estimated_min_mb);
+        assert!(ready
+            .items
+            .iter()
+            .any(|item| item.code == "hidden-captions" && item.level == "warning"));
+
+        crate::data::audio_mix::save(
+            &project,
+            &crate::data::audio_mix::AudioMix {
+                music: vec![crate::data::audio_mix::MusicTrack {
+                    id: "music-missing".into(),
+                    path: tmp.path().join("missing-music.wav"),
+                    start: 0.0,
+                    end: 0.3,
+                    source_start: 0.0,
+                    volume: 0.25,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                    ducking: true,
+                }],
+                ..Default::default()
+            },
+            0.4,
+        )
+        .unwrap();
+        let blocked_music = export_preflight_impl(
+            "p1",
+            crate::data::export_settings::VideoExportSettings {
+                encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
+                subtitle_mode: crate::data::export_settings::ExportSubtitleMode::None,
+                ..Default::default()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!(!blocked_music.ready);
+        assert!(blocked_music.items.iter().any(|item| {
+            item.code == "audio"
+                && item.level == "blocker"
+                && item
+                    .message
+                    .contains("background music music-missing is missing")
+        }));
+
+        crate::data::broll::save(
+            &project,
+            &[crate::data::broll::BrollPlacement {
+                id: "missing-asset".into(),
+                file: tmp.path().join("missing-broll.mp4"),
+                start: 0.0,
+                end: 0.2,
+                mode: crate::data::broll::PlacementMode::Fullscreen,
+                rect: None,
+                fit: crate::data::broll::FitMode::Cover,
+                background: crate::data::broll::BackgroundMode::Black,
+                source_start: 0.0,
+                radius: 0,
+                name: None,
+            }],
+        )
+        .unwrap();
+        let blocked_broll = export_preflight_impl(
+            "p1",
+            crate::data::export_settings::VideoExportSettings {
+                encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
+                subtitle_mode: crate::data::export_settings::ExportSubtitleMode::None,
+                ..Default::default()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!(!blocked_broll.ready);
+        assert!(blocked_broll
+            .items
+            .iter()
+            .any(|item| item.code == "broll" && item.level == "blocker"));
+
+        std::fs::write(project.join("cuts.json"), "{").unwrap();
+        std::fs::write(project.join("broll.json"), "{").unwrap();
+        std::fs::write(project.join("titles.json"), "{").unwrap();
+        std::fs::write(project.join("hidden.json"), "{").unwrap();
+        std::fs::write(project.join("style.json"), "{").unwrap();
+        std::fs::write(
+            project.join("audio-mix.json"),
+            r#"{"volume":9,"muted":false,"fadeIn":0,"fadeOut":0}"#,
+        )
+        .unwrap();
+        let corrupt_sidecars = export_preflight_impl(
+            "p1",
+            crate::data::export_settings::VideoExportSettings {
+                encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
+                subtitle_mode: crate::data::export_settings::ExportSubtitleMode::None,
+                ..Default::default()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!(!corrupt_sidecars.ready);
+        for code in [
+            "timeline-data",
+            "broll",
+            "titles",
+            "audio",
+            "caption-state",
+            "style",
+        ] {
+            assert!(
+                corrupt_sidecars
+                    .items
+                    .iter()
+                    .any(|item| item.code == code && item.level == "blocker"),
+                "missing blocker {code}: {:?}",
+                corrupt_sidecars.items
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn export_preflight_rejects_audio_only_source_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let media = tmp.path().join("audio-only.m4a");
+        crate::proc::run(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.4",
+                "-c:a",
+                "aac",
+                &media.display().to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: media,
+                duration_seconds: 0.4,
+                sample_rate: Some(44_100),
+                channels: Some(1),
+            },
+            meta: Meta {
+                title: "Audio only".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: None,
+                sentences: vec![crate::data::doc::Sentence {
+                    id: "s1".into(),
+                    text: "Hello".into(),
+                    words: vec![crate::data::doc::Word {
+                        id: "w1".into(),
+                        text: "Hello".into(),
+                        start: 0.0,
+                        end: 0.3,
+                    }],
+                }],
+            }],
+            translations: Default::default(),
+        }
+        .save(&project)
+        .unwrap();
+
+        let report = export_preflight_impl(
+            "p1",
+            crate::data::export_settings::VideoExportSettings {
+                encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
+                ..Default::default()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!(!report.ready);
+        assert!(report
+            .items
+            .iter()
+            .any(|item| item.code == "media" && item.level == "blocker"));
+    }
+
+    #[tokio::test]
+    async fn export_aware_finish_check_defers_translation_coverage_to_selected_caption_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let now = chrono::Utc::now();
+        Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: tmp.path().join("source.mp4"),
+                duration_seconds: 2.0,
+                sample_rate: None,
+                channels: None,
+            },
+            meta: Meta {
+                title: "Selective captions".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: Some("Host".into()),
+                sentences: vec![crate::data::doc::Sentence {
+                    id: "s1".into(),
+                    text: "A complete source caption".into(),
+                    words: vec![crate::data::doc::Word {
+                        id: "w1".into(),
+                        text: "caption".into(),
+                        start: 0.0,
+                        end: 1.0,
+                    }],
+                }],
+            }],
+            translations: std::collections::BTreeMap::from([(
+                "fr".into(),
+                std::collections::BTreeMap::new(),
+            )]),
+        }
+        .save(&project)
+        .unwrap();
+
+        let general = finish_check_pid("p1".into(), None, Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(general
+            .iter()
+            .any(|item| item.code == "translations-filled" && !item.pass));
+
+        let selected = finish_check_pid(
+            "p1".into(),
+            Some(crate::data::export_settings::VideoExportSettings::default()),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!(selected
+            .iter()
+            .any(|item| item.code == "translations-filled" && item.pass));
     }
 
     fn save_index_project(
@@ -5226,6 +9438,396 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn project_thumbnail_video_uses_fast_bounded_seek_and_one_frame() {
+        let args = project_thumbnail_args(
+            std::path::Path::new("/tmp/source.mp4"),
+            800.0,
+            std::path::Path::new("/tmp/thumbnail.jpg"),
+            false,
+        );
+        let seek = args.iter().position(|value| value == "-ss").unwrap();
+        let input = args.iter().position(|value| value == "-i").unwrap();
+
+        assert!(seek < input, "input seeking should happen before decoding");
+        assert_eq!(args[seek + 1], "30.000");
+        assert!(args.iter().any(|value| value.contains("crop=640:360")));
+        assert!(args.windows(2).any(|pair| pair == ["-frames:v", "1"]));
+        assert_eq!(args.last().unwrap(), "/tmp/thumbnail.jpg");
+    }
+
+    #[test]
+    fn project_thumbnail_audio_renders_a_single_waveform_without_video_seek() {
+        let args = project_thumbnail_args(
+            std::path::Path::new("/tmp/source.wav"),
+            800.0,
+            std::path::Path::new("/tmp/thumbnail.jpg"),
+            true,
+        );
+
+        assert!(!args.iter().any(|value| value == "-ss"));
+        assert!(args.iter().any(|value| value.contains("showwavespic")));
+        assert!(args.windows(2).any(|pair| pair == ["-frames:v", "1"]));
+    }
+
+    #[tokio::test]
+    async fn manual_timeline_cut_is_durable_and_undoable() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "remove this",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].sentences[0].words = vec![
+            crate::data::Word {
+                id: "w1".into(),
+                text: "remove".into(),
+                start: 1.0,
+                end: 1.5,
+            },
+            crate::data::Word {
+                id: "w2".into(),
+                text: "this".into(),
+                start: 1.5,
+                end: 2.0,
+            },
+        ];
+        doc.save(&project).unwrap();
+
+        assert!(
+            cut_manual("p1".into(), "s1".into(), Some(tmp.path().to_path_buf()),)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(history.can_undo);
+
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert!(
+            edit_redo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_retranscription_save_restores_the_previous_authoritative_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p1");
+        let now = chrono::Utc::now();
+        let make_doc = |sentence_id: &str, text: &str| Doc {
+            id: "p1".into(),
+            schema: 1,
+            media: MediaRef {
+                path: tmp.path().join("source.mp4"),
+                duration_seconds: 2.0,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+            },
+            meta: Meta {
+                title: "Interview".into(),
+                description: String::new(),
+                language: Some("en".into()),
+                created_at: now,
+                updated_at: now,
+            },
+            paragraphs: vec![crate::data::doc::Paragraph {
+                id: 1,
+                speaker: Some("Host".into()),
+                sentences: vec![crate::data::doc::Sentence {
+                    id: sentence_id.into(),
+                    text: text.into(),
+                    words: vec![crate::data::doc::Word {
+                        id: format!("{sentence_id}-word"),
+                        text: text.into(),
+                        start: 0.0,
+                        end: 1.0,
+                    }],
+                }],
+            }],
+            translations: Default::default(),
+        };
+        make_doc("old", "Old").save(&project).unwrap();
+        std::fs::write(project.join("hidden.json"), r#"{"hidden":["old"]}"#).unwrap();
+        std::fs::write(project.join("cuts.json"), r#"{"cuts":[]}"#).unwrap();
+        std::fs::create_dir(project.join("out.srt")).unwrap();
+
+        assert!(persist_transcription_result(make_doc("new", "New"), project.clone()).is_err());
+        let restored = Doc::load(&project).unwrap();
+        assert_eq!(restored.paragraphs[0].sentences[0].id, "old");
+        assert!(project.join("hidden.json").is_file());
+        assert!(project.join("cuts.json").is_file());
+        assert!(crate::data::version::Lineage::load(&project)
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|node| node.name == "Before retranscription"));
+    }
+
+    #[tokio::test]
+    async fn multiple_timeline_cuts_are_atomic_and_need_only_one_undo() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "remove these",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].sentences = vec![
+            crate::data::Sentence {
+                id: "s1".into(),
+                text: "remove one".into(),
+                words: vec![
+                    crate::data::Word {
+                        id: "w1".into(),
+                        text: "remove".into(),
+                        start: 1.0,
+                        end: 1.4,
+                    },
+                    crate::data::Word {
+                        id: "w2".into(),
+                        text: "one".into(),
+                        start: 1.5,
+                        end: 2.0,
+                    },
+                ],
+            },
+            crate::data::Sentence {
+                id: "s2".into(),
+                text: "remove two".into(),
+                words: vec![
+                    crate::data::Word {
+                        id: "w3".into(),
+                        text: "remove".into(),
+                        start: 3.0,
+                        end: 3.4,
+                    },
+                    crate::data::Word {
+                        id: "w4".into(),
+                        text: "two".into(),
+                        start: 3.5,
+                        end: 4.0,
+                    },
+                ],
+            },
+        ];
+        doc.save(&project).unwrap();
+
+        assert_eq!(
+            cut_manual_many(
+                "p1".into(),
+                vec!["s1".into(), "s2".into()],
+                Some(tmp.path().to_path_buf()),
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(
+            history.undo_label.as_deref(),
+            Some("Remove timeline regions")
+        );
+
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert!(cut_manual_many(
+            "p1".into(),
+            vec!["s1".into(), "missing".into()],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .is_err());
+        assert!(cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn audio_mix_is_durable_and_undoable_with_the_timeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "audio",
+            chrono::Utc::now(),
+        );
+        let music_path = tmp.path().join("music.wav");
+        std::fs::write(&music_path, b"test music").unwrap();
+        let music_path = std::fs::canonicalize(music_path).unwrap();
+        let mix = crate::data::audio_mix::AudioMix {
+            volume: 1.2,
+            muted: false,
+            fade_in: 0.5,
+            fade_out: 1.0,
+            voice_enhance: true,
+            normalize_loudness: true,
+            loudness_target: -16.0,
+            music: vec![crate::data::audio_mix::MusicTrack {
+                id: "music-main".into(),
+                path: music_path,
+                start: 0.5,
+                end: 4.5,
+                source_start: 1.0,
+                volume: 0.25,
+                fade_in: 0.5,
+                fade_out: 0.5,
+                ducking: true,
+            }],
+        };
+
+        assert_eq!(
+            audio_mix_set("p1".into(), mix.clone(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap(),
+            mix
+        );
+        assert_eq!(
+            audio_mix_get("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap(),
+            mix
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            audio_mix_get("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap(),
+            crate::data::audio_mix::AudioMix::default()
+        );
+        assert!(
+            edit_redo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            audio_mix_get("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap(),
+            mix
+        );
+    }
+
+    #[tokio::test]
+    async fn title_edits_are_durable_and_round_trip_through_undo_redo() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "title",
+            chrono::Utc::now(),
+        );
+        let input = TitleClipInput {
+            text: "Opening title".into(),
+            start: 1.0,
+            end: 3.0,
+            x: 0.5,
+            y: 0.18,
+            font_size: 72,
+            color: "#FFFFFF".into(),
+            background: "#00000099".into(),
+            fade_in: 0.25,
+            fade_out: 0.5,
+        };
+
+        let added = title_add("p1".into(), input, Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(
+            title_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap(),
+            vec![added.clone()]
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(title_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            edit_redo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            title_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap(),
+            vec![added]
+        );
+    }
+
     #[tokio::test]
     async fn project_index_searches_content_and_persists_starred_order() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5257,10 +9859,12 @@ mod tests {
         assert_eq!(transcript_matches[0].pid, "older");
         assert_eq!(transcript_matches[0].description, "Customer notes");
 
+        let activity = crate::data::activity::touch(&tmp.path().join("older")).unwrap();
         let starred = project_set_star("older".into(), true, Some(tmp.path().to_path_buf()))
             .await
             .unwrap();
         assert!(starred.starred);
+        assert_eq!(starred.updated_at, activity);
         let projects = project_list(Some(tmp.path().to_path_buf())).await.unwrap();
         assert_eq!(projects[0].pid, "older");
         assert!(projects[0].starred);
@@ -5270,6 +9874,45 @@ mod tests {
         )
         .unwrap();
         assert!(persisted.starred);
+    }
+
+    #[tokio::test]
+    async fn project_open_time_is_durable_and_survives_star_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        save_index_project(
+            tmp.path(),
+            "older",
+            "Older project",
+            "",
+            "",
+            now - chrono::Duration::days(2),
+        );
+        save_index_project(tmp.path(), "newer", "Newer project", "", "", now);
+
+        let initial = project_list(Some(tmp.path().to_path_buf())).await.unwrap();
+        assert_eq!(initial[0].pid, "newer");
+
+        let opened = project_mark_opened("older".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        let opened_at = opened.last_opened_at.expect("last open time");
+        let reordered = project_list(Some(tmp.path().to_path_buf())).await.unwrap();
+        assert_eq!(reordered[0].pid, "older");
+        assert_eq!(reordered[0].last_opened_at, Some(opened_at));
+
+        let starred = project_set_star("older".into(), true, Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(starred.starred);
+        assert_eq!(starred.last_opened_at, Some(opened_at));
+
+        let persisted: ProjectLocalState = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("older/project-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(persisted.starred);
+        assert_eq!(persisted.last_opened_at, Some(opened_at));
     }
 
     #[tokio::test]
@@ -5380,6 +10023,38 @@ mod tests {
                 .await
                 .is_err()
         );
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(
+            history.undo_label.as_deref(),
+            Some("Apply speaker analysis")
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            Doc::load(&project).unwrap().paragraphs[0]
+                .speaker
+                .as_deref(),
+            Some("Host")
+        );
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            Doc::load(&project).unwrap().paragraphs[0]
+                .speaker
+                .as_deref(),
+            Some("Alice")
+        );
+        assert!(crate::data::activity::load(&project).is_some());
     }
 
     #[tokio::test]
@@ -5489,6 +10164,7 @@ mod tests {
             mode: Some(crate::data::broll::PlacementMode::Pip),
             fit: None,
             background: None,
+            rect: None,
             source_start: None,
             radius: Some(12),
             name: Some("Product close-up".into()),
@@ -5597,8 +10273,8 @@ mod tests {
             }],
         };
         assert_eq!(
-            broll_preview_timestamps(&doc, &cuts, std::slice::from_ref(&updated)),
-            vec![8.0]
+            broll_preview_points(&doc, &cuts, std::slice::from_ref(&updated)),
+            vec![(8.0, 10.0, 0)]
         );
         std::fs::write(project.join("ai/broll-suggestions.json"), "not json").unwrap();
         let partial = broll_list("p1".into(), Some(tmp.path().to_path_buf()))
@@ -5711,6 +10387,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn speaker_preview_safely_splits_legacy_multi_sentence_projects_on_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Legacy interview",
+            "",
+            "First",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].id = 42;
+        doc.paragraphs[0].speaker = None;
+        doc.paragraphs[0].sentences[0].id = "cue-a".into();
+        doc.paragraphs[0].sentences[0].text = "First speaker".into();
+        doc.paragraphs[0].sentences[0].words = vec![crate::data::Word {
+            id: "w0".into(),
+            text: "First speaker".into(),
+            start: 0.0,
+            end: 1.0,
+        }];
+        let mut second = doc.paragraphs[0].sentences[0].clone();
+        second.id = "cue-b".into();
+        second.text = "Second speaker".into();
+        second.words[0].id = "w1".into();
+        second.words[0].text = "Second speaker".into();
+        second.words[0].start = 2.0;
+        second.words[0].end = 3.0;
+        doc.paragraphs[0].sentences.push(second);
+        doc.save(&project).unwrap();
+
+        let proposals = vec![
+            SpeakerReidentifyProposal {
+                paragraph_id: 1,
+                current: None,
+                cluster: "SPEAKER_00".into(),
+                proposed: "Alice".into(),
+                start: 0.0,
+                end: 1.0,
+                text: "First speaker".into(),
+                coverage: 1.0,
+                margin: 1.0,
+            },
+            SpeakerReidentifyProposal {
+                paragraph_id: 2,
+                current: None,
+                cluster: "SPEAKER_01".into(),
+                proposed: "Bob".into(),
+                start: 2.0,
+                end: 3.0,
+                text: "Second speaker".into(),
+                coverage: 1.0,
+                margin: 1.0,
+            },
+        ];
+        let preview = SpeakerReidentifyPreview {
+            segments: 2,
+            changed: 2,
+            unassigned: 0,
+            proposals: proposals.clone(),
+        };
+        assert!(speaker_preview_matches_doc(
+            &Doc::load(&project).unwrap(),
+            &preview
+        ));
+
+        assert_eq!(
+            speaker_reidentify_apply("p1".into(), proposals, Some(tmp.path().to_path_buf()),)
+                .await
+                .unwrap(),
+            2
+        );
+        let applied = Doc::load(&project).unwrap();
+        assert_eq!(applied.paragraphs.len(), 2);
+        assert_eq!(applied.paragraphs[0].sentences[0].id, "cue-a");
+        assert_eq!(applied.paragraphs[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(applied.paragraphs[1].sentences[0].id, "cue-b");
+        assert_eq!(applied.paragraphs[1].speaker.as_deref(), Some("Bob"));
+
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        let restored = Doc::load(&project).unwrap();
+        assert_eq!(restored.paragraphs.len(), 1);
+        assert_eq!(restored.paragraphs[0].id, 42);
+        assert_eq!(restored.paragraphs[0].sentences.len(), 2);
+    }
+
     fn settings() -> SettingsPayload {
         SettingsPayload {
             llm_endpoint: "http://localhost:11434/v1/chat/completions".into(),
@@ -5726,8 +10495,12 @@ mod tests {
         let v = serde_json::to_value(settings()).unwrap();
         let obj = v.as_object().unwrap();
         for k in [
+            "asrEngine",
             "asrModel",
             "asrAligner",
+            "asrCloudEndpoint",
+            "asrCloudApiKey",
+            "asrCloudModel",
             "diarizeModel",
             "hfToken",
             "llmEndpoint",
@@ -5755,6 +10528,25 @@ mod tests {
         assert_eq!(back.worker_count, 2);
         assert_eq!(back.llm_model, "m");
         assert_eq!(back.hf_token, "hf_test");
+    }
+
+    #[test]
+    fn webview_config_redacts_every_secret_but_reports_presence() {
+        let config = crate::data::modelconfig::ModelConfig {
+            hf_token: "hf-secret".into(),
+            llm_api_key: "llm-secret".into(),
+            asr_cloud_api_key: "asr-secret".into(),
+            ..crate::data::modelconfig::ModelConfig::default()
+        };
+        let public = redact_model_config(config);
+        assert!(public.config.hf_token.is_empty());
+        assert!(public.config.llm_api_key.is_empty());
+        assert!(public.config.asr_cloud_api_key.is_empty());
+        assert!(public.hf_token_set);
+        assert!(public.llm_api_key_set);
+        assert!(public.asr_cloud_api_key_set);
+        let serialized = serde_json::to_string(&public).unwrap();
+        assert!(!serialized.contains("secret"));
     }
 
     #[test]
@@ -5910,6 +10702,7 @@ mod tests {
         assert_eq!(status.kinds[0].failed, 1);
         assert_eq!(status.kinds[0].pending, 0);
         assert_eq!(status.pending, 0);
+        assert_eq!(status.failed, 1);
         assert_eq!(
             status.kinds[0].last_error.as_deref(),
             Some("provider rejected the request")

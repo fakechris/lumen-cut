@@ -10,12 +10,18 @@ import type {
   BrollPlacementInput,
   BrollSuggestion,
   BrollPreviewJobStatus,
+  ChapterInput,
+  ChapterRow,
   Doc,
   DoctorCheck,
   FinishCheckItem,
+  ExportPreflightReport,
   MergeSummary,
   ModelConfig,
+  PerformanceStatus,
+  ProjectMediaStatus,
   ProjectSummary,
+  ProjectThumbnail,
   RecordingStarted,
   RecordingStopped,
   ReportSummary,
@@ -28,10 +34,15 @@ import type {
   SpeakerReidentifyProposal,
   SubtitleRow,
   SubtitleStyle,
+  SubtitleUpdateResult,
   TaskStatus,
+  TitleClip,
+  TitleClipInput,
+  AudioMix,
   TranscriptionJobStatus,
   VersionHistory,
   VideoExportJobStatus,
+  VideoExportSettings,
 } from "./types";
 
 export interface CutSummary {
@@ -41,6 +52,24 @@ export interface CutSummary {
   b_word: string;
   duration: number;
   note: string | null;
+}
+
+export interface EditHistoryStatus {
+  canUndo: boolean;
+  canRedo: boolean;
+  undoLabel: string | null;
+  redoLabel: string | null;
+}
+
+export interface EditHistoryAction {
+  changed: boolean;
+  status: EditHistoryStatus;
+}
+
+export interface TimelineVisuals {
+  contactSheet: string | null;
+  waveform: string | null;
+  deferred: boolean;
 }
 
 export async function greet(): Promise<{ msg: string; version: string }> {
@@ -53,6 +82,10 @@ export async function pickMediaFile(): Promise<string | null> {
 
 export async function pickBrollFile(): Promise<string | null> {
   return invoke("pick_broll_file");
+}
+
+export async function pickAudioFile(): Promise<string | null> {
+  return invoke("pick_audio_file");
 }
 
 export async function projectList(): Promise<ProjectSummary[]> {
@@ -68,6 +101,14 @@ export async function projectSetStar(
   starred: boolean,
 ): Promise<ProjectSummary> {
   return invoke("project_set_star", { pid, starred, root: null });
+}
+
+export async function projectMarkOpened(pid: string): Promise<ProjectSummary> {
+  return invoke("project_mark_opened", { pid, root: null });
+}
+
+export async function projectThumbnail(pid: string): Promise<ProjectThumbnail> {
+  return invoke("project_thumbnail", { pid, root: null });
 }
 
 export async function projectShow(pid: string): Promise<Doc> {
@@ -97,8 +138,24 @@ export async function projectDelete(pid: string): Promise<boolean> {
   return invoke("project_delete", { pid, root: null });
 }
 
+export async function projectMediaStatus(pid: string): Promise<ProjectMediaStatus> {
+  return invoke("project_media_status", { pid, root: null });
+}
+
+export async function projectMediaRelink(pid: string, path: string): Promise<Doc> {
+  return invoke("project_media_relink", { pid, path, root: null });
+}
+
 export async function allowProjectMedia(pid: string): Promise<string> {
   return invoke("media_asset_allow", { pid, root: null });
+}
+
+export async function allowMusicAsset(pid: string, musicId: string): Promise<string> {
+  return invoke("audio_asset_allow", { pid, musicId, root: null });
+}
+
+export async function timelineVisuals(pid: string): Promise<TimelineVisuals> {
+  return invoke("timeline_visuals", { pid, root: null });
 }
 
 export async function projectCreate(
@@ -148,11 +205,10 @@ export async function transcriptionCancel(
   return invoke("transcription_cancel", { pid });
 }
 
-export async function recordAudio(
+export async function transcriptionRetry(
   pid: string,
-  seconds: number,
-): Promise<string> {
-  return invoke("record_audio", { pid, seconds, root: null });
+): Promise<TranscriptionJobStatus> {
+  return invoke("transcription_retry", { pid });
 }
 
 export async function recordingStart(pid: string): Promise<RecordingStarted> {
@@ -171,9 +227,10 @@ export async function taskStart(
   kind: string,
   pid: string,
   lang: string | null,
+  staleOnly = false,
 ): Promise<{ pending: number; ai_dir: string; agent_port: number }> {
   return invoke("task_start", {
-    args: { kind, pid, lang, root: null, stale_only: false },
+    args: { kind, pid, lang, root: null, stale_only: staleOnly },
   });
 }
 
@@ -189,6 +246,27 @@ export async function taskResume(pid: string): Promise<{
   return invoke("task_resume", { pid, root: null });
 }
 
+export async function taskPause(
+  pid: string,
+  kind: string | null = null,
+): Promise<{ paused: number; queuedCalls: number; inFlightCalls: number }> {
+  return invoke("task_pause", { pid, kind, root: null });
+}
+
+export async function taskRetry(
+  pid: string,
+  kind: string,
+): Promise<{ pending: number; ai_dir: string; agent_port: number }> {
+  return invoke("task_retry", { pid, kind, root: null });
+}
+
+export async function taskPrioritize(
+  pid: string,
+  kind: string,
+): Promise<{ movedCalls: number }> {
+  return invoke("task_prioritize", { pid, kind, root: null });
+}
+
 export async function subtitleList(pid: string): Promise<SubtitleRow[]> {
   return invoke("subtitle_list", { pid, root: null });
 }
@@ -201,6 +279,31 @@ export async function subtitleSet(
   return invoke("subtitle_set", { pid, id, text, root: null });
 }
 
+export async function subtitleSetMany(
+  pid: string,
+  updates: Array<{ id: string; text: string }>,
+): Promise<number> {
+  return invoke("subtitle_set_many", { pid, updates, root: null });
+}
+
+export async function subtitleUpdateMany(
+  pid: string,
+  updates: Array<{ id: string; text: string }>,
+): Promise<SubtitleUpdateResult> {
+  return invoke("subtitle_update_many", { pid, updates, root: null });
+}
+
+export async function chapterList(pid: string): Promise<ChapterRow[]> {
+  return invoke("chapter_list", { pid, root: null });
+}
+
+export async function chapterSetMany(
+  pid: string,
+  chapters: ChapterInput[],
+): Promise<boolean> {
+  return invoke("chapter_set_many", { pid, chapters, root: null });
+}
+
 export async function translationSet(
   pid: string,
   lang: string,
@@ -208,6 +311,14 @@ export async function translationSet(
   text: string,
 ): Promise<boolean> {
   return invoke("translation_set", { pid, lang, id, text, root: null });
+}
+
+export async function translationSetMany(
+  pid: string,
+  lang: string,
+  updates: Array<{ id: string; text: string }>,
+): Promise<number> {
+  return invoke("translation_set_many", { pid, lang, updates, root: null });
 }
 
 export async function subtitleReplace(
@@ -232,6 +343,18 @@ export async function subtitleVisibility(
   return invoke("subtitle_visibility", { pid, id, hidden, root: null });
 }
 
+export async function editHistoryStatus(pid: string): Promise<EditHistoryStatus> {
+  return invoke("edit_history_status", { pid, root: null });
+}
+
+export async function editUndo(pid: string): Promise<EditHistoryAction> {
+  return invoke("edit_undo", { pid, root: null });
+}
+
+export async function editRedo(pid: string): Promise<EditHistoryAction> {
+  return invoke("edit_redo", { pid, root: null });
+}
+
 export async function splitSubtitle(
   pid: string,
   id: string,
@@ -246,6 +369,15 @@ export async function mergeSubtitles(
   id2: string,
 ): Promise<boolean> {
   return invoke("merge_lines", { pid, id1, id2, root: null });
+}
+
+export async function setSubtitleTiming(
+  pid: string,
+  id: string,
+  start: number,
+  end: number,
+): Promise<boolean> {
+  return invoke("subtitle_timing_set", { pid, id, start, end, root: null });
 }
 
 export async function styleGet(pid: string): Promise<SubtitleStyle> {
@@ -265,6 +397,10 @@ export async function configShow(): Promise<ModelConfig> {
 
 export async function llmModelsList(endpoint: string, apiKey: string): Promise<string[]> {
   return invoke("llm_models_list", { endpoint, apiKey });
+}
+
+export async function asrModelsList(endpoint: string, apiKey: string): Promise<string[]> {
+  return invoke("asr_models_list", { endpoint, apiKey });
 }
 
 export async function asrStatus(): Promise<AsrStatus> {
@@ -301,6 +437,10 @@ export async function setupJobCancel(): Promise<SetupJobStatus> {
 
 export async function runDoctor(): Promise<DoctorCheck[]> {
   return invoke("run_doctor");
+}
+
+export async function performanceStatus(): Promise<PerformanceStatus> {
+  return invoke("performance_status");
 }
 
 export async function revealLogs(): Promise<string> {
@@ -378,6 +518,10 @@ export async function brollList(pid: string): Promise<BrollOverview> {
   return invoke("broll_list", { pid, root: null });
 }
 
+export async function allowBrollAsset(pid: string, id: string): Promise<string> {
+  return invoke("broll_asset_allow", { pid, id, root: null });
+}
+
 export async function brollAdd(
   pid: string,
   input: BrollPlacementInput,
@@ -410,6 +554,45 @@ export async function brollRemove(pid: string, id: string): Promise<boolean> {
   return invoke("broll_remove", { pid, id, root: null });
 }
 
+export async function titleList(pid: string): Promise<TitleClip[]> {
+  return invoke("title_list", { pid, root: null });
+}
+
+export async function titleAdd(pid: string, input: TitleClipInput): Promise<TitleClip> {
+  return invoke("title_add", { pid, input, root: null });
+}
+
+export async function titleUpdate(
+  pid: string,
+  id: string,
+  input: TitleClipInput,
+): Promise<TitleClip> {
+  return invoke("title_update", { pid, id, input, root: null });
+}
+
+export async function titleRemove(pid: string, id: string): Promise<boolean> {
+  return invoke("title_remove", { pid, id, root: null });
+}
+
+export async function audioMixGet(pid: string): Promise<AudioMix> {
+  return invoke("audio_mix_get", { pid, root: null });
+}
+
+export async function audioMixSet(pid: string, mix: AudioMix): Promise<AudioMix> {
+  return invoke("audio_mix_set", { pid, mix, root: null });
+}
+
+export async function exportSettingsGet(pid: string): Promise<VideoExportSettings> {
+  return invoke("export_settings_get", { pid, root: null });
+}
+
+export async function exportSettingsSet(
+  pid: string,
+  settings: VideoExportSettings,
+): Promise<VideoExportSettings> {
+  return invoke("export_settings_set", { pid, settings, root: null });
+}
+
 export async function brollPreview(pid: string): Promise<string[]> {
   return invoke("broll_preview", { pid, at: [], root: null });
 }
@@ -418,8 +601,11 @@ export async function brollPreviewStart(pid: string): Promise<BrollPreviewJobSta
   return invoke("broll_preview_start", { pid });
 }
 
-export async function brollPreviewStatus(pid: string): Promise<BrollPreviewJobStatus> {
-  return invoke("broll_preview_status", { pid });
+export async function brollPreviewStatus(
+  pid: string,
+  restoreAssets = false,
+): Promise<BrollPreviewJobStatus> {
+  return invoke("broll_preview_status", { pid, restoreAssets });
 }
 
 export async function brollPreviewCancel(pid: string): Promise<BrollPreviewJobStatus> {
@@ -427,11 +613,33 @@ export async function brollPreviewCancel(pid: string): Promise<BrollPreviewJobSt
 }
 
 export async function finishCheck(pid: string): Promise<FinishCheckItem[]> {
-  return invoke("finish_check_pid", { pid, root: null });
+  return invoke("finish_check_pid", { pid, settings: null, root: null });
+}
+
+export async function finishCheckForExport(
+  pid: string,
+  settings: VideoExportSettings,
+): Promise<FinishCheckItem[]> {
+  return invoke("finish_check_pid", { pid, settings, root: null });
+}
+
+export async function exportPreflight(
+  pid: string,
+  settings: VideoExportSettings,
+): Promise<ExportPreflightReport> {
+  return invoke("export_preflight", { pid, settings, root: null });
 }
 
 export async function cutAuto(pid: string): Promise<number> {
   return invoke("cut_auto", { pid, root: null });
+}
+
+export async function cutManual(pid: string, cueId: string): Promise<boolean> {
+  return invoke("cut_manual", { pid, cueId, root: null });
+}
+
+export async function cutManualMany(pid: string, cueIds: string[]): Promise<number> {
+  return invoke("cut_manual_many", { pid, cueIds, root: null });
 }
 
 export async function cutRestore(pid: string, cutId: string): Promise<boolean> {
@@ -472,9 +680,9 @@ export async function exportVideo(pid: string): Promise<string> {
 
 export async function videoExportStart(
   pid: string,
-  mode: VideoExportJobStatus["mode"],
+  settings: VideoExportSettings,
 ): Promise<VideoExportJobStatus> {
-  return invoke("video_export_start", { pid, mode });
+  return invoke("video_export_start", { pid, settings, mode: null });
 }
 
 export async function videoExportStatus(pid: string): Promise<VideoExportJobStatus> {
@@ -532,8 +740,12 @@ export async function agentWorkers(): Promise<unknown[]> {
 export async function settingsExport(s: Settings): Promise<string> {
   return invoke("settings_export", {
     settings: {
+      asr_engine: s.asrEngine,
       asr_model: s.asrModel,
       asr_aligner: s.asrAligner,
+      asr_cloud_endpoint: s.asrCloudEndpoint,
+      asr_cloud_api_key: s.asrCloudApiKey,
+      asr_cloud_model: s.asrCloudModel,
       diarize_model: s.diarizeModel,
       hf_token: s.hfToken,
       llm_endpoint: s.llmEndpoint,
@@ -559,14 +771,23 @@ export function loadSettings(): Settings {
 }
 
 export function saveSettings(s: Settings) {
-  const { hfToken: _hfToken, llmApiKey: _llmApiKey, ...nonSensitive } = s;
+  const {
+    hfToken: _hfToken,
+    llmApiKey: _llmApiKey,
+    asrCloudApiKey: _asrCloudApiKey,
+    ...nonSensitive
+  } = s;
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(nonSensitive));
 }
 
 function defaultSettings(): Settings {
   return {
+    asrEngine: "local",
     asrModel: "mlx-community/Qwen3-ASR-0.6B-8bit",
     asrAligner: "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
+    asrCloudEndpoint: "https://api.openai.com/v1/audio/transcriptions",
+    asrCloudApiKey: "",
+    asrCloudModel: "whisper-1",
     diarizeModel: "pyannote/speaker-diarization-3.1",
     hfToken: "",
     llmEndpoint: "",

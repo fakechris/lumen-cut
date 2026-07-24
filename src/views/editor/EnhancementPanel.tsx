@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { Lang } from "../../i18n";
 import type { Doc, TaskStatus } from "../../types";
 
@@ -54,6 +55,12 @@ export function EnhancementPanel({
   onStart,
 }: Props) {
   const translationLanguage = Object.keys(doc.translations)[0] || null;
+  const [confirmKind, setConfirmKind] = useState<string | null>(null);
+
+  const start = (kind: string, language: string | null) => {
+    setConfirmKind(null);
+    void onStart(kind, language);
+  };
 
   return (
     <section className="enhancement-panel" aria-labelledby="enhancement-title">
@@ -126,23 +133,54 @@ export function EnhancementPanel({
                       ? lang === "zh" ? "已完成" : "Completed"
                       : lang === "zh" ? "未运行" : "Not run"}
               </span>
-              <button
-                className="button-quiet"
-                disabled={busy || running || !configured || alignUnavailable}
-                onClick={() =>
-                  onStart(
-                    task.kind,
-                    task.kind === "align" ? translationLanguage : null,
-                  )
-                }
-              >
-                {running
-                  ? <span className="spinner" aria-hidden="true" />
-                  : null}
-                {failed || completed
-                  ? lang === "zh" ? "再次运行" : "Run again"
-                  : lang === "zh" ? "开始" : "Start"}
-              </button>
+              {completed && confirmKind === task.kind ? (
+                <div className="enhancement-rerun-confirm" role="alert">
+                  <span>
+                    {lang === "zh"
+                      ? "再次运行可能替换这一步的现有结果。"
+                      : "Running again may replace the existing result from this step."}
+                  </span>
+                  <button
+                    className="button-quiet"
+                    disabled={busy}
+                    onClick={() => setConfirmKind(null)}
+                  >
+                    {lang === "zh" ? "取消" : "Cancel"}
+                  </button>
+                  <button
+                    className="button-danger"
+                    disabled={busy}
+                    onClick={() => start(
+                      task.kind,
+                      task.kind === "align" ? translationLanguage : null,
+                    )}
+                  >
+                    {lang === "zh" ? "确认再次运行" : "Confirm rerun"}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="button-quiet"
+                  disabled={busy || running || !configured || alignUnavailable}
+                  onClick={() => {
+                    if (completed) {
+                      setConfirmKind(task.kind);
+                    } else {
+                      start(
+                        task.kind,
+                        task.kind === "align" ? translationLanguage : null,
+                      );
+                    }
+                  }}
+                >
+                  {running
+                    ? <span className="spinner" aria-hidden="true" />
+                    : null}
+                  {failed || completed
+                    ? lang === "zh" ? "再次运行" : "Run again"
+                    : lang === "zh" ? "开始" : "Start"}
+                </button>
+              )}
             </article>
           );
         })}

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  asrModelsList,
   asrStatus,
   configShow,
   llmModelsList,
@@ -10,6 +11,7 @@ import {
   setupJobStatus,
   settingsExport,
 } from "../api";
+import { PipelineFreshness } from "../components/PipelineFreshness";
 import type { Lang } from "../i18n";
 import {
   getLlmProvider,
@@ -21,16 +23,25 @@ import { PipelineView } from "./PipelineView";
 
 interface Props {
   lang: Lang;
-  pid: string | null;
 }
 
 const COPY = {
   zh: {
     eyebrow: "偏好设置",
     title: "设置",
-    intro: "首次转写请按下方状态引导准备本地引擎和模型；完成后，转写与其他后台任务会按需自动运行。",
-    localTitle: "本地模型与运行环境",
-    localDescription: "转写、词级对齐和说话人识别都在 Mac 本机运行。这里显示每一项真实状态。",
+    intro: "首次转写先选择本机或云端引擎，并按状态引导完成准备；之后所有后台任务都会按需自动运行。",
+    localTitle: "转写引擎与说话人",
+    localDescription: "可选择本机 MLX 或兼容 OpenAI 音频接口的云端转写。说话人识别始终在本机独立运行。",
+    asrEngine: "转写引擎",
+    localEngine: "本机 MLX · 隐私优先",
+    cloudEngine: "OpenAI Compatible · 云端",
+    cloudEndpoint: "转写服务地址",
+    cloudModel: "转写模型",
+    cloudKey: "转写 API Key",
+    cloudReady: "云端转写已配置",
+    cloudIncomplete: "请补全转写服务地址、模型和 API Key",
+    cloudPrivacy: "音频会从这台 Mac 直接上传到所选服务。长音频会按 10 分钟分片，任务可取消；服务必须返回真实词级时码。",
+    storedSecret: "已保存；留空会继续使用原 Key",
     asrModel: "转写模型",
     aligner: "字词对齐模型",
     runtime: "转写引擎",
@@ -52,7 +63,7 @@ const COPY = {
     downloadSpeakerModel: "下载说话人模型",
     downloadingSpeakerModel: "正在下载说话人模型…",
     refreshStatus: "重新检查",
-    localHint: "先准备转写即可开始工作；说话人识别是可选能力，需要另行接受模型条款并设置 HF_TOKEN。安装和下载都在后台执行。",
+    localHint: "本机与云端转写二选一；无需启动服务器。说话人识别是可选能力，需要另行接受模型条款并设置 HF_TOKEN。",
     agentTitle: "AI 功能",
     agentDescription: "用于翻译、润色、章节和 B-roll 建议。基础转写与字幕导出不需要配置。",
     automatic: "无需手动启动 Pipeline 或服务器。保存服务地址和模型后，使用相关功能时会自动启动后台任务。",
@@ -92,9 +103,19 @@ const COPY = {
   en: {
     eyebrow: "Preferences",
     title: "Settings",
-    intro: "Before the first transcript, use the status below to prepare the local runtime and models. Later jobs start automatically.",
-    localTitle: "Local models and runtimes",
-    localDescription: "Transcription, word alignment, and speaker identification run on this Mac. Every real dependency is reported here.",
+    intro: "Before the first transcript, choose a local or cloud engine and follow its readiness status. Later jobs start automatically.",
+    localTitle: "Transcription engine and speakers",
+    localDescription: "Choose local MLX or an OpenAI-compatible audio endpoint. Speaker identification remains a separate local capability.",
+    asrEngine: "Transcription engine",
+    localEngine: "Local MLX · privacy first",
+    cloudEngine: "OpenAI Compatible · cloud",
+    cloudEndpoint: "Transcription endpoint",
+    cloudModel: "Transcription model",
+    cloudKey: "Transcription API key",
+    cloudReady: "Cloud transcription is configured",
+    cloudIncomplete: "Complete the transcription endpoint, model, and API key",
+    cloudPrivacy: "Audio is uploaded directly from this Mac to the selected service. Long audio is split into 10-minute chunks and remains cancellable; the service must return real word timestamps.",
+    storedSecret: "Already saved; leave blank to keep the existing key",
     asrModel: "Transcription model",
     aligner: "Word alignment model",
     runtime: "Transcription runtime",
@@ -116,7 +137,7 @@ const COPY = {
     downloadSpeakerModel: "Download speaker model",
     downloadingSpeakerModel: "Downloading speaker model…",
     refreshStatus: "Check again",
-    localHint: "Prepare transcription first and start working. Speaker identification is optional and separately requires accepting model terms and setting HF_TOKEN. All setup runs in the background.",
+    localHint: "Choose either local or cloud transcription; no server startup is needed. Speaker identification is optional and separately requires accepting model terms and setting HF_TOKEN.",
     agentTitle: "AI features",
     agentDescription: "Used for translation, polish, chapters, and B-roll suggestions. Basic transcription and subtitle export need no configuration.",
     automatic: "You never need to start a Pipeline or server manually. Save an endpoint and model; the background worker starts when a feature needs it.",
@@ -155,7 +176,7 @@ const COPY = {
   },
 } as const;
 
-export function SettingsView({ lang, pid }: Props) {
+export function SettingsView({ lang }: Props) {
   const c = COPY[lang];
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [providerId, setProviderId] = useState(() => inferLlmProvider(settings.llmEndpoint));
@@ -168,6 +189,11 @@ export function SettingsView({ lang, pid }: Props) {
   const [modelCatalogState, setModelCatalogState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
   const [modelCatalogMessage, setModelCatalogMessage] = useState<string | null>(null);
   const modelCatalogRequest = useRef(0);
+  const [llmApiKeyStored, setLlmApiKeyStored] = useState(false);
+  const [asrCloudApiKeyStored, setAsrCloudApiKeyStored] = useState(false);
+  const [cloudAsrModels, setCloudAsrModels] = useState<string[]>([]);
+  const [cloudAsrCatalogState, setCloudAsrCatalogState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [cloudAsrCatalogMessage, setCloudAsrCatalogMessage] = useState<string | null>(null);
 
   const refreshModels = async (source: Settings = settings) => {
     if (!source.llmEndpoint.trim()) return;
@@ -188,6 +214,25 @@ export function SettingsView({ lang, pid }: Props) {
     }
   };
 
+  const refreshCloudAsrModels = async (source: Settings = settings) => {
+    if (!source.asrCloudEndpoint.trim()) return;
+    setCloudAsrCatalogState("loading");
+    setCloudAsrCatalogMessage(null);
+    try {
+      const models = await asrModelsList(
+        source.asrCloudEndpoint.trim(),
+        source.asrCloudApiKey.trim(),
+      );
+      setCloudAsrModels(models);
+      setCloudAsrCatalogState("loaded");
+      setCloudAsrCatalogMessage(c.modelsLoaded(models.length));
+    } catch (error) {
+      setCloudAsrModels([]);
+      setCloudAsrCatalogState("error");
+      setCloudAsrCatalogMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   useEffect(() => {
     let disposed = false;
     void Promise.all([
@@ -197,25 +242,39 @@ export function SettingsView({ lang, pid }: Props) {
     ])
       .then(([config, status, setup]) => {
         if (disposed) return;
+        const asrEngine = config.asrEngine ?? "local";
+        const asrCloudEndpoint = config.asrCloudEndpoint
+          ?? "https://api.openai.com/v1/audio/transcriptions";
+        const asrCloudModel = config.asrCloudModel ?? "whisper-1";
         setSettings({
+          asrEngine,
           asrModel: config.asrModel,
           asrAligner: config.asrAligner,
+          asrCloudEndpoint,
+          asrCloudApiKey: "",
+          asrCloudModel,
           diarizeModel: config.diarizeModel,
-          hfToken: config.hfToken,
+          hfToken: "",
           llmEndpoint: config.llmEndpoint,
-          llmApiKey: config.llmApiKey,
+          llmApiKey: "",
           llmModel: config.llmModel,
           workerCount: config.workerCount,
         });
+        setLlmApiKeyStored(config.llmApiKeySet ?? Boolean(config.llmApiKey));
+        setAsrCloudApiKeyStored(config.asrCloudApiKeySet ?? Boolean(config.asrCloudApiKey));
         setProviderId(inferLlmProvider(config.llmEndpoint));
         if (config.llmEndpoint.trim()) {
           void refreshModels({
+            asrEngine,
             asrModel: config.asrModel,
             asrAligner: config.asrAligner,
+            asrCloudEndpoint,
+            asrCloudApiKey: "",
+            asrCloudModel,
             diarizeModel: config.diarizeModel,
-            hfToken: config.hfToken,
+            hfToken: "",
             llmEndpoint: config.llmEndpoint,
-            llmApiKey: config.llmApiKey,
+            llmApiKey: "",
             llmModel: config.llmModel,
             workerCount: config.workerCount,
           });
@@ -290,6 +349,13 @@ export function SettingsView({ lang, pid }: Props) {
       setRemoteModels([]);
       setModelCatalogState("idle");
       setModelCatalogMessage(null);
+      if (key === "llmEndpoint" || value !== "") setLlmApiKeyStored(false);
+    }
+    if (key === "asrCloudEndpoint" || key === "asrCloudApiKey") {
+      setCloudAsrModels([]);
+      setCloudAsrCatalogState("idle");
+      setCloudAsrCatalogMessage(null);
+      if (key === "asrCloudEndpoint" || value !== "") setAsrCloudApiKeyStored(false);
     }
     setSettings((previous) => ({ ...previous, [key]: value }));
   };
@@ -302,7 +368,12 @@ export function SettingsView({ lang, pid }: Props) {
   const providerConfigured = Boolean(
     settings.llmEndpoint.trim()
       && settings.llmModel.trim()
-      && (!selectedProvider?.needsKey || settings.llmApiKey.trim()),
+      && (!selectedProvider?.needsKey || settings.llmApiKey.trim() || llmApiKeyStored),
+  );
+  const cloudAsrConfigured = Boolean(
+    settings.asrCloudEndpoint?.trim()
+      && settings.asrCloudModel?.trim()
+      && (settings.asrCloudApiKey?.trim() || asrCloudApiKeyStored),
   );
 
   const selectProvider = (nextId: string) => {
@@ -315,6 +386,7 @@ export function SettingsView({ lang, pid }: Props) {
     setModelCatalogState("idle");
     setModelCatalogMessage(null);
     if (nextId === "none") {
+      setLlmApiKeyStored(false);
       setSettings((previous) => ({
         ...previous,
         llmApiKey: "",
@@ -326,10 +398,12 @@ export function SettingsView({ lang, pid }: Props) {
     const provider = getLlmProvider(nextId);
     if (!provider) {
       if (changedProvider) {
+        setLlmApiKeyStored(false);
         setSettings((previous) => ({ ...previous, llmApiKey: "" }));
       }
       return;
     }
+    if (changedProvider) setLlmApiKeyStored(false);
     setSettings((previous) => ({
       ...previous,
       llmApiKey: changedProvider ? "" : previous.llmApiKey,
@@ -350,10 +424,13 @@ export function SettingsView({ lang, pid }: Props) {
         llmModel: settings.llmModel.trim(),
         workerCount: Math.max(1, Math.min(8, Math.round(settings.workerCount || 1))),
       };
+      if (normalized.asrEngine === "openai-compatible" && !cloudAsrConfigured) {
+        throw new Error(c.cloudIncomplete);
+      }
       if (normalized.llmEndpoint && !normalized.llmModel) {
         throw new Error(c.incomplete);
       }
-      if (selectedProvider?.needsKey && !normalized.llmApiKey) {
+      if (selectedProvider?.needsKey && !normalized.llmApiKey && !llmApiKeyStored) {
         throw new Error(c.missingApiKey);
       }
       if (normalized.llmEndpoint) {
@@ -367,10 +444,27 @@ export function SettingsView({ lang, pid }: Props) {
           throw new Error(c.invalidEndpoint);
         }
       }
+      if (normalized.asrEngine === "openai-compatible") {
+        let protocol = "";
+        try {
+          protocol = new URL(normalized.asrCloudEndpoint).protocol;
+        } catch {
+          throw new Error(c.invalidEndpoint);
+        }
+        if (!["http:", "https:"].includes(protocol)) throw new Error(c.invalidEndpoint);
+      }
       setSettings(normalized);
       saveSettings(normalized);
       await settingsExport(normalized);
       setAsr(await asrStatus());
+      if (normalized.llmApiKey) setLlmApiKeyStored(true);
+      if (normalized.asrCloudApiKey) setAsrCloudApiKeyStored(true);
+      setSettings((previous) => ({
+        ...previous,
+        hfToken: "",
+        llmApiKey: "",
+        asrCloudApiKey: "",
+      }));
       setState("saved");
       window.setTimeout(() => setState("idle"), 1800);
     } catch (error) {
@@ -474,6 +568,87 @@ export function SettingsView({ lang, pid }: Props) {
         </div>
         <div className="settings-form local-asr-settings">
           <label>
+            <span>{c.asrEngine}</span>
+            <select
+              value={settings.asrEngine}
+              onChange={(event) => update(
+                "asrEngine",
+                event.target.value as Settings["asrEngine"],
+              )}
+            >
+              <option value="local">{c.localEngine}</option>
+              <option value="openai-compatible">{c.cloudEngine}</option>
+            </select>
+          </label>
+          {settings.asrEngine === "openai-compatible" && (
+            <>
+              <div className={`provider-configuration-state${cloudAsrConfigured ? " ready" : ""}`} role="status">
+                <span className={cloudAsrConfigured ? "status-dot ready" : "status-dot"} />
+                <div>
+                  <strong>{cloudAsrConfigured ? c.cloudReady : c.cloudIncomplete}</strong>
+                  <small>{c.cloudPrivacy}</small>
+                </div>
+              </div>
+              <label>
+                <span>{c.cloudKey}</span>
+                <input
+                  aria-label={c.cloudKey}
+                  autoComplete="off"
+                  placeholder={asrCloudApiKeyStored ? c.storedSecret : "sk-…"}
+                  type="password"
+                  value={settings.asrCloudApiKey}
+                  onChange={(event) => update("asrCloudApiKey", event.target.value)}
+                />
+              </label>
+              <label className="provider-model-field">
+                <span>{c.cloudModel}</span>
+                <div className="provider-model-input">
+                  <input
+                    aria-label={c.cloudModel}
+                    list={cloudAsrModels.length ? "asr-cloud-model-options" : undefined}
+                    value={settings.asrCloudModel}
+                    onChange={(event) => update("asrCloudModel", event.target.value)}
+                  />
+                  <button
+                    className="button-quiet"
+                    disabled={cloudAsrCatalogState === "loading"
+                      || !settings.asrCloudEndpoint.trim()
+                      || (!settings.asrCloudApiKey.trim() && !asrCloudApiKeyStored)}
+                    type="button"
+                    onClick={() => void refreshCloudAsrModels()}
+                  >
+                    {cloudAsrCatalogState === "loading" ? c.refreshingModels : c.refreshModels}
+                  </button>
+                </div>
+                {cloudAsrModels.length ? (
+                  <datalist id="asr-cloud-model-options">
+                    {cloudAsrModels.map((model) => <option key={model} value={model} />)}
+                  </datalist>
+                ) : null}
+                <small className="field-hint">
+                  {lang === "zh"
+                    ? "默认 whisper-1；当前必须支持 verbose_json 和 word timestamps，不能用推测时码代替。"
+                    : "Defaults to whisper-1. The model must support verbose_json word timestamps; inferred timing is never substituted."}
+                </small>
+                {cloudAsrCatalogMessage ? (
+                  <small className={`field-hint model-catalog-message ${cloudAsrCatalogState}`} role={cloudAsrCatalogState === "error" ? "alert" : "status"}>
+                    {cloudAsrCatalogMessage}
+                  </small>
+                ) : null}
+              </label>
+              <label>
+                <span>{c.cloudEndpoint}</span>
+                <input
+                  aria-label={c.cloudEndpoint}
+                  value={settings.asrCloudEndpoint}
+                  onChange={(event) => update("asrCloudEndpoint", event.target.value)}
+                />
+              </label>
+            </>
+          )}
+          {settings.asrEngine === "local" && (
+            <>
+          <label>
             <span>{c.asrModel}</span>
             <select
               disabled={asrAction !== null}
@@ -490,6 +665,8 @@ export function SettingsView({ lang, pid }: Props) {
             <span>{c.aligner}</span>
             <input value={settings.asrAligner} readOnly />
           </label>
+            </>
+          )}
           <label>
             <span>{c.diarizeModel}</span>
             <select
@@ -504,7 +681,7 @@ export function SettingsView({ lang, pid }: Props) {
             <span>{c.hfToken}</span>
             <input
               autoComplete="off"
-              placeholder="hf_…"
+              placeholder={asr?.huggingFaceTokenSet ? c.storedSecret : "hf_…"}
               type="password"
               value={settings.hfToken}
               onChange={(event) => update("hfToken", event.target.value)}
@@ -512,6 +689,8 @@ export function SettingsView({ lang, pid }: Props) {
           </label>
 
           <div className="asr-health" aria-live="polite">
+            {settings.asrEngine === "local" && (
+              <>
             <div>
               <span className={asr?.runtimeReady ? "status-dot ready" : "status-dot"} />
               <strong>{c.runtime}</strong>
@@ -527,6 +706,8 @@ export function SettingsView({ lang, pid }: Props) {
               <strong>{settings.asrAligner}</strong>
               <small>{asr?.alignerCached ? c.modelCached : c.modelMissing}</small>
             </div>
+              </>
+            )}
             <div>
               <span className={asr?.diarizeRuntimeReady ? "status-dot ready" : "status-dot"} />
               <strong>{c.diarizeRuntime}</strong>
@@ -545,12 +726,12 @@ export function SettingsView({ lang, pid }: Props) {
           </div>
 
           <div className="settings-save asr-actions">
-            {!asr?.runtimeReady && (
+            {settings.asrEngine === "local" && !asr?.runtimeReady && (
               <button className="button-primary" disabled={asrAction !== null} onClick={installAsr}>
                 {asrAction === "install" ? c.installingRuntime : c.installRuntime}
               </button>
             )}
-            {asr?.runtimeReady && (!asr.modelCached || !asr.alignerCached) && (
+            {settings.asrEngine === "local" && asr?.runtimeReady && (!asr.modelCached || !asr.alignerCached) && (
               <button
                 className="button-primary"
                 disabled={asrAction !== null}
@@ -597,6 +778,12 @@ export function SettingsView({ lang, pid }: Props) {
                   ? "当前工具没有提供可信的总字节数，因此这里明确显示不定进度；详细失败输出会保留末尾日志。"
                   : "This tool does not expose a trustworthy total byte count, so progress is explicitly indeterminate; failure output keeps a bounded log tail."}
               </small>
+              <PipelineFreshness
+                state={setupJob.state}
+                phase={setupJob.phase}
+                updatedAt={setupJob.updatedAt}
+                lang={lang}
+              />
               <button
                 className="button-quiet"
                 disabled={setupJob.state === "cancelling"}
@@ -669,7 +856,7 @@ export function SettingsView({ lang, pid }: Props) {
                     aria-label={selectedProvider?.needsKey ? c.apiKey : c.apiKeyOptional}
                     aria-required={selectedProvider?.needsKey || undefined}
                     autoComplete="off"
-                    placeholder={selectedProvider?.needsKey ? "sk-…" : undefined}
+                    placeholder={llmApiKeyStored ? c.storedSecret : selectedProvider?.needsKey ? "sk-…" : undefined}
                     type="password"
                     value={settings.llmApiKey}
                     onChange={(event) => update("llmApiKey", event.target.value)}
@@ -691,7 +878,7 @@ export function SettingsView({ lang, pid }: Props) {
                     className="button-quiet"
                     disabled={modelCatalogState === "loading"
                       || !settings.llmEndpoint.trim()
-                      || Boolean(selectedProvider?.needsKey && !settings.llmApiKey.trim())}
+                      || Boolean(selectedProvider?.needsKey && !settings.llmApiKey.trim() && !llmApiKeyStored)}
                     type="button"
                     onClick={() => void refreshModels()}
                   >
@@ -704,7 +891,7 @@ export function SettingsView({ lang, pid }: Props) {
                   </datalist>
                 ) : null}
                 <small className="field-hint">{c.modelHint}</small>
-                {selectedProvider?.needsKey && !settings.llmApiKey.trim() ? (
+                {selectedProvider?.needsKey && !settings.llmApiKey.trim() && !llmApiKeyStored ? (
                   <small className="field-hint">{c.modelsNeedKey}</small>
                 ) : null}
                 {modelCatalogMessage ? (
@@ -778,7 +965,7 @@ export function SettingsView({ lang, pid }: Props) {
             <small>{c.advancedHint}</small>
           </span>
         </summary>
-        <PipelineView embedded lang={lang} pid={pid} />
+        <PipelineView lang={lang} />
       </details>
     </section>
   );
