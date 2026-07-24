@@ -497,52 +497,165 @@ pub fn restore_or_enqueue(allocator: &Allocator, task: &PreparedTask) -> AppResu
     Ok(restored)
 }
 
-/// Count every pending/completed call across task kinds. Status is a project
-/// view, not a translate-only view.
-pub fn task_counts(project_dir: &Path) -> (usize, usize) {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskKindStatus {
+    pub kind: String,
+    pub lang: Option<String>,
+    pub state: String,
+    pub calls: usize,
+    pub pending: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub last_error: Option<String>,
+    pub started_at: Option<u64>,
+    pub updated_at: Option<u64>,
+}
+
+/// Build one durable status row per task kind. Only files belonging to the
+/// manifest's active run are counted, so stale artifacts cannot make a new
+/// run look completed or failed.
+pub fn task_kind_statuses(project_dir: &Path) -> Vec<TaskKindStatus> {
     let ai = project_dir.join("ai");
-    let mut pending = 0;
-    let mut done = 0;
     let Ok(kinds) = std::fs::read_dir(ai) else {
-        return (0, 0);
+        return vec![];
     };
-    for kind in kinds
+    let mut statuses = kinds
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
-    {
-        let count = |name: &str| {
-            std::fs::read_dir(kind.path().join(name))
-                .map(|entries| entries.filter_map(Result::ok).count())
-                .unwrap_or_default()
-        };
-        let failed_names: std::collections::BTreeSet<std::ffi::OsString> =
-            std::fs::read_dir(kind.path().join("failed"))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .collect();
-        let done_names: std::collections::BTreeSet<std::ffi::OsString> =
-            std::fs::read_dir(kind.path().join("done"))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .collect();
-        pending += std::fs::read_dir(kind.path().join("pending"))
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        !failed_names.contains(&entry.file_name())
-                            && !done_names.contains(&entry.file_name())
+        .filter_map(|entry| {
+            let dir = entry.path();
+            let kind = entry.file_name().to_string_lossy().into_owned();
+            let task_json = std::fs::read_to_string(dir.join("task.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            let active_prefix = task_json
+                .as_ref()
+                .and_then(|value| value.get("runId"))
+                .and_then(|value| value.as_str())
+                .map(|run_id| format!("{kind}-{run_id}-"));
+            let entries_for = |name: &str| {
+                std::fs::read_dir(dir.join(name))
+                    .map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .filter(|entry| {
+                                active_prefix.as_ref().is_none_or(|prefix| {
+                                    entry.file_name().to_string_lossy().starts_with(prefix)
+                                })
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .count()
+                    .unwrap_or_default()
+            };
+            let done_entries = entries_for("done");
+            let failed_entries = entries_for("failed");
+            let pending_entries = entries_for("pending");
+            let done = done_entries.len();
+            let failed = failed_entries.len();
+            let failed_names: BTreeSet<std::ffi::OsString> = failed_entries
+                .iter()
+                .map(|entry| entry.file_name())
+                .collect();
+            let done_names: BTreeSet<std::ffi::OsString> =
+                done_entries.iter().map(|entry| entry.file_name()).collect();
+            let pending = pending_entries
+                .iter()
+                .filter(|entry| {
+                    !failed_names.contains(&entry.file_name())
+                        && !done_names.contains(&entry.file_name())
+                })
+                .count();
+            if pending + done + failed == 0 && !dir.join("task.json").exists() {
+                return None;
+            }
+            let lang = task_json
+                .as_ref()
+                .and_then(|value| value.get("lang"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let manifest_state = task_json
+                .as_ref()
+                .and_then(|value| value.get("state"))
+                .and_then(|value| value.as_str());
+            let calls = task_json
+                .as_ref()
+                .and_then(|value| value.get("calls"))
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(pending + done + failed);
+            let state = if failed > 0 && pending == 0 {
+                "failed"
+            } else if calls > 0 && done == calls {
+                "completed"
+            } else {
+                manifest_state.unwrap_or(if pending > 0 { "running" } else { "completed" })
+            }
+            .to_string();
+            let last_error = task_json
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    failed_entries
+                        .iter()
+                        .max_by_key(|entry| {
+                            entry
+                                .metadata()
+                                .ok()
+                                .and_then(|metadata| metadata.modified().ok())
+                        })
+                        .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+                });
+            let started_at = task_json
+                .as_ref()
+                .and_then(|value| value.get("startedAt"))
+                .and_then(|value| value.as_u64());
+            let updated_at = std::iter::once(dir.join("task.json"))
+                .chain(std::iter::once(dir.clone()))
+                .chain(done_entries.iter().map(|entry| entry.path()))
+                .chain(failed_entries.iter().map(|entry| entry.path()))
+                .chain(pending_entries.iter().map(|entry| entry.path()))
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .filter_map(|metadata| metadata.modified().ok())
+                .filter_map(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .max();
+            Some(TaskKindStatus {
+                kind,
+                lang,
+                state,
+                calls,
+                pending,
+                done,
+                failed,
+                last_error,
+                started_at,
+                updated_at,
             })
-            .unwrap_or_default();
-        done += count("done");
-    }
-    (pending, done)
+        })
+        .collect::<Vec<_>>();
+    statuses.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    statuses
+}
+
+/// Count every active-run pending/completed call across task kinds. Kept for
+/// compatibility with existing callers; richer surfaces should use
+/// `task_kind_statuses`.
+pub fn task_counts(project_dir: &Path) -> (usize, usize) {
+    let statuses = task_kind_statuses(project_dir);
+    (
+        statuses.iter().map(|status| status.pending).sum(),
+        statuses.iter().map(|status| status.done).sum(),
+    )
 }
 
 fn timeline_payload(doc: &Doc) -> AppResult<serde_json::Value> {

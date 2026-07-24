@@ -7,8 +7,9 @@ import { EnhancementPanel } from "./EnhancementPanel";
 test("completed enhancements require explicit confirmation before rerunning", () => {
   const onStart = vi.fn(async () => undefined);
   const status: TaskStatus = {
-    pending: 0,
-    done: 1,
+  pending: 0,
+  done: 1,
+  failed: 0,
     kinds: [{
       kind: "chapters",
       state: "completed",

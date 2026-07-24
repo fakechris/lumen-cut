@@ -276,6 +276,7 @@ export interface PerformanceStatus {
 export interface TaskStatus {
   pending: number;
   done: number;
+  failed: number;
   kinds: Array<{
     kind: string;
     lang?: string | null;

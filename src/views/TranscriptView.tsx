@@ -1036,14 +1036,24 @@ export function TranscriptView({
         if (status.kinds.some(
           (task) => task.pending > 0 && task.state !== "paused" && task.state !== "failed",
         )) {
-          const recovery = await taskResume(pid);
-          if (activeProject.current !== pid) return;
-          if (recovery.resumed > 0 || recovery.recoveredSubmissions > 0) {
+          try {
+            const recovery = await taskResume(pid);
+            if (activeProject.current !== pid) return;
+            if (recovery.resumed > 0 || recovery.recoveredSubmissions > 0) {
+              setFeedback({
+                tone: "info",
+                text: lang === "zh"
+                  ? `已恢复 ${recovery.resumed} 个未完成任务，其中 ${recovery.recoveredSubmissions} 个模型结果无需重算。`
+                  : `Resumed ${recovery.resumed} unfinished tasks; ${recovery.recoveredSubmissions} model results did not need recomputation.`,
+              });
+            }
+          } catch (error) {
+            if (activeProject.current !== pid) return;
             setFeedback({
-              tone: "info",
+              tone: "error",
               text: lang === "zh"
-                ? `已恢复 ${recovery.resumed} 个未完成任务，其中 ${recovery.recoveredSubmissions} 个模型结果无需重算。`
-                : `Resumed ${recovery.resumed} unfinished tasks; ${recovery.recoveredSubmissions} model results did not need recomputation.`,
+                ? `未完成的 AI 任务尚未恢复：${friendlyError(error, lang)}`
+                : `Unfinished AI tasks were not resumed: ${friendlyError(error, lang)}`,
             });
           }
         }
@@ -1108,7 +1118,7 @@ export function TranscriptView({
           }
         })
         .catch(() => undefined),
-      brollPreviewStatus(pid)
+      brollPreviewStatus(pid, true)
         .then((status) => {
           if (status.state === "running" || status.state === "cancelling") {
             setBrollPreviewJob(status);
@@ -1389,7 +1399,7 @@ export function TranscriptView({
     let timer: number | undefined;
     const poll = async () => {
       try {
-        const status = await brollPreviewStatus(pid);
+        const status = await brollPreviewStatus(pid, true);
         if (disposed) return;
         if (status.state === "completed") {
           setBrollPreviewJob(status);

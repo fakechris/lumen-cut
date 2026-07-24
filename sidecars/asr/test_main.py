@@ -15,6 +15,13 @@ SPEC.loader.exec_module(ASR)
 
 
 class SidecarFormattingTests(unittest.TestCase):
+    def test_default_memory_policy_scales_down_on_an_eight_gigabyte_mac(self) -> None:
+        with mock.patch.object(ASR, "physical_memory_mb", return_value=8192):
+            limit = ASR.default_memory_limit_mb()
+
+        self.assertGreaterEqual(limit, ASR.MIN_MEMORY_LIMIT_MB)
+        self.assertLess(limit, ASR.DEFAULT_MEMORY_LIMIT_MB)
+
     def test_mlx_memory_policy_caps_unified_memory_and_cache(self) -> None:
         calls: list[tuple[str, int]] = []
         fake_mx = types.SimpleNamespace(

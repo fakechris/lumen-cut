@@ -62,6 +62,51 @@ fn doctor_json_is_one_machine_readable_value() {
     assert!(value["total"].is_number());
 }
 
+#[test]
+fn task_status_json_surfaces_the_active_run_failure_and_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let task = temp.path().join("projects/demo/ai/translate");
+    std::fs::create_dir_all(task.join("pending")).expect("pending directory");
+    std::fs::create_dir_all(task.join("failed")).expect("failed directory");
+    std::fs::write(
+        task.join("task.json"),
+        r#"{"kind":"translate","lang":"zh-Hans","runId":"current","calls":1,"state":"running"}"#,
+    )
+    .expect("task manifest");
+    std::fs::write(
+        task.join("pending/translate-current-0000.json"),
+        r#"{"lines":[]}"#,
+    )
+    .expect("pending call");
+    std::fs::write(
+        task.join("failed/translate-current-0000.json"),
+        r#"{"error":"provider returned invalid JSON"}"#,
+    )
+    .expect("failed call");
+
+    let output = cli()
+        .args(["--json", "task", "status", "demo", "--root"])
+        .arg(temp.path().join("projects"))
+        .output()
+        .expect("run lumen-cut-cli task status");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("task status stdout must be JSON");
+    assert_eq!(value["pending"], 0);
+    assert_eq!(value["done"], 0);
+    assert_eq!(value["failed"], 1);
+    assert_eq!(value["kinds"][0]["state"], "failed");
+    assert_eq!(
+        value["kinds"][0]["lastError"],
+        "provider returned invalid JSON"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn diarize_progress_stays_on_stderr_while_json_stdout_remains_clean() {

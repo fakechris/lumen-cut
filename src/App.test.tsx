@@ -132,6 +132,7 @@ let taskStatusState: {
 };
 let mediaAllowError: Error | null;
 let llmConfigured: boolean;
+let taskResumeError: Error | null;
 let subtitleSetError: Error | null;
 let chapterRowsState: Array<{
   title: string;
@@ -321,6 +322,7 @@ beforeEach(() => {
   taskStatusState = { pending: 0, done: 0, kinds: [], polishQuality: null };
   mediaAllowError = null;
   llmConfigured = false;
+  taskResumeError = null;
   subtitleSetError = null;
   chapterRowsState = [];
   subtitleRowsState = [];
@@ -679,6 +681,7 @@ beforeEach(() => {
       case "performance_status":
         return performanceState;
       case "task_resume":
+        if (taskResumeError) throw taskResumeError;
         return { resumed: 1, recoveredSubmissions: 1, agentPort: 3417 };
       case "task_pause":
         return { paused: 1, queuedCalls: 3, inFlightCalls: 1 };
@@ -1553,6 +1556,23 @@ test("unfinished AI tasks resume automatically when a project is reopened", asyn
     });
   });
   expect(await screen.findByText(/已恢复 1 个未完成任务/)).toBeVisible();
+});
+
+test("an AI recovery preflight error does not turn a healthy project into a load failure", async () => {
+  taskStatusState = {
+    pending: 1,
+    done: 0,
+    kinds: [{ kind: "translate", pending: 1, done: 0, failed: 0 }],
+    polishQuality: null,
+  };
+  taskResumeError = new Error("AI provider is not configured; open Settings → AI features");
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
+
+  expect(await screen.findByText(/未完成的 AI 任务尚未恢复/)).toBeVisible();
+  expect(screen.queryByText(/项目加载失败/)).not.toBeInTheDocument();
+  expect(await screen.findByRole("navigation", { name: "编辑主流程" })).toBeVisible();
 });
 
 test("translation shows completed batches instead of an indefinite running state", async () => {

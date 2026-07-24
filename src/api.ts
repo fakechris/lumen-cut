@@ -601,8 +601,11 @@ export async function brollPreviewStart(pid: string): Promise<BrollPreviewJobSta
   return invoke("broll_preview_start", { pid });
 }
 
-export async function brollPreviewStatus(pid: string): Promise<BrollPreviewJobStatus> {
-  return invoke("broll_preview_status", { pid });
+export async function brollPreviewStatus(
+  pid: string,
+  restoreAssets = false,
+): Promise<BrollPreviewJobStatus> {
+  return invoke("broll_preview_status", { pid, restoreAssets });
 }
 
 export async function brollPreviewCancel(pid: string): Promise<BrollPreviewJobStatus> {

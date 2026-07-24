@@ -51,6 +51,13 @@ class _Pipeline:
 
 
 class DiarizeProgressTests(unittest.TestCase):
+    def test_default_memory_policy_scales_down_on_an_eight_gigabyte_mac(self) -> None:
+        with mock.patch.object(DIARIZE, "physical_memory_mb", return_value=8192):
+            limit = DIARIZE.default_memory_limit_mb()
+
+        self.assertGreaterEqual(limit, DIARIZE.MIN_MEMORY_LIMIT_MB)
+        self.assertLess(limit, DIARIZE.DEFAULT_MEMORY_LIMIT_MB)
+
     def test_progress_normalizes_numpy_style_integer_counters(self) -> None:
         class IntLike:
             def __init__(self, value: int) -> None:

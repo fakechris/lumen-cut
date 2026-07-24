@@ -747,7 +747,24 @@ async fn run_cli() -> AppResult<()> {
                 if json {
                     println!("{}", serde_json::to_string(&st)?);
                 } else {
-                    println!("pending={} done={}", st.pending, st.done);
+                    println!(
+                        "pending={} done={} failed={}",
+                        st.pending, st.done, st.failed
+                    );
+                    for kind in &st.kinds {
+                        println!(
+                            "{} state={} pending={} done={} failed={}{}",
+                            kind.kind,
+                            kind.state,
+                            kind.pending,
+                            kind.done,
+                            kind.failed,
+                            kind.last_error
+                                .as_deref()
+                                .map(|error| format!(" error={error}"))
+                                .unwrap_or_default()
+                        );
+                    }
                     if let Some(quality) = &st.polish_quality {
                         println!(
                             "polishQuality={:?} measured={}/{} residualTerms={}",
@@ -1693,6 +1710,8 @@ fn fmt_ts(seconds: f64) -> String {
 struct TaskStatus {
     pending: usize,
     done: usize,
+    failed: usize,
+    kinds: Vec<lumen_cut::agent::task::TaskKindStatus>,
     polish_quality: Option<lumen_cut::pipeline::polish::PolishQualityArtifact>,
 }
 
@@ -1755,19 +1774,32 @@ async fn task_start(
     }
     let recovered = lumen_cut::agent::task::restore_or_enqueue(&allocator, &task)?;
     info!(kind, pid, recovered, "restored durable task submissions");
-    let applied = lumen_cut::agent::task::wait_and_apply(
+    let result = lumen_cut::agent::task::wait_and_apply(
         allocator,
-        task,
+        task.clone(),
         std::time::Duration::from_secs(30 * 60),
     )
-    .await?;
-    info!(kind, pid, applied, "task completed and applied");
-    Ok(pending)
+    .await;
+    match result {
+        Ok(applied) => {
+            lumen_cut::agent::task::set_task_state(&task, "completed", None)?;
+            info!(kind, pid, applied, "task completed and applied");
+            Ok(pending)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            lumen_cut::agent::task::set_task_state(&task, "failed", Some(&message))?;
+            Err(error)
+        }
+    }
 }
 
 fn task_status(pid: &str, root: &Path) -> AppResult<TaskStatus> {
     let project_dir = root.join(pid);
-    let (pending, done) = lumen_cut::agent::task::task_counts(&project_dir);
+    let kinds = lumen_cut::agent::task::task_kind_statuses(&project_dir);
+    let pending = kinds.iter().map(|status| status.pending).sum();
+    let done = kinds.iter().map(|status| status.done).sum();
+    let failed = kinds.iter().map(|status| status.failed).sum();
     let polish_quality = lumen_cut::pipeline::polish::PolishQualityArtifact::load(
         &project_dir.join("ai/polish-quality.json"),
     )
@@ -1775,6 +1807,8 @@ fn task_status(pid: &str, root: &Path) -> AppResult<TaskStatus> {
     Ok(TaskStatus {
         pending,
         done,
+        failed,
+        kinds,
         polish_quality,
     })
 }
