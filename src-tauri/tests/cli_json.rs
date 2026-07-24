@@ -307,9 +307,125 @@ fn cut_without_an_action_never_synthesizes_a_test_cut() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("cut requires either --auto or --restore")
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cut requires exactly one of --auto/--detect, --list, --add, --restore")
     );
     assert!(!temp.path().join("cuts.json").exists());
+}
+
+#[test]
+fn cut_add_list_and_restore_round_trip_over_json() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("doc.json"),
+        r#"{
+          "id":"demo","schema":1,
+          "media":{"path":"input.mp4","durationSeconds":2.0,"sampleRate":null,"channels":null},
+          "meta":{"title":"demo","description":"","language":"en",
+            "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"},
+          "paragraphs":[{
+            "id":1,"speaker":null,
+            "sentences":[{
+              "id":"s1","text":"hello world",
+              "words":[
+                {"id":"w1","text":"hello","start":0.0,"end":0.5},
+                {"id":"w2","text":"world","start":0.5,"end":1.0}
+              ]
+            }]
+          }],
+          "translations":{}
+        }"#,
+    )
+    .expect("write doc");
+
+    let added = cli()
+        .args([
+            "--json",
+            "cut",
+        ])
+        .arg(temp.path())
+        .args(["--add", "--words", "w1..w2", "--note", "manual trim"])
+        .output()
+        .expect("cut add");
+    assert!(
+        added.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added: serde_json::Value =
+        serde_json::from_slice(&added.stdout).expect("cut add json");
+    assert_eq!(added["added"], true);
+    assert_eq!(added["total"], 1);
+
+    let listed = cli()
+        .args(["--json", "cut"])
+        .arg(temp.path())
+        .args(["--list", "--kind", "manual"])
+        .output()
+        .expect("cut list");
+    assert!(listed.status.success());
+    let listed: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("cut list json");
+    assert_eq!(listed["total"], 1);
+    assert_eq!(listed["cuts"][0]["aWord"], "w1");
+    assert_eq!(listed["cuts"][0]["bWord"], "w2");
+
+    let id = listed["cuts"][0]["id"].as_str().expect("cut id");
+    let restored = cli()
+        .args(["--json", "cut"])
+        .arg(temp.path())
+        .args(["--restore", id])
+        .output()
+        .expect("cut restore");
+    assert!(restored.status.success());
+    let restored: serde_json::Value =
+        serde_json::from_slice(&restored.stdout).expect("cut restore json");
+    assert_eq!(restored["restored"], true);
+    assert_eq!(restored["total"], 0);
+}
+
+#[test]
+fn export_srt_flag_writes_only_selected_output_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("doc.json"),
+        r#"{
+          "id":"demo","schema":1,
+          "media":{"path":"input.mp4","durationSeconds":1.0,"sampleRate":null,"channels":null},
+          "meta":{"title":"demo","description":"","language":"en",
+            "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"},
+          "paragraphs":[{
+            "id":1,"speaker":null,
+            "sentences":[{
+              "id":"s1","text":"hello",
+              "words":[{"id":"w1","text":"hello","start":0.0,"end":0.5}]
+            }]
+          }],
+          "translations":{}
+        }"#,
+    )
+    .expect("write doc");
+    let out = temp.path().join("only.srt");
+    let output = cli()
+        .args(["--json", "export"])
+        .arg(temp.path())
+        .args(["--srt", "-o"])
+        .arg(&out)
+        .output()
+        .expect("export srt");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("export json");
+    assert!(out.is_file(), "expected {}", out.display());
+    assert!(!temp.path().join("export.vtt").exists());
+    assert_eq!(
+        value["artifacts"]["srt"].as_str(),
+        Some(out.to_str().unwrap())
+    );
 }
 
 #[test]
