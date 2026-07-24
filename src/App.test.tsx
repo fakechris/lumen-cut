@@ -1607,7 +1607,7 @@ test("translation shows completed batches instead of an indefinite running state
   const workflow = await screen.findByRole("navigation", { name: "编辑主流程" });
   fireEvent.click(within(workflow).getByRole("button", { name: /翻译/ }));
 
-  expect(await screen.findByText("已完成 2 / 10 批")).toBeVisible();
+  expect(await screen.findByText("2/10 批")).toBeVisible();
   expect(screen.getByRole("progressbar", { name: "翻译进度" })).toHaveAttribute("value", "2");
   expect(screen.getByRole("progressbar", { name: "翻译进度" })).toHaveAttribute("max", "10");
 });
@@ -1647,10 +1647,10 @@ test("translation supports custom language tags and exposes another unfinished l
   fireEvent.change(screen.getByRole("combobox", { name: "目标语言" }), {
     target: { value: "ja" },
   });
-  expect(await screen.findByText(/ZH 翻译仍有 8 个批次未完成/)).toBeVisible();
-  expect(screen.getByRole("button", { name: "其他语言任务待处理" })).toBeDisabled();
+  expect(await screen.findByText(/ZH 仍有 8 批未完成/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "其他语言待处理" })).toBeDisabled();
 
-  fireEvent.click(screen.getByRole("button", { name: "切回该任务" }));
+  fireEvent.click(screen.getByRole("button", { name: "切回" }));
   expect(screen.getByRole("combobox", { name: "目标语言" })).toHaveValue("zh");
 
   fireEvent.change(screen.getByRole("textbox", { name: "自定义目标语言代码" }), {
@@ -1805,7 +1805,7 @@ test("translation updates only stale lines unless full retranslation is explicit
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "翻译" }));
-  fireEvent.click(await screen.findByRole("button", { name: "更新 1 条变化" }));
+  fireEvent.click(await screen.findByRole("button", { name: "更新 1" }));
 
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("task_start", {
     args: {
@@ -1817,8 +1817,8 @@ test("translation updates only stale lines unless full retranslation is explicit
     },
   }));
 
-  fireEvent.click(screen.getByRole("button", { name: "重新翻译全部…" }));
-  fireEvent.click(screen.getByRole("button", { name: "确认全部重译" }));
+  fireEvent.click(screen.getByRole("button", { name: "全部重译" }));
+  fireEvent.click(screen.getByRole("button", { name: "确认重译" }));
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("task_start", {
     args: {
       kind: "translate",
@@ -1866,7 +1866,7 @@ test("an active translation can be paused from the translation workspace", async
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
   const workflow = await screen.findByRole("navigation", { name: "编辑主流程" });
   fireEvent.click(within(workflow).getByRole("button", { name: /翻译/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "暂停翻译" }));
+  fireEvent.click(await screen.findByRole("button", { name: "暂停" }));
 
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("task_pause", {
     pid: "project-1",
