@@ -119,6 +119,10 @@ pub struct DetectOptions {
     pub fillers: bool,
     /// When false, skip silence compression proposals.
     pub pauses: bool,
+    /// When true, also cut soft vocalized fillers (嗯/啊/…) in one-click mode.
+    pub soft_fillers: bool,
+    /// When false, skip retake / false-start detectors (one-click silence/filler).
+    pub structure: bool,
 }
 
 impl Default for DetectOptions {
@@ -130,6 +134,74 @@ impl Default for DetectOptions {
             max_gap: MAX_SILENCE_GAP,
             fillers: true,
             pauses: true,
+            soft_fillers: false,
+            structure: true,
+        }
+    }
+}
+
+/// User-facing aggressiveness for one-click speech cleanup (Palmier-style tiers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupAggressiveness {
+    /// Keep less pause; cut more aggressively.
+    Tight,
+    /// Default talking-head thresholds.
+    Balanced,
+    /// Keep more cadence; only longer silences.
+    Loose,
+}
+
+impl CleanupAggressiveness {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "tight" | "tight/" | "紧" => Some(Self::Tight),
+            "balanced" | "medium" | "default" | "中" => Some(Self::Balanced),
+            "loose" | "松" => Some(Self::Loose),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tight => "tight",
+            Self::Balanced => "balanced",
+            Self::Loose => "loose",
+        }
+    }
+
+    /// Map tiers to detect thresholds (inspired by kept-gap 60/150/320ms style).
+    pub fn detect_options(self) -> DetectOptions {
+        match self {
+            Self::Tight => DetectOptions {
+                min_pause: 0.5,
+                compress_to: 0.12,
+                sentence_end_retain: 0.2,
+                max_gap: 2.5,
+                fillers: true,
+                pauses: true,
+                soft_fillers: true,
+                structure: false,
+            },
+            Self::Balanced => DetectOptions {
+                min_pause: 0.8,
+                compress_to: 0.3,
+                sentence_end_retain: 0.4,
+                max_gap: 3.0,
+                fillers: true,
+                pauses: true,
+                soft_fillers: true,
+                structure: false,
+            },
+            Self::Loose => DetectOptions {
+                min_pause: 1.2,
+                compress_to: 0.5,
+                sentence_end_retain: 0.65,
+                max_gap: 4.0,
+                fillers: true,
+                pauses: true,
+                soft_fillers: false,
+                structure: false,
+            },
         }
     }
 }
@@ -139,6 +211,9 @@ impl Default for DetectOptions {
 const HARD_FILLERS: &[&str] = &[
     "um", "umm", "uh", "uhh", "er", "erm", "ah", "hmm", "mhm", "呃", "额",
 ];
+
+/// Soft vocalized fillers enabled only by one-click / tight-balanced cleanup.
+const SOFT_FILLERS: &[&str] = &["嗯", "啊", "唔", "嘿", "呵", "欸", "哎"];
 
 /// Lowercase and strip leading/trailing non-alphanumerics, so `"Um,"`
 /// normalises to `um` and `呃，` to `呃`.
@@ -163,43 +238,50 @@ pub fn detect_with(doc: &Doc, options: DetectOptions) -> Vec<CleanupHit> {
 
     // (1) retake — consecutive near-identical sentences; exact verbatim
     // repeats (jaccard == 1.0) are the most common case and are included.
-    for w in all_sents.windows(2) {
-        let sim = trigram_jaccard(&w[0].text, &w[1].text);
-        if sim >= 0.85 {
-            out.push(CleanupHit {
-                kind: CleanupKind::Retake,
-                a_sentence: w[0].id.clone(),
-                b_sentence: w[1].id.clone(),
-                word_id: None,
-                word_id2: None,
-                note: format!("jaccard={sim:.2}"),
-            });
+    if options.structure {
+        for w in all_sents.windows(2) {
+            let sim = trigram_jaccard(&w[0].text, &w[1].text);
+            if sim >= 0.85 {
+                out.push(CleanupHit {
+                    kind: CleanupKind::Retake,
+                    a_sentence: w[0].id.clone(),
+                    b_sentence: w[1].id.clone(),
+                    word_id: None,
+                    word_id2: None,
+                    note: format!("jaccard={sim:.2}"),
+                });
+            }
+        }
+
+        // (2) falseStart — short trailing fragment after a pause.
+        for w in all_sents.windows(2) {
+            let prev_end = w[0].words.last().map(|x| x.end).unwrap_or(0.0);
+            let next_start = w[1].words.first().map(|x| x.start).unwrap_or(0.0);
+            let gap = next_start - prev_end;
+            if gap > options.min_pause && w[1].words.len() <= 3 {
+                out.push(CleanupHit {
+                    kind: CleanupKind::FalseStart,
+                    a_sentence: w[0].id.clone(),
+                    b_sentence: w[1].id.clone(),
+                    word_id: None,
+                    word_id2: None,
+                    note: format!("gap={gap:.2}s short"),
+                });
+            }
         }
     }
 
-    // (2) falseStart — short trailing fragment after a pause.
-    for w in all_sents.windows(2) {
-        let prev_end = w[0].words.last().map(|x| x.end).unwrap_or(0.0);
-        let next_start = w[1].words.first().map(|x| x.start).unwrap_or(0.0);
-        let gap = next_start - prev_end;
-        if gap > options.min_pause && w[1].words.len() <= 3 {
-            out.push(CleanupHit {
-                kind: CleanupKind::FalseStart,
-                a_sentence: w[0].id.clone(),
-                b_sentence: w[1].id.clone(),
-                word_id: None,
-                word_id2: None,
-                note: format!("gap={gap:.2}s short"),
-            });
-        }
-    }
-
-    // (3) filler — word level hard list only.
+    // (3) filler — word level hard list (+ optional soft vocalized fillers).
     if options.fillers {
         for s in &all_sents {
             for word in &s.words {
                 let norm = normalize_word(&word.text);
-                if !norm.is_empty() && HARD_FILLERS.contains(&norm.as_str()) {
+                if norm.is_empty() {
+                    continue;
+                }
+                let hard = HARD_FILLERS.contains(&norm.as_str());
+                let soft = options.soft_fillers && SOFT_FILLERS.contains(&norm.as_str());
+                if hard || soft {
                     out.push(CleanupHit {
                         kind: CleanupKind::Filler,
                         a_sentence: s.id.clone(),
@@ -346,17 +428,101 @@ pub fn apply(doc: &Doc, cuts: &mut ClipCuts) -> usize {
 
 /// Like [`apply`] with explicit detect thresholds.
 pub fn apply_with(doc: &Doc, cuts: &mut ClipCuts, options: DetectOptions) -> usize {
+    apply_kinds(doc, cuts, options, None)
+}
+
+/// Apply only selected cleanup kinds (e.g. silence-only or fillers-only).
+pub fn apply_kinds(
+    doc: &Doc,
+    cuts: &mut ClipCuts,
+    options: DetectOptions,
+    kinds: Option<&[CleanupKind]>,
+) -> usize {
     let mut added = 0;
     for hit in detect_with(doc, options) {
+        if let Some(allowed) = kinds {
+            if !allowed.contains(&hit.kind) {
+                continue;
+            }
+        }
         if let Some(cut) = cut_from_hit_with(doc, &hit, options) {
             let id = cut.id.clone();
             if !cuts.cuts.iter().any(|c| c.id == id) {
+                // Also skip if the word span already overlaps an existing cut.
+                if let Some(interval) = cut.resolved_interval(doc) {
+                    let overlaps = cuts.cuts.iter().any(|existing| {
+                        existing
+                            .resolved_interval(doc)
+                            .is_some_and(|(s, e)| interval.0 < e && s < interval.1)
+                    });
+                    if overlaps {
+                        continue;
+                    }
+                }
                 cuts.add(cut);
                 added += 1;
             }
         }
     }
     added
+}
+
+/// Build manual cuts covering the selected word ids. Adjacent selected words
+/// on the timeline are merged into one cut so one user action is one undo step.
+/// Returns an empty vec when no matching words exist.
+pub fn cuts_from_word_ids(doc: &Doc, word_ids: &[String]) -> Vec<Cut> {
+    if word_ids.is_empty() {
+        return Vec::new();
+    }
+    let wanted: HashSet<&str> = word_ids.iter().map(String::as_str).collect();
+    let mut ordered: Vec<&crate::data::Word> = doc
+        .all_words()
+        .into_iter()
+        .filter(|word| wanted.contains(word.id.as_str()))
+        .collect();
+    if ordered.is_empty() {
+        return Vec::new();
+    }
+    ordered.sort_by(|left, right| {
+        left.start
+            .partial_cmp(&right.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut spans: Vec<(&crate::data::Word, &crate::data::Word)> = Vec::new();
+    let mut start = ordered[0];
+    let mut end = ordered[0];
+    for word in ordered.into_iter().skip(1) {
+        // Contiguous if this word starts at/near the previous word's end.
+        if word.start <= end.end + 0.05 {
+            end = word;
+        } else {
+            spans.push((start, end));
+            start = word;
+            end = word;
+        }
+    }
+    spans.push((start, end));
+
+    spans
+        .into_iter()
+        .map(|(a, b)| {
+            let note = if a.id == b.id {
+                format!("removed word {:?}", a.text)
+            } else {
+                format!("removed words {:?}…{:?}", a.text, b.text)
+            };
+            Cut {
+                id: format!("word-{}", uuid::Uuid::new_v4().simple()),
+                note: Some(note),
+                a_word: a.id.clone(),
+                b_word: b.id.clone(),
+                kind: CutKind::Manual,
+                duration: (b.end - a.start).max(0.0),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -678,6 +844,41 @@ mod tests {
                 .any(|hit| matches!(hit.kind, CleanupKind::Silence)),
             "min_pause 1.0 should skip 0.9s gap"
         );
+    }
+
+    #[test]
+    fn cuts_from_word_ids_merges_adjacent_words() {
+        let doc = doc_with(vec![sent(
+            "s1",
+            "hello um world",
+            vec![
+                ("w0", "hello", 0.0, 0.4),
+                ("w1", "um", 0.45, 0.6),
+                ("w2", "world", 0.65, 1.0),
+            ],
+        )]);
+        let cuts = cuts_from_word_ids(&doc, &["w1".into(), "w2".into()]);
+        assert_eq!(cuts.len(), 1);
+        assert_eq!(cuts[0].a_word, "w1");
+        assert_eq!(cuts[0].b_word, "w2");
+        assert!((cuts[0].duration - 0.55).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_click_fillers_include_soft_vocalized_chinese() {
+        let doc = doc_with(vec![sent(
+            "s1",
+            "嗯 你好",
+            vec![("w0", "嗯", 0.0, 0.2), ("w1", "你好", 0.3, 0.8)],
+        )]);
+        let hits = detect_with(&doc, CleanupAggressiveness::Balanced.detect_options());
+        assert!(hits.iter().any(|hit| {
+            matches!(hit.kind, CleanupKind::Filler) && hit.word_id.as_deref() == Some("w0")
+        }));
+        let default_hits = detect(&doc);
+        assert!(!default_hits.iter().any(|hit| {
+            matches!(hit.kind, CleanupKind::Filler) && hit.word_id.as_deref() == Some("w0")
+        }));
     }
 
     fn fixture_two_words_with_gap(gap: f64) -> Doc {

@@ -2821,6 +2821,145 @@ pub async fn cut_auto(pid: String, root: Option<PathBuf>) -> AppResult<usize> {
     .await
 }
 
+/// One-click speech cleanup: silence, fillers, or both — single undo step.
+#[tauri::command]
+pub async fn cut_speech_cleanup(
+    pid: String,
+    mode: String,
+    aggressiveness: Option<String>,
+    root: Option<PathBuf>,
+) -> AppResult<usize> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("speech cleanup", move || {
+        let agg = aggressiveness
+            .as_deref()
+            .and_then(crate::pipeline::cleanup::CleanupAggressiveness::parse)
+            .unwrap_or(crate::pipeline::cleanup::CleanupAggressiveness::Balanced);
+        let mut options = agg.detect_options();
+        let kinds: Option<Vec<crate::pipeline::cleanup::CleanupKind>> = match mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "silence" | "pauses" | "dead-air" => {
+                options.fillers = false;
+                options.pauses = true;
+                Some(vec![crate::pipeline::cleanup::CleanupKind::Silence])
+            }
+            "fillers" | "filler" => {
+                options.fillers = true;
+                options.pauses = false;
+                Some(vec![crate::pipeline::cleanup::CleanupKind::Filler])
+            }
+            "both" | "all" | "speech" => {
+                options.fillers = true;
+                options.pauses = true;
+                Some(vec![
+                    crate::pipeline::cleanup::CleanupKind::Silence,
+                    crate::pipeline::cleanup::CleanupKind::Filler,
+                ])
+            }
+            other => {
+                return Err(AppError::Schema(format!(
+                    "unknown cleanup mode `{other}`; use silence, fillers, or both"
+                )));
+            }
+        };
+        let label = match mode.trim().to_ascii_lowercase().as_str() {
+            "silence" | "pauses" | "dead-air" => "Remove silence",
+            "fillers" | "filler" => "Remove filler words",
+            _ => "Clean up speech",
+        };
+        crate::data::edit_history::record(
+            &dir,
+            label,
+            || {
+                let doc = Doc::load(&dir)?;
+                let cuts_path = dir.join("cuts.json");
+                let mut cuts: ClipCuts = if cuts_path.exists() {
+                    serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+                } else {
+                    ClipCuts::new()
+                };
+                let added = crate::pipeline::cleanup::apply_kinds(
+                    &doc,
+                    &mut cuts,
+                    options,
+                    kinds.as_deref(),
+                );
+                if added > 0 {
+                    crate::data::storage::write_json(&cuts_path, &cuts)?;
+                }
+                Ok(added)
+            },
+            |added| *added > 0,
+        )
+    })
+    .await
+}
+
+/// Cut one or more transcript words (Descript-style). Adjacent words merge.
+#[tauri::command]
+pub async fn cut_words(
+    pid: String,
+    word_ids: Vec<String>,
+    root: Option<PathBuf>,
+) -> AppResult<usize> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("cut words", move || {
+        crate::data::edit_history::record(
+            &dir,
+            if word_ids.len() == 1 {
+                "Remove word"
+            } else {
+                "Remove words"
+            },
+            || {
+                let doc = Doc::load(&dir)?;
+                let proposed = crate::pipeline::cleanup::cuts_from_word_ids(&doc, &word_ids);
+                if proposed.is_empty() {
+                    return Err(AppError::Schema(
+                        "none of the selected words are in the transcript".into(),
+                    ));
+                }
+                let cuts_path = dir.join("cuts.json");
+                let mut cuts: ClipCuts = if cuts_path.exists() {
+                    serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+                } else {
+                    ClipCuts::new()
+                };
+                let existing = cuts
+                    .cuts
+                    .iter()
+                    .filter_map(|cut| cut.resolved_interval(&doc))
+                    .collect::<Vec<_>>();
+                let mut added = 0usize;
+                for cut in proposed {
+                    let Some(interval) = cut.resolved_interval(&doc) else {
+                        continue;
+                    };
+                    if existing
+                        .iter()
+                        .any(|(s, e)| interval.0 < *e && *s < interval.1)
+                    {
+                        continue;
+                    }
+                    cuts.add(cut);
+                    added += 1;
+                }
+                if added > 0 {
+                    crate::data::storage::write_json(&cuts_path, &cuts)?;
+                }
+                Ok(added)
+            },
+            |added| *added > 0,
+        )
+    })
+    .await
+}
+
 #[derive(Debug)]
 struct ManualCutCandidate {
     a_word: String,
