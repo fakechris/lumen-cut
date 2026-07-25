@@ -347,11 +347,7 @@ pub fn cut_from_hit(doc: &Doc, hit: &CleanupHit) -> Option<Cut> {
 }
 
 /// Convert a hit using the same compress thresholds that produced it.
-pub fn cut_from_hit_with(
-    doc: &Doc,
-    hit: &CleanupHit,
-    options: DetectOptions,
-) -> Option<Cut> {
+pub fn cut_from_hit_with(doc: &Doc, hit: &CleanupHit, options: DetectOptions) -> Option<Cut> {
     let (a_word, b_word, kind) = match hit.kind {
         CleanupKind::Retake => {
             let a = find_sentence(doc, &hit.a_sentence)?;

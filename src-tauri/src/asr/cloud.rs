@@ -102,14 +102,7 @@ async fn transcribe_chunks(
     let mut all_words = Vec::new();
     let mut previous_text = String::new();
 
-    report_progress(
-        &on_progress,
-        started,
-        "preparing",
-        0,
-        total_chunks,
-        5,
-    );
+    report_progress(&on_progress, started, "preparing", 0, total_chunks, 5);
 
     for index in 0..total_chunks {
         ensure_not_cancelled()?;

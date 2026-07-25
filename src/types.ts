@@ -212,14 +212,23 @@ export interface SpeakerAnalysisJobStatus {
 
 export interface VideoExportJobStatus {
   pid: string;
-  mode: "fast" | "quality";
+  mode: "match-source" | "fast" | "quality";
   settings: VideoExportSettings;
   state: "running" | "cancelling" | "completed" | "cancelled" | "failed";
-  phase: "waiting" | "preparing" | "encoding" | "completed" | "cancelling" | "cancelled" | "failed";
+  phase:
+    | "waiting"
+    | "preparing"
+    | "remuxing"
+    | "encoding"
+    | "completed"
+    | "cancelling"
+    | "cancelled"
+    | "failed";
   progress: number;
   currentSeconds: number | null;
   totalSeconds: number | null;
   encoder:
+    | "copy"
     | "h264_videotoolbox"
     | "hevc_videotoolbox"
     | "libx264"
@@ -242,7 +251,7 @@ export interface VideoExportSettings {
   subtitleLanguage: string | null;
   bilingualSubtitles: boolean;
   audioCodec: "aac" | "pcm";
-  encodingSpeed: "fast" | "quality";
+  encodingSpeed: "match-source" | "fast" | "quality";
 }
 
 export interface SetupJobStatus {
@@ -428,6 +437,8 @@ export interface ExportPreflightReport {
     brollItems: number;
     titleItems: number;
     encoder: string;
+    /** `remux` stream-copy or `reencode`. */
+    renderPath: "remux" | "reencode" | string;
     estimatedMinMb: number;
     estimatedMaxMb: number;
   };

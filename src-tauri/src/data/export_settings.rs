@@ -69,10 +69,16 @@ pub enum ExportAudioCodec {
     Pcm,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportEncodingSpeed {
+    /// Prefer stream-copy when possible; otherwise target source-like bitrate.
+    #[default]
+    #[serde(rename = "match-source")]
+    MatchSource,
+    /// Hardware-first encode with moderate quality (smaller than old "fast").
     Fast,
+    /// CPU encode with delivery CRF (not archival master).
     Quality,
 }
 
@@ -103,7 +109,7 @@ impl Default for VideoExportSettings {
             subtitle_language: None,
             bilingual_subtitles: false,
             audio_codec: ExportAudioCodec::Aac,
-            encoding_speed: ExportEncodingSpeed::Fast,
+            encoding_speed: ExportEncodingSpeed::MatchSource,
         }
     }
 }
@@ -204,9 +210,25 @@ impl VideoExportSettings {
 
     pub const fn legacy_mode(&self) -> &'static str {
         match self.encoding_speed {
+            ExportEncodingSpeed::MatchSource => "match-source",
             ExportEncodingSpeed::Fast => "fast",
             ExportEncodingSpeed::Quality => "quality",
         }
+    }
+
+    /// Settings-only gate for stream-copy remux (no picture/audio re-encode).
+    /// Timeline edits, titles burn-in, and non-passthrough audio are checked separately.
+    ///
+    /// HEVC/ProRes requests always re-encode so the selected delivery codec is honored.
+    pub fn allows_stream_copy(&self) -> bool {
+        matches!(
+            self.subtitle_mode,
+            ExportSubtitleMode::Soft | ExportSubtitleMode::None
+        ) && self.resolution == ExportResolution::Source
+            && self.aspect_ratio == ExportAspectRatio::Source
+            && self.video_codec == ExportVideoCodec::H264
+            && self.audio_codec == ExportAudioCodec::Aac
+            && matches!(self.container, ExportContainer::Mp4 | ExportContainer::Mov)
     }
 }
 
@@ -415,14 +437,20 @@ mod tests {
     fn defaults_are_backward_compatible_with_the_existing_mp4_export() {
         let settings = VideoExportSettings::default();
         assert_eq!(settings.extension(), "mp4");
-        assert_eq!(settings.legacy_mode(), "fast");
+        assert_eq!(settings.legacy_mode(), "match-source");
         assert_eq!(settings.dimensions(), None);
-        let json = serde_json::to_value(settings).unwrap();
+        assert!(!settings.allows_stream_copy());
+        let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json["videoCodec"], "h264");
         assert_eq!(json["aspectRatio"], "source");
         assert_eq!(json["canvasFit"], "contain");
         assert_eq!(json["subtitleMode"], "burn");
-        assert_eq!(json["encodingSpeed"], "fast");
+        assert_eq!(json["encodingSpeed"], "match-source");
+        assert!(VideoExportSettings {
+            subtitle_mode: ExportSubtitleMode::Soft,
+            ..Default::default()
+        }
+        .allows_stream_copy());
     }
 
     #[test]

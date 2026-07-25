@@ -1465,9 +1465,7 @@ async fn run_cli() -> AppResult<()> {
                         if speakers::assign_by_cue(&mut doc, &cue_id, label) {
                             1
                         } else {
-                            return Err(AppError::Schema(format!(
-                                "cue `{cue_id}` was not found"
-                            )));
+                            return Err(AppError::Schema(format!("cue `{cue_id}` was not found")));
                         }
                     } else {
                         let (Some(range_start), Some(range_end)) = (start, end) else {
@@ -1510,27 +1508,25 @@ async fn run_cli() -> AppResult<()> {
                         );
                     }
                 }
-                SpeakersCmd::Proposals => {
-                    match speakers::load_proposal(&dir)? {
-                        Some(set) => {
-                            emit!(
-                                json,
-                                &set,
-                                "✓ speakers proposals {pid}: {} (changed={} unassigned={})",
-                                set.id,
-                                set.changed,
-                                set.unassigned
-                            );
-                        }
-                        None => {
-                            emit!(
-                                json,
-                                serde_json::json!({"pid": pid, "proposals": null}),
-                                "✓ speakers proposals {pid}: (none)"
-                            );
-                        }
+                SpeakersCmd::Proposals => match speakers::load_proposal(&dir)? {
+                    Some(set) => {
+                        emit!(
+                            json,
+                            &set,
+                            "✓ speakers proposals {pid}: {} (changed={} unassigned={})",
+                            set.id,
+                            set.changed,
+                            set.unassigned
+                        );
                     }
-                }
+                    None => {
+                        emit!(
+                            json,
+                            serde_json::json!({"pid": pid, "proposals": null}),
+                            "✓ speakers proposals {pid}: (none)"
+                        );
+                    }
+                },
                 SpeakersCmd::Apply { changed_only, all } => {
                     let set = speakers::load_proposal(&dir)?.ok_or_else(|| {
                         AppError::Schema(
@@ -2085,6 +2081,8 @@ struct AutoOptions<'a> {
     model: Option<&'a str>,
     no_polish: bool,
     rough_cut: bool,
+    /// Reserved for auto Phase-2 fit; forwarded via task_start when align runs.
+    #[allow(dead_code)]
     align_fit: Option<usize>,
     stale_only: bool,
 }
@@ -2145,6 +2143,7 @@ fn parse_second_look(raw: &str) -> AppResult<lumen_cut::agent::task::SecondLookM
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_serve(
     kind: &str,
     pid: &str,
@@ -2197,9 +2196,7 @@ async fn task_serve(
     if lumen_cut::agent::runtime::load_bridge_config().is_some() {
         lumen_cut::agent::runtime::spawn_workers(allocator.clone(), capacity).await;
     } else if !json {
-        eprintln!(
-            "agent claim/submit listening on {url} (GET /agent/next, POST /agent/submit)"
-        );
+        eprintln!("agent claim/submit listening on {url} (GET /agent/next, POST /agent/submit)");
         eprintln!("no built-in LLM workers — external workers must claim work");
     }
     let recovered = lumen_cut::agent::task::restore_or_enqueue(&allocator, &task)?;
@@ -2241,6 +2238,7 @@ async fn task_serve(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_start(
     kind: &str,
     pid: &str,
@@ -2767,13 +2765,9 @@ async fn run_auto(opts: AutoOptions<'_>) -> AppResult<AutoSummary> {
 
     // Multi-stage intent: translate target needs source-lang, --no-polish, or
     // --rough-cut so plain `auto media --lang zh` stays ASR-only (compat).
-    let wants_translate = opts.lang.is_some()
-        && (opts.source_lang.is_some() || opts.no_polish || opts.rough_cut);
-    let translate_lang = if wants_translate {
-        opts.lang
-    } else {
-        None
-    };
+    let wants_translate =
+        opts.lang.is_some() && (opts.source_lang.is_some() || opts.no_polish || opts.rough_cut);
+    let translate_lang = if wants_translate { opts.lang } else { None };
     let asr_lang = opts
         .source_lang
         .or(if wants_translate { None } else { opts.lang });
@@ -3045,9 +3039,7 @@ fn run_cut_command(cmd: CutCommand<'_>) -> AppResult<()> {
         let hits = lumen_cut::pipeline::detect_with(&doc, detect_options);
         let proposals: Vec<_> = hits
             .iter()
-            .filter_map(|hit| {
-                lumen_cut::pipeline::cut_from_hit_with(&doc, hit, detect_options)
-            })
+            .filter_map(|hit| lumen_cut::pipeline::cut_from_hit_with(&doc, hit, detect_options))
             .map(|cut| {
                 serde_json::json!({
                     "id": cut.id,
@@ -3162,10 +3154,7 @@ fn manual_cut_from_args(
     })
 }
 
-fn parse_word_span(
-    spec: &str,
-    words: &[&lumen_cut::data::Word],
-) -> AppResult<(String, String)> {
+fn parse_word_span(spec: &str, words: &[&lumen_cut::data::Word]) -> AppResult<(String, String)> {
     let parts: Vec<&str> = if spec.contains("..") {
         spec.split("..").map(str::trim).collect()
     } else {
@@ -3209,12 +3198,8 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     let (doc, cuts) = match (cmd.start, cmd.end) {
         (Some(start), Some(end)) if end > start => {
             let clipped_doc = lumen_cut::export::clip_doc_window(&full_doc, start, end);
-            let clipped_cuts = lumen_cut::export::clip_cuts_window(
-                &full_doc,
-                &full_cuts.cuts,
-                start,
-                end,
-            );
+            let clipped_cuts =
+                lumen_cut::export::clip_cuts_window(&full_doc, &full_cuts.cuts, start, end);
             (clipped_doc, ClipCuts { cuts: clipped_cuts })
         }
         (None, None) => (full_doc, full_cuts),
@@ -3226,9 +3211,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     };
     let export_settings = lumen_cut::data::export_settings::load(&dir)?;
     let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
-    let caption_lang = cmd
-        .lang
-        .or(export_settings.subtitle_language.as_deref());
+    let caption_lang = cmd.lang.or(export_settings.subtitle_language.as_deref());
     let bilingual = if cmd.translated {
         false
     } else if cmd.bilingual {
@@ -3246,10 +3229,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
         )?
     } else {
         lumen_cut::data::export_settings::project_caption_doc_with_hidden(
-            &doc,
-            None,
-            false,
-            &hidden,
+            &doc, None, false, &hidden,
         )?
     };
 
@@ -3538,8 +3518,9 @@ mod tests {
 
     #[test]
     fn cut_parses_list_add_and_detect_flags() {
-        let list = Cli::try_parse_from(["lumen-cut-cli", "cut", "demo", "--list", "--kind", "filler"])
-            .unwrap();
+        let list =
+            Cli::try_parse_from(["lumen-cut-cli", "cut", "demo", "--list", "--kind", "filler"])
+                .unwrap();
         match list.cmd {
             Cmd::Cut { list, kind, .. } => {
                 assert!(list);
@@ -3560,10 +3541,7 @@ mod tests {
         .unwrap();
         match add.cmd {
             Cmd::Cut {
-                add,
-                words,
-                note,
-                ..
+                add, words, note, ..
             } => {
                 assert!(add);
                 assert_eq!(words.as_deref(), Some("w1..w3"));
@@ -3623,8 +3601,8 @@ mod tests {
             } => assert!(review),
             other => panic!("unexpected command: {other:?}"),
         }
-        let apply = Cli::try_parse_from(["lumen-cut-cli", "speakers", "demo", "apply", "--all"])
-            .unwrap();
+        let apply =
+            Cli::try_parse_from(["lumen-cut-cli", "speakers", "demo", "apply", "--all"]).unwrap();
         match apply.cmd {
             Cmd::Speakers {
                 action: SpeakersCmd::Apply { changed_only, all },
@@ -3756,10 +3734,10 @@ mod tests {
         let advice = finish_check_fix("p", &items, &cuts, &doc);
         assert_eq!(cuts, before, "finish_check_fix must not mutate cuts");
         assert!(
-            advice
-                .suggestions
-                .iter()
-                .any(|s| s.contains("cut") || s.contains("audit") || s.contains("translate") || s.contains("version")),
+            advice.suggestions.iter().any(|s| s.contains("cut")
+                || s.contains("audit")
+                || s.contains("translate")
+                || s.contains("version")),
             "expected advisory suggestions, got {advice:?}"
         );
     }

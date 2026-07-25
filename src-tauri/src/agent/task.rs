@@ -197,8 +197,6 @@ struct TimedWord {
     speaker: Option<String>,
 }
 
-
-
 pub fn prepare_task(project_dir: &Path, kind: &str, lang: Option<&str>) -> AppResult<PreparedTask> {
     prepare_task_with_options(project_dir, kind, lang, false)
 }
@@ -1071,7 +1069,12 @@ fn align_payloads(
         let scoped = if requested.is_empty() {
             None
         } else {
-            Some(requested.iter().map(|id| (*id).to_string()).collect::<Vec<_>>())
+            Some(
+                requested
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect::<Vec<_>>(),
+            )
         };
         // Prefer the shared Phase-2 fitter (punctuation-aware multi-line wrap).
         if scoped.is_none() {
@@ -2748,9 +2751,7 @@ fn apply_answer(task: &PreparedTask, call: &PendingCall, answer: &str) -> AppRes
                 }
             }
             artifact.save(&task.project_dir.join("ai").join("align-artifact.json"))?;
-            if !second_look_groups.is_empty()
-                && !task.ai_dir.join("second-look-done").exists()
-            {
+            if !second_look_groups.is_empty() && !task.ai_dir.join("second-look-done").exists() {
                 crate::data::storage::write_json(
                     &task.ai_dir.join("second-look-pending.json"),
                     &serde_json::json!({ "groups": second_look_groups }),
@@ -3368,10 +3369,7 @@ mod tests {
         );
         let saved = Doc::load(tmp.path()).unwrap();
         let text = &saved.translations["zh"]["s1"].text;
-        assert!(
-            text.contains('\n'),
-            "expected wrapped text, got {text}"
-        );
+        assert!(text.contains('\n'), "expected wrapped text, got {text}");
     }
 
     #[test]
@@ -3403,7 +3401,10 @@ mod tests {
         apply_answer(&task, &task.calls[0].call, rewrite).unwrap();
         let saved = Doc::load(tmp.path()).unwrap();
         assert_eq!(saved.translations["zh"]["s1"].text, "更正译文");
-        assert!(tmp.path().join("ai/align/second-look-pending.json").exists());
+        assert!(tmp
+            .path()
+            .join("ai/align/second-look-pending.json")
+            .exists());
         assert!(tmp.path().join("ai/align-artifact.json").exists());
     }
 
