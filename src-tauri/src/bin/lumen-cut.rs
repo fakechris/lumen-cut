@@ -2081,6 +2081,8 @@ struct AutoOptions<'a> {
     model: Option<&'a str>,
     no_polish: bool,
     rough_cut: bool,
+    /// Reserved for auto Phase-2 fit; forwarded via task_start when align runs.
+    #[allow(dead_code)]
     align_fit: Option<usize>,
     stale_only: bool,
 }
@@ -2141,6 +2143,7 @@ fn parse_second_look(raw: &str) -> AppResult<lumen_cut::agent::task::SecondLookM
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_serve(
     kind: &str,
     pid: &str,
@@ -2235,6 +2238,7 @@ async fn task_serve(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_start(
     kind: &str,
     pid: &str,
