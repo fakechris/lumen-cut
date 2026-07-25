@@ -2612,10 +2612,7 @@ pub async fn finish_check_pid(
     .await
 }
 
-fn humanize_finish_item(
-    item: crate::audit::finish_check::EmitItem,
-    zh: bool,
-) -> FinishCheckItem {
+fn humanize_finish_item(item: crate::audit::finish_check::EmitItem, zh: bool) -> FinishCheckItem {
     let mut reason_codes = Vec::new();
     let mut target_width = 0usize;
     let mut target_aim = 0usize;
@@ -2837,35 +2834,32 @@ pub async fn cut_speech_cleanup(
             .and_then(crate::pipeline::cleanup::CleanupAggressiveness::parse)
             .unwrap_or(crate::pipeline::cleanup::CleanupAggressiveness::Balanced);
         let mut options = agg.detect_options();
-        let kinds: Option<Vec<crate::pipeline::cleanup::CleanupKind>> = match mode
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "silence" | "pauses" | "dead-air" => {
-                options.fillers = false;
-                options.pauses = true;
-                Some(vec![crate::pipeline::cleanup::CleanupKind::Silence])
-            }
-            "fillers" | "filler" => {
-                options.fillers = true;
-                options.pauses = false;
-                Some(vec![crate::pipeline::cleanup::CleanupKind::Filler])
-            }
-            "both" | "all" | "speech" => {
-                options.fillers = true;
-                options.pauses = true;
-                Some(vec![
-                    crate::pipeline::cleanup::CleanupKind::Silence,
-                    crate::pipeline::cleanup::CleanupKind::Filler,
-                ])
-            }
-            other => {
-                return Err(AppError::Schema(format!(
-                    "unknown cleanup mode `{other}`; use silence, fillers, or both"
-                )));
-            }
-        };
+        let kinds: Option<Vec<crate::pipeline::cleanup::CleanupKind>> =
+            match mode.trim().to_ascii_lowercase().as_str() {
+                "silence" | "pauses" | "dead-air" => {
+                    options.fillers = false;
+                    options.pauses = true;
+                    Some(vec![crate::pipeline::cleanup::CleanupKind::Silence])
+                }
+                "fillers" | "filler" => {
+                    options.fillers = true;
+                    options.pauses = false;
+                    Some(vec![crate::pipeline::cleanup::CleanupKind::Filler])
+                }
+                "both" | "all" | "speech" => {
+                    options.fillers = true;
+                    options.pauses = true;
+                    Some(vec![
+                        crate::pipeline::cleanup::CleanupKind::Silence,
+                        crate::pipeline::cleanup::CleanupKind::Filler,
+                    ])
+                }
+                other => {
+                    return Err(AppError::Schema(format!(
+                        "unknown cleanup mode `{other}`; use silence, fillers, or both"
+                    )));
+                }
+            };
         let label = match mode.trim().to_ascii_lowercase().as_str() {
             "silence" | "pauses" | "dead-air" => "Remove silence",
             "fillers" | "filler" => "Remove filler words",
@@ -5619,11 +5613,7 @@ async fn export_preflight_impl(
         .as_ref()
         .ok()
         .is_some_and(|mix| !mix.music.is_empty());
-    let audio_mix_for_path = audio_mix_result
-        .as_ref()
-        .ok()
-        .cloned()
-        .unwrap_or_default();
+    let audio_mix_for_path = audio_mix_result.as_ref().ok().cloned().unwrap_or_default();
     match audio_mix_result.and_then(|mix| mix.fit_to_duration(duration_seconds)) {
         Ok(mix) => {
             let mut music_ready = 0usize;

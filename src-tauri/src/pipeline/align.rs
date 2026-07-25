@@ -255,9 +255,7 @@ pub fn align_list(doc: &Doc, lang: &str, fit: usize, pid: &str) -> AppResult<Ali
 }
 
 fn target_cells(text: &str) -> f64 {
-    text.chars()
-        .map(char_cells)
-        .sum()
+    text.chars().map(char_cells).sum()
 }
 
 fn char_cells(character: char) -> f64 {
@@ -304,7 +302,11 @@ pub const MIN_CAPTION_DISPLAY_SECONDS: f64 = 0.7;
 /// Deterministic Phase-2: wrap every over-fit translation group into short
 /// display lines. Does **not** re-translate; inserts line breaks at punctuation
 /// seams when possible, otherwise at the fit budget. Mutates `doc` in place.
-pub fn auto_fit_translations(doc: &mut Doc, lang: &str, fit: Option<usize>) -> AppResult<FitFixReport> {
+pub fn auto_fit_translations(
+    doc: &mut Doc,
+    lang: &str,
+    fit: Option<usize>,
+) -> AppResult<FitFixReport> {
     let fit = fit
         .unwrap_or_else(|| crate::pipeline::translate::aim_chars_for_lang(lang))
         .clamp(8, 32);
@@ -439,7 +441,18 @@ pub fn wrap_display_lines(text: &str, fit: usize, hard: usize) -> String {
             end += 1;
             if matches!(
                 chars[end - 1],
-                '，' | '。' | '、' | '；' | '：' | '！' | '？' | ',' | '.' | ';' | ':' | '!' | '?'
+                '，' | '。'
+                    | '、'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
                     | '…'
             ) {
                 last_punct = Some(end);

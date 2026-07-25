@@ -306,10 +306,8 @@ fn cut_without_an_action_never_synthesizes_a_test_cut() {
         .expect("run lumen-cut-cli cut");
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("cut requires exactly one of --auto/--detect, --list, --add, --restore")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("cut requires exactly one of --auto/--detect, --list, --add, --restore"));
     assert!(!temp.path().join("cuts.json").exists());
 }
 
@@ -339,10 +337,7 @@ fn cut_add_list_and_restore_round_trip_over_json() {
     .expect("write doc");
 
     let added = cli()
-        .args([
-            "--json",
-            "cut",
-        ])
+        .args(["--json", "cut"])
         .arg(temp.path())
         .args(["--add", "--words", "w1..w2", "--note", "manual trim"])
         .output()
@@ -352,8 +347,7 @@ fn cut_add_list_and_restore_round_trip_over_json() {
         "stderr: {}",
         String::from_utf8_lossy(&added.stderr)
     );
-    let added: serde_json::Value =
-        serde_json::from_slice(&added.stdout).expect("cut add json");
+    let added: serde_json::Value = serde_json::from_slice(&added.stdout).expect("cut add json");
     assert_eq!(added["added"], true);
     assert_eq!(added["total"], 1);
 
@@ -364,8 +358,7 @@ fn cut_add_list_and_restore_round_trip_over_json() {
         .output()
         .expect("cut list");
     assert!(listed.status.success());
-    let listed: serde_json::Value =
-        serde_json::from_slice(&listed.stdout).expect("cut list json");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("cut list json");
     assert_eq!(listed["total"], 1);
     assert_eq!(listed["cuts"][0]["aWord"], "w1");
     assert_eq!(listed["cuts"][0]["bWord"], "w2");
@@ -418,8 +411,7 @@ fn export_srt_flag_writes_only_selected_output_path() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("export json");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("export json");
     assert!(out.is_file(), "expected {}", out.display());
     assert!(!temp.path().join("export.vtt").exists());
     assert_eq!(

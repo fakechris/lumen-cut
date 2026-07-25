@@ -95,8 +95,10 @@ pub fn reencode_reason(
         return "stream-copy remux".into();
     }
     let mut reasons = Vec::new();
-    if matches!(settings.subtitle_mode, crate::data::export_settings::ExportSubtitleMode::Burn)
-    {
+    if matches!(
+        settings.subtitle_mode,
+        crate::data::export_settings::ExportSubtitleMode::Burn
+    ) {
         reasons.push("burned-in captions");
     }
     if include_ass {
@@ -1108,12 +1110,7 @@ fn encoder_args(
                 (RenderPurpose::Final, ExportEncodingSpeed::MatchSource) => ("medium", "23"),
                 (RenderPurpose::Final, ExportEncodingSpeed::Quality) => ("medium", "22"),
             };
-            args.extend([
-                "-preset".into(),
-                preset.into(),
-                "-crf".into(),
-                crf.into(),
-            ]);
+            args.extend(["-preset".into(), preset.into(), "-crf".into(), crf.into()]);
         }
         if encoder == "libx265" {
             args.extend(["-tag:v".into(), "hvc1".into()]);
@@ -1786,16 +1783,14 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             ..Default::default()
         };
         assert_eq!(encoder_for_settings(&hevc).unwrap(), "libx265");
-        assert!(
-            encoder_args(
-                "libx265",
-                RenderPurpose::Final,
-                ExportEncodingSpeed::Quality,
-                None
-            )
-            .windows(2)
-            .any(|pair| pair == ["-tag:v", "hvc1"])
-        );
+        assert!(encoder_args(
+            "libx265",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::Quality,
+            None
+        )
+        .windows(2)
+        .any(|pair| pair == ["-tag:v", "hvc1"]));
 
         let prores = VideoExportSettings {
             container: crate::data::export_settings::ExportContainer::Mov,
@@ -1804,16 +1799,14 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             ..Default::default()
         };
         assert_eq!(encoder_for_settings(&prores).unwrap(), "prores_ks");
-        assert!(
-            encoder_args(
-                "prores_ks",
-                RenderPurpose::Final,
-                ExportEncodingSpeed::Quality,
-                None
-            )
-            .windows(2)
-            .any(|pair| pair == ["-profile:v", "3"])
-        );
+        assert!(encoder_args(
+            "prores_ks",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::Quality,
+            None
+        )
+        .windows(2)
+        .any(|pair| pair == ["-profile:v", "3"]));
         assert_eq!(audio_encoder(ExportAudioCodec::Aac), "aac");
         assert_eq!(audio_encoder(ExportAudioCodec::Pcm), "pcm_s16le");
     }
