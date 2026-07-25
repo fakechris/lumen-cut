@@ -274,7 +274,7 @@ pub fn max_line_cells(text: &str) -> f64 {
         return 0.0;
     }
     text.lines()
-        .map(|line| target_cells(line))
+        .map(target_cells)
         .fold(0.0_f64, f64::max)
 }
 
