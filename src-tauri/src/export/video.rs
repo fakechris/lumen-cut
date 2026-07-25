@@ -1,8 +1,14 @@
 //! Cut-aware video export. The picture and audio are trimmed/concatenated
 //! before the already-retimed ASS captions are burned in.
+//!
+//! When only soft (or no) captions change and the timeline is otherwise intact,
+//! export uses stream-copy remux instead of a full re-encode.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
+
+use tracing::info;
 
 use crate::data::audio_mix::AudioMix;
 use crate::data::broll::{BackgroundMode, BrollPlacement, FitMode, PlacementMode, Rect};
@@ -37,6 +43,92 @@ pub struct VideoRenderOptions {
     pub settings: Option<VideoExportSettings>,
     pub soft_subtitle: Option<PathBuf>,
     pub include_ass: bool,
+}
+
+/// How the final video will be produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportRenderPath {
+    /// `-c:v copy -c:a copy` remux, optionally mux soft captions.
+    StreamCopy,
+    /// Full filter graph + re-encode.
+    Reencode,
+}
+
+/// Whether this export can stream-copy the source A/V (only remux + soft captions).
+pub fn can_stream_copy_export(
+    settings: &VideoExportSettings,
+    cuts: &[Cut],
+    placements: &[BrollPlacement],
+    audio_mix: &AudioMix,
+    include_ass: bool,
+) -> bool {
+    settings.allows_stream_copy()
+        && cuts.is_empty()
+        && placements.is_empty()
+        && audio_mix.is_passthrough()
+        && !include_ass
+}
+
+pub fn export_render_path(
+    settings: &VideoExportSettings,
+    cuts: &[Cut],
+    placements: &[BrollPlacement],
+    audio_mix: &AudioMix,
+    include_ass: bool,
+) -> ExportRenderPath {
+    if can_stream_copy_export(settings, cuts, placements, audio_mix, include_ass) {
+        ExportRenderPath::StreamCopy
+    } else {
+        ExportRenderPath::Reencode
+    }
+}
+
+/// Human-readable reason when re-encode is required (for preflight/UI).
+pub fn reencode_reason(
+    settings: &VideoExportSettings,
+    cuts: &[Cut],
+    placements: &[BrollPlacement],
+    audio_mix: &AudioMix,
+    include_ass: bool,
+) -> String {
+    if can_stream_copy_export(settings, cuts, placements, audio_mix, include_ass) {
+        return "stream-copy remux".into();
+    }
+    let mut reasons = Vec::new();
+    if matches!(settings.subtitle_mode, crate::data::export_settings::ExportSubtitleMode::Burn)
+    {
+        reasons.push("burned-in captions");
+    }
+    if include_ass {
+        reasons.push("titles or graphics burned into picture");
+    }
+    if !cuts.is_empty() {
+        reasons.push("soft cuts on the timeline");
+    }
+    if !placements.is_empty() {
+        reasons.push("B-roll overlays");
+    }
+    if !audio_mix.is_passthrough() {
+        reasons.push("audio mix / music / enhance");
+    }
+    if settings.resolution != crate::data::export_settings::ExportResolution::Source
+        || settings.aspect_ratio != crate::data::export_settings::ExportAspectRatio::Source
+    {
+        reasons.push("canvas resize or aspect change");
+    }
+    if settings.video_codec == ExportVideoCodec::Prores {
+        reasons.push("ProRes master encode");
+    }
+    if settings.video_codec == ExportVideoCodec::Hevc {
+        reasons.push("HEVC re-encode");
+    }
+    if settings.audio_codec == ExportAudioCodec::Pcm {
+        reasons.push("PCM audio re-encode");
+    }
+    if reasons.is_empty() {
+        reasons.push("delivery settings require re-encode");
+    }
+    reasons.join(", ")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -483,6 +575,7 @@ pub async fn render_video_with_broll_options(
     placements: &[BrollPlacement],
     options: VideoRenderOptions,
 ) -> AppResult<()> {
+    let started = Instant::now();
     let VideoRenderOptions {
         purpose,
         mode,
@@ -495,7 +588,8 @@ pub async fn render_video_with_broll_options(
     let settings = settings.unwrap_or_else(|| VideoExportSettings {
         encoding_speed: match mode.as_deref() {
             Some("quality") => ExportEncodingSpeed::Quality,
-            _ => ExportEncodingSpeed::Fast,
+            Some("fast") => ExportEncodingSpeed::Fast,
+            _ => ExportEncodingSpeed::MatchSource,
         },
         ..Default::default()
     });
@@ -510,8 +604,39 @@ pub async fn render_video_with_broll_options(
             return Err(AppError::ProjectNotFound(track.path.clone()));
         }
     }
+
+    let output_duration: f64 = super::project::kept_intervals(doc, cuts)
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum();
+
+    let path = export_render_path(&settings, cuts, placements, &audio_mix, include_ass);
+    if path == ExportRenderPath::StreamCopy && purpose == RenderPurpose::Final {
+        info!(
+            path = "stream-copy",
+            soft_subtitle = soft_subtitle.is_some(),
+            "video export using remux (no re-encode)"
+        );
+        render_stream_copy_remux(
+            doc,
+            output,
+            soft_subtitle.as_deref(),
+            &settings,
+            output_duration,
+            on_progress,
+        )
+        .await?;
+        info!(
+            path = "stream-copy",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "video export remux finished"
+        );
+        return Ok(());
+    }
+
     let source_info = crate::media::probe(&doc.media.path).await?;
     let source_dimensions = source_info.width.zip(source_info.height);
+    let source_bitrate = source_info.bit_rate;
     let output_dimensions = settings.target_dimensions(source_dimensions);
     // B-roll rectangles are stored in normalized 1920×1080 design space and
     // must be projected onto the final canvas, not the uncropped source.
@@ -528,6 +653,7 @@ pub async fn render_video_with_broll_options(
             fit: settings.canvas_fit,
         },
     )?;
+    let filter_ms = started.elapsed().as_millis() as u64;
     let mut args = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -590,12 +716,13 @@ pub async fn render_video_with_broll_options(
             format!("language={subtitle_language}"),
         ]);
     }
-    let output_duration: f64 = super::project::kept_intervals(doc, cuts)
-        .iter()
-        .map(|(start, end)| end - start)
-        .sum();
     let encoder = encoder_for_settings(&settings)?;
-    args.extend(encoder_args(&encoder, purpose));
+    args.extend(encoder_args(
+        &encoder,
+        purpose,
+        settings.encoding_speed,
+        source_bitrate,
+    ));
     args.extend([
         "-movflags".into(),
         "+faststart".into(),
@@ -604,6 +731,15 @@ pub async fn render_video_with_broll_options(
         output.display().to_string(),
     ]);
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    info!(
+        path = "reencode",
+        encoder = %encoder,
+        speed = ?settings.encoding_speed,
+        source_bitrate,
+        filter_prepare_ms = filter_ms,
+        reason = %reencode_reason(&settings, cuts, placements, &audio_mix, include_ass),
+        "video export re-encode starting"
+    );
     if let Some(callback) = &on_progress {
         callback(VideoRenderProgress {
             progress: 0,
@@ -612,6 +748,118 @@ pub async fn render_video_with_broll_options(
             encoder: encoder.clone(),
         });
     }
+    let encode_started = Instant::now();
+    let progress_callback = on_progress.clone();
+    let callback_encoder = encoder.clone();
+    let _ = proc::run_with_progress(
+        "ffmpeg",
+        &arg_refs,
+        Arc::new(move |line| {
+            let Some(current_seconds) = ffmpeg_out_time_seconds(&line) else {
+                return;
+            };
+            let progress = if output_duration > 0.0 {
+                ((current_seconds / output_duration) * 100.0)
+                    .floor()
+                    .clamp(0.0, 99.0) as u8
+            } else {
+                0
+            };
+            if let Some(callback) = &progress_callback {
+                callback(VideoRenderProgress {
+                    progress,
+                    current_seconds: current_seconds.min(output_duration),
+                    total_seconds: output_duration,
+                    encoder: callback_encoder.clone(),
+                });
+            }
+        }),
+    )
+    .await?;
+    info!(
+        path = "reencode",
+        encoder = %encoder,
+        encode_ms = encode_started.elapsed().as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "video export re-encode finished"
+    );
+    if let Some(callback) = on_progress {
+        callback(VideoRenderProgress {
+            progress: 100,
+            current_seconds: output_duration,
+            total_seconds: output_duration,
+            encoder,
+        });
+    }
+    Ok(())
+}
+
+async fn render_stream_copy_remux(
+    doc: &Doc,
+    output: &Path,
+    soft_subtitle: Option<&Path>,
+    settings: &VideoExportSettings,
+    output_duration: f64,
+    on_progress: Option<VideoRenderProgressCallback>,
+) -> AppResult<()> {
+    let encoder = "copy".to_string();
+    if let Some(callback) = &on_progress {
+        callback(VideoRenderProgress {
+            progress: 0,
+            current_seconds: 0.0,
+            total_seconds: output_duration,
+            encoder: encoder.clone(),
+        });
+    }
+    // Explicit maps only: never pull source subtitle/data streams into the remux.
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-progress".into(),
+        "pipe:2".into(),
+        "-nostats".into(),
+        "-i".into(),
+        doc.media.path.display().to_string(),
+    ];
+    if let Some(path) = soft_subtitle {
+        args.extend(["-i".into(), path.display().to_string()]);
+    }
+    args.extend([
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-c:a".into(),
+        "copy".into(),
+    ]);
+    if soft_subtitle.is_some() {
+        let subtitle_language = settings
+            .subtitle_language
+            .as_deref()
+            .or(doc.meta.language.as_deref())
+            .unwrap_or("und");
+        args.extend([
+            "-map".into(),
+            "1:0".into(),
+            "-c:s".into(),
+            "mov_text".into(),
+            "-metadata:s:s:0".into(),
+            format!("language={subtitle_language}"),
+        ]);
+    }
+    args.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        "-t".into(),
+        format!("{output_duration:.6}"),
+        output.display().to_string(),
+    ]);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let progress_callback = on_progress.clone();
     let callback_encoder = encoder.clone();
     let _ = proc::run_with_progress(
@@ -750,14 +998,18 @@ pub fn encoder_for_settings(settings: &VideoExportSettings) -> AppResult<String>
     settings.validate()?;
     match settings.video_codec {
         ExportVideoCodec::H264 => match settings.encoding_speed {
-            ExportEncodingSpeed::Fast => Ok(selected_encoder()),
+            ExportEncodingSpeed::MatchSource | ExportEncodingSpeed::Fast => Ok(selected_encoder()),
             ExportEncodingSpeed::Quality => Ok("libx264".into()),
         },
         ExportVideoCodec::Hevc => match settings.encoding_speed {
-            ExportEncodingSpeed::Fast if cfg!(target_os = "macos") => {
+            ExportEncodingSpeed::MatchSource | ExportEncodingSpeed::Fast
+                if cfg!(target_os = "macos") =>
+            {
                 Ok("hevc_videotoolbox".into())
             }
-            ExportEncodingSpeed::Fast | ExportEncodingSpeed::Quality => Ok("libx265".into()),
+            ExportEncodingSpeed::MatchSource
+            | ExportEncodingSpeed::Fast
+            | ExportEncodingSpeed::Quality => Ok("libx265".into()),
         },
         ExportVideoCodec::Prores => Ok("prores_ks".into()),
     }
@@ -765,7 +1017,7 @@ pub fn encoder_for_settings(settings: &VideoExportSettings) -> AppResult<String>
 
 pub fn encoder_for_mode(mode: Option<&str>) -> AppResult<String> {
     match mode.unwrap_or("auto") {
-        "auto" => Ok(selected_encoder()),
+        "auto" | "match-source" => Ok(selected_encoder()),
         "quality" => Ok("libx264".into()),
         "fast" if cfg!(target_os = "macos") => Ok("h264_videotoolbox".into()),
         "fast" => Ok("libx264".into()),
@@ -775,21 +1027,45 @@ pub fn encoder_for_mode(mode: Option<&str>) -> AppResult<String> {
     }
 }
 
-fn encoder_args(encoder: &str, purpose: RenderPurpose) -> Vec<String> {
+fn encoder_args(
+    encoder: &str,
+    purpose: RenderPurpose,
+    speed: ExportEncodingSpeed,
+    source_bitrate: Option<u64>,
+) -> Vec<String> {
     if matches!(encoder, "h264_videotoolbox" | "hevc_videotoolbox") {
-        let quality = if purpose == RenderPurpose::Preview {
-            "55"
-        } else {
-            "65"
-        };
         let mut args = vec![
             "-c:v".into(),
             encoder.into(),
             "-pix_fmt".into(),
             "yuv420p".into(),
-            "-q:v".into(),
-            quality.into(),
         ];
+        // Match-source + known bitrate: constrain rate instead of high fixed q.
+        let use_bitrate = purpose == RenderPurpose::Final
+            && speed == ExportEncodingSpeed::MatchSource
+            && source_bitrate.is_some_and(|br| br >= 100_000);
+        if use_bitrate {
+            let br = source_bitrate.unwrap();
+            let maxrate = ((br as f64) * 1.25).round() as u64;
+            let bufsize = br.saturating_mul(2);
+            args.extend([
+                "-b:v".into(),
+                br.to_string(),
+                "-maxrate".into(),
+                maxrate.to_string(),
+                "-bufsize".into(),
+                bufsize.to_string(),
+            ]);
+        } else {
+            let quality = match (purpose, speed) {
+                (RenderPurpose::Preview, _) => "55",
+                // Was 65 (near-master); 58 is still clean but much smaller.
+                (RenderPurpose::Final, ExportEncodingSpeed::Fast) => "58",
+                (RenderPurpose::Final, ExportEncodingSpeed::MatchSource) => "60",
+                (RenderPurpose::Final, ExportEncodingSpeed::Quality) => "55",
+            };
+            args.extend(["-q:v".into(), quality.into()]);
+        }
         if encoder == "h264_videotoolbox" {
             args.extend(["-profile:v".into(), "high".into()]);
         } else {
@@ -805,19 +1081,40 @@ fn encoder_args(encoder: &str, purpose: RenderPurpose) -> Vec<String> {
         }
         args
     } else if encoder == "libx264" || encoder == "libx265" {
-        let (preset, crf) = if purpose == RenderPurpose::Preview {
-            ("veryfast", "23")
+        let use_bitrate = purpose == RenderPurpose::Final
+            && speed == ExportEncodingSpeed::MatchSource
+            && source_bitrate.is_some_and(|br| br >= 100_000);
+        let mut args = vec!["-c:v".into(), encoder.into()];
+        if use_bitrate {
+            let br = source_bitrate.unwrap();
+            let maxrate = ((br as f64) * 1.25).round() as u64;
+            let bufsize = br.saturating_mul(2);
+            let preset = "veryfast";
+            args.extend([
+                "-preset".into(),
+                preset.into(),
+                "-b:v".into(),
+                br.to_string(),
+                "-maxrate".into(),
+                maxrate.to_string(),
+                "-bufsize".into(),
+                bufsize.to_string(),
+            ]);
         } else {
-            ("medium", "18")
-        };
-        let mut args = vec![
-            "-c:v".into(),
-            encoder.into(),
-            "-preset".into(),
-            preset.into(),
-            "-crf".into(),
-            crf.into(),
-        ];
+            // Delivery CRF 23 (was archival 18). Preview stays veryfast.
+            let (preset, crf) = match (purpose, speed) {
+                (RenderPurpose::Preview, _) => ("veryfast", "23"),
+                (RenderPurpose::Final, ExportEncodingSpeed::Fast) => ("veryfast", "23"),
+                (RenderPurpose::Final, ExportEncodingSpeed::MatchSource) => ("medium", "23"),
+                (RenderPurpose::Final, ExportEncodingSpeed::Quality) => ("medium", "22"),
+            };
+            args.extend([
+                "-preset".into(),
+                preset.into(),
+                "-crf".into(),
+                crf.into(),
+            ]);
+        }
         if encoder == "libx265" {
             args.extend(["-tag:v".into(), "hvc1".into()]);
         }
@@ -1391,14 +1688,76 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
 
     #[test]
     fn videotoolbox_profiles_separate_preview_speed_from_final_quality() {
-        let preview = encoder_args("h264_videotoolbox", RenderPurpose::Preview);
-        let final_render = encoder_args("h264_videotoolbox", RenderPurpose::Final);
+        let preview = encoder_args(
+            "h264_videotoolbox",
+            RenderPurpose::Preview,
+            ExportEncodingSpeed::Fast,
+            None,
+        );
+        let final_render = encoder_args(
+            "h264_videotoolbox",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::Fast,
+            None,
+        );
         assert!(preview.windows(2).any(|pair| pair == ["-realtime", "1"]));
         assert!(preview.windows(2).any(|pair| pair == ["-q:v", "55"]));
-        assert!(final_render.windows(2).any(|pair| pair == ["-q:v", "65"]));
+        assert!(final_render.windows(2).any(|pair| pair == ["-q:v", "58"]));
         assert!(!final_render
             .windows(2)
             .any(|pair| pair == ["-realtime", "1"]));
+    }
+
+    #[test]
+    fn match_source_uses_source_bitrate_when_available() {
+        let args = encoder_args(
+            "libx264",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::MatchSource,
+            Some(2_000_000),
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-b:v", "2000000"]));
+        assert!(!args.windows(2).any(|pair| pair[0] == "-crf"));
+    }
+
+    #[test]
+    fn quality_delivery_uses_moderate_crf_not_archival() {
+        let args = encoder_args(
+            "libx264",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::Quality,
+            None,
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-crf", "22"]));
+    }
+
+    #[test]
+    fn stream_copy_requires_soft_or_none_and_clean_timeline() {
+        let soft = VideoExportSettings {
+            subtitle_mode: crate::data::export_settings::ExportSubtitleMode::Soft,
+            ..Default::default()
+        };
+        assert!(can_stream_copy_export(
+            &soft,
+            &[],
+            &[],
+            &AudioMix::default(),
+            false
+        ));
+        assert!(!can_stream_copy_export(
+            &VideoExportSettings::default(), // burn
+            &[],
+            &[],
+            &AudioMix::default(),
+            false
+        ));
+        assert!(!can_stream_copy_export(
+            &soft,
+            &[],
+            &[],
+            &AudioMix::default(),
+            true // titles burn
+        ));
     }
 
     #[test]
@@ -1427,9 +1786,16 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             ..Default::default()
         };
         assert_eq!(encoder_for_settings(&hevc).unwrap(), "libx265");
-        assert!(encoder_args("libx265", RenderPurpose::Final)
+        assert!(
+            encoder_args(
+                "libx265",
+                RenderPurpose::Final,
+                ExportEncodingSpeed::Quality,
+                None
+            )
             .windows(2)
-            .any(|pair| pair == ["-tag:v", "hvc1"]));
+            .any(|pair| pair == ["-tag:v", "hvc1"])
+        );
 
         let prores = VideoExportSettings {
             container: crate::data::export_settings::ExportContainer::Mov,
@@ -1438,9 +1804,16 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             ..Default::default()
         };
         assert_eq!(encoder_for_settings(&prores).unwrap(), "prores_ks");
-        assert!(encoder_args("prores_ks", RenderPurpose::Final)
+        assert!(
+            encoder_args(
+                "prores_ks",
+                RenderPurpose::Final,
+                ExportEncodingSpeed::Quality,
+                None
+            )
             .windows(2)
-            .any(|pair| pair == ["-profile:v", "3"]));
+            .any(|pair| pair == ["-profile:v", "3"])
+        );
         assert_eq!(audio_encoder(ExportAudioCodec::Aac), "aac");
         assert_eq!(audio_encoder(ExportAudioCodec::Pcm), "pcm_s16le");
     }
@@ -1582,6 +1955,44 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
         assert!(extracted_captions.contains("一二三"));
         let soft_media = crate::media::probe(&soft_output).await.unwrap();
         assert_eq!(soft_media.width.zip(soft_media.height), Some((1280, 720)));
+
+        // Soft + source canvas + no edits → stream-copy remux (size ≈ source).
+        let remux_srt = temp.path().join("remux.srt");
+        crate::export::write_srt_with(&caption_doc, &[], &remux_srt).unwrap();
+        let remux_output = temp.path().join("remux.mp4");
+        let source_bytes = std::fs::metadata(&media_doc.media.path).unwrap().len();
+        render_video_with_broll_options(
+            &media_doc,
+            &[],
+            &temp.path().join("unused-remux.ass"),
+            &remux_output,
+            &[],
+            VideoRenderOptions {
+                purpose: RenderPurpose::Final,
+                mode: None,
+                on_progress: None,
+                audio_mix: AudioMix::default(),
+                settings: Some(VideoExportSettings {
+                    subtitle_mode: crate::data::export_settings::ExportSubtitleMode::Soft,
+                    subtitle_language: Some("zh-Hans".into()),
+                    bilingual_subtitles: true,
+                    encoding_speed: ExportEncodingSpeed::MatchSource,
+                    ..Default::default()
+                }),
+                soft_subtitle: Some(remux_srt),
+                include_ass: false,
+            },
+        )
+        .await
+        .unwrap();
+        let remux_bytes = std::fs::metadata(&remux_output).unwrap().len();
+        // Remux must stay near source size (not 3–5× bloat from high-q re-encode).
+        assert!(
+            remux_bytes < source_bytes.saturating_mul(2).max(source_bytes + 200_000),
+            "remux {remux_bytes} vs source {source_bytes}"
+        );
+        let remux_codecs = stream_codecs(&remux_output).await;
+        assert!(remux_codecs.contains(&("subtitle".into(), "mov_text".into())));
 
         let music = temp.path().join("music.wav");
         let second_music = temp.path().join("second-music.wav");

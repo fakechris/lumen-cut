@@ -26,6 +26,10 @@ pub struct MediaInfo {
     pub codec_type: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Container-level bitrate in bits/sec when ffprobe reports it.
+    pub bit_rate: Option<u64>,
+    /// On-disk file size in bytes when available.
+    pub size_bytes: Option<u64>,
 }
 
 /// Extract one frame at the given timestamp; useful for B-roll thumbnail prep
@@ -105,6 +109,8 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
     #[derive(Deserialize)]
     struct FormatBlock {
         duration: Option<String>,
+        bit_rate: Option<String>,
+        size: Option<String>,
     }
     #[derive(Deserialize)]
     struct StreamBlock {
@@ -114,6 +120,7 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
         channels: Option<u32>,
         width: Option<u32>,
         height: Option<u32>,
+        bit_rate: Option<String>,
     }
 
     let parsed: FfProbeOut =
@@ -121,7 +128,8 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
 
     let duration_seconds: f64 = parsed
         .format
-        .and_then(|f| f.duration)
+        .as_ref()
+        .and_then(|f| f.duration.as_ref())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
@@ -134,6 +142,20 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
         .streams
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("video"));
+    let format_bit_rate = parsed
+        .format
+        .as_ref()
+        .and_then(|f| f.bit_rate.as_ref())
+        .and_then(|s| s.parse().ok());
+    let video_bit_rate = video
+        .and_then(|s| s.bit_rate.as_ref())
+        .and_then(|s| s.parse().ok());
+    let size_bytes = parsed
+        .format
+        .as_ref()
+        .and_then(|f| f.size.as_ref())
+        .and_then(|s| s.parse().ok())
+        .or_else(|| std::fs::metadata(input).ok().map(|meta| meta.len()));
 
     Ok(MediaInfo {
         path: input.to_path_buf(),
@@ -146,6 +168,8 @@ pub async fn probe(input: &Path) -> AppResult<MediaInfo> {
         codec_type: audio.and_then(|s| s.codec_type.clone()),
         width: video.and_then(|s| s.width),
         height: video.and_then(|s| s.height),
+        bit_rate: video_bit_rate.or(format_bit_rate),
+        size_bytes,
     })
 }
 

@@ -72,6 +72,11 @@ impl Default for AudioMix {
 }
 
 impl AudioMix {
+    /// True when dialogue can pass through without filter graph audio processing.
+    pub fn is_passthrough(&self) -> bool {
+        *self == Self::default()
+    }
+
     pub fn fit_to_duration(&self, duration: f64) -> AppResult<Self> {
         if !self.volume.is_finite() || !(0.0..=2.0).contains(&self.volume) {
             return Err(AppError::Schema(

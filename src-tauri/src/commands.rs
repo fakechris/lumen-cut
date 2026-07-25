@@ -5323,6 +5323,8 @@ pub struct ExportPreflightSummary {
     pub broll_items: usize,
     pub title_items: usize,
     pub encoder: String,
+    /// `remux` (stream copy) or `reencode`.
+    pub render_path: String,
     pub estimated_min_mb: u64,
     pub estimated_max_mb: u64,
 }
@@ -5353,17 +5355,48 @@ fn export_size_estimate_mb(
     duration_seconds: f64,
     dimensions: Option<(u32, u32)>,
     has_audio: bool,
+    render_path: crate::export::video::ExportRenderPath,
+    source_bit_rate: Option<u64>,
+    source_size_bytes: Option<u64>,
 ) -> (u64, u64) {
-    use crate::data::export_settings::{ExportAudioCodec, ExportVideoCodec};
+    use crate::data::export_settings::{ExportAudioCodec, ExportEncodingSpeed, ExportVideoCodec};
+    use crate::export::video::ExportRenderPath;
+
+    if render_path == ExportRenderPath::StreamCopy {
+        if let Some(bytes) = source_size_bytes.filter(|bytes| *bytes > 0) {
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+            // Soft captions add a few hundred KB; remux is ~source size.
+            return (
+                mb.floor().max(1.0) as u64,
+                (mb * 1.08).ceil().max(1.0) as u64,
+            );
+        }
+    }
+
     let pixel_scale = dimensions
         .map(|(width, height)| {
             (f64::from(width) * f64::from(height) / (1920.0 * 1080.0)).clamp(0.25, 4.0)
         })
         .unwrap_or(1.0);
+
+    let source_mbps = source_bit_rate.map(|br| br as f64 / 1_000_000.0);
     let video_mbps = match settings.video_codec {
-        ExportVideoCodec::H264 => 8.0 * pixel_scale,
-        ExportVideoCodec::Hevc => 5.0 * pixel_scale,
         ExportVideoCodec::Prores => 220.0 * pixel_scale,
+        ExportVideoCodec::Hevc => match settings.encoding_speed {
+            ExportEncodingSpeed::MatchSource => source_mbps
+                .map(|mbps| mbps.clamp(0.4, 20.0))
+                .unwrap_or(2.5 * pixel_scale),
+            ExportEncodingSpeed::Fast => 3.5 * pixel_scale,
+            ExportEncodingSpeed::Quality => 4.5 * pixel_scale,
+        },
+        ExportVideoCodec::H264 => match settings.encoding_speed {
+            // Prefer source bitrate when known; else ~2.5 Mbps@1080 (not 8).
+            ExportEncodingSpeed::MatchSource => source_mbps
+                .map(|mbps| mbps.clamp(0.5, 25.0))
+                .unwrap_or(2.5 * pixel_scale),
+            ExportEncodingSpeed::Fast => 4.0 * pixel_scale,
+            ExportEncodingSpeed::Quality => 5.0 * pixel_scale,
+        },
     };
     let audio_mbps = if !has_audio {
         0.0
@@ -5375,8 +5408,8 @@ fn export_size_estimate_mb(
     };
     let nominal_mb = duration_seconds.max(0.0) * (video_mbps + audio_mbps) / 8.0;
     (
-        (nominal_mb * 0.65).ceil().max(1.0) as u64,
-        (nominal_mb * 1.5).ceil().max(1.0) as u64,
+        (nominal_mb * 0.75).ceil().max(1.0) as u64,
+        (nominal_mb * 1.35).ceil().max(1.0) as u64,
     )
 }
 
@@ -5586,6 +5619,11 @@ async fn export_preflight_impl(
         .as_ref()
         .ok()
         .is_some_and(|mix| !mix.music.is_empty());
+    let audio_mix_for_path = audio_mix_result
+        .as_ref()
+        .ok()
+        .cloned()
+        .unwrap_or_default();
     match audio_mix_result.and_then(|mix| mix.fit_to_duration(duration_seconds)) {
         Ok(mix) => {
             let mut music_ready = 0usize;
@@ -5773,35 +5811,85 @@ async fn export_preflight_impl(
         }
     }
 
-    let encoder = match crate::export::video::encoder_for_settings(&settings) {
-        Ok(encoder) => {
-            match crate::proc::run(
-                "ffmpeg",
-                &["-hide_banner", "-loglevel", "error", "-encoders"],
-            )
-            .await
-            {
-                Ok(encoders) if encoders.contains(&encoder) => items.push(ExportPreflightItem {
-                    code: "encoder".into(),
-                    level: "pass".into(),
-                    message: format!("{encoder} is available"),
-                }),
-                Ok(_) => push_export_preflight_item(
-                    &mut items,
-                    "encoder",
-                    "blocker",
-                    format!("FFmpeg does not provide the selected encoder `{encoder}`"),
-                ),
-                Err(error) => push_export_preflight_item(
-                    &mut items,
-                    "encoder",
-                    "blocker",
-                    format!("FFmpeg is unavailable: {error}"),
-                ),
+    let include_ass_for_path = match settings.subtitle_mode {
+        crate::data::export_settings::ExportSubtitleMode::Burn => true,
+        crate::data::export_settings::ExportSubtitleMode::Soft
+        | crate::data::export_settings::ExportSubtitleMode::None => !titles.is_empty(),
+    };
+    let render_path = crate::export::video::export_render_path(
+        &settings,
+        &cuts.cuts,
+        &broll,
+        &audio_mix_for_path,
+        include_ass_for_path,
+    );
+    let render_path_label = match render_path {
+        crate::export::video::ExportRenderPath::StreamCopy => "remux",
+        crate::export::video::ExportRenderPath::Reencode => "reencode",
+    };
+    let render_reason = crate::export::video::reencode_reason(
+        &settings,
+        &cuts.cuts,
+        &broll,
+        &audio_mix_for_path,
+        include_ass_for_path,
+    );
+    items.push(ExportPreflightItem {
+        code: "render-path".into(),
+        level: "pass".into(),
+        message: match render_path {
+            crate::export::video::ExportRenderPath::StreamCopy => {
+                "stream-copy remux: video/audio copied without re-encode (size ≈ source)".into()
             }
-            encoder
+            crate::export::video::ExportRenderPath::Reencode => {
+                format!("full re-encode required ({render_reason})")
+            }
+        },
+    });
+
+    let encoder = match render_path {
+        crate::export::video::ExportRenderPath::StreamCopy => {
+            items.push(ExportPreflightItem {
+                code: "encoder".into(),
+                level: "pass".into(),
+                message: "stream copy (no video encoder)".into(),
+            });
+            "copy".into()
         }
-        Err(_) => "unavailable".into(),
+        crate::export::video::ExportRenderPath::Reencode => {
+            match crate::export::video::encoder_for_settings(&settings) {
+                Ok(encoder) => {
+                    match crate::proc::run(
+                        "ffmpeg",
+                        &["-hide_banner", "-loglevel", "error", "-encoders"],
+                    )
+                    .await
+                    {
+                        Ok(encoders) if encoders.contains(&encoder) => {
+                            items.push(ExportPreflightItem {
+                                code: "encoder".into(),
+                                level: "pass".into(),
+                                message: format!("{encoder} is available"),
+                            })
+                        }
+                        Ok(_) => push_export_preflight_item(
+                            &mut items,
+                            "encoder",
+                            "blocker",
+                            format!("FFmpeg does not provide the selected encoder `{encoder}`"),
+                        ),
+                        Err(error) => push_export_preflight_item(
+                            &mut items,
+                            "encoder",
+                            "blocker",
+                            format!("FFmpeg is unavailable: {error}"),
+                        ),
+                    }
+                    encoder
+                }
+                Err(_) => "unavailable".into(),
+            }
+        }
     };
 
     let source_dimensions = media_info
@@ -5820,13 +5908,25 @@ async fn export_preflight_impl(
             .or(doc.media.channels)
             .is_some_and(|channels| channels > 0)
             || has_background_music,
+        render_path,
+        media_info.as_ref().and_then(|info| info.bit_rate),
+        media_info.as_ref().and_then(|info| info.size_bytes),
     );
     items.push(ExportPreflightItem {
         code: "size-estimate".into(),
-        level: "warning".into(),
-        message: format!(
-            "estimated output size is {estimated_min_mb}–{estimated_max_mb} MB; actual size depends on content"
-        ),
+        level: if render_path == crate::export::video::ExportRenderPath::StreamCopy {
+            "pass".into()
+        } else {
+            "warning".into()
+        },
+        message: match render_path {
+            crate::export::video::ExportRenderPath::StreamCopy => format!(
+                "estimated output size is {estimated_min_mb}–{estimated_max_mb} MB (remux ≈ source)"
+            ),
+            crate::export::video::ExportRenderPath::Reencode => format!(
+                "estimated output size is {estimated_min_mb}–{estimated_max_mb} MB; re-encode size depends on content and compression preset"
+            ),
+        },
     });
     let ready = !items.iter().any(|item| item.level == "blocker");
     Ok(ExportPreflightReport {
@@ -5839,6 +5939,7 @@ async fn export_preflight_impl(
             broll_items: broll.len(),
             title_items: titles.len(),
             encoder,
+            render_path: render_path_label.into(),
             estimated_min_mb,
             estimated_max_mb,
         },
@@ -7549,7 +7650,7 @@ pub struct VideoExportJobStatus {
 }
 
 fn default_video_export_mode() -> String {
-    "fast".into()
+    "match-source".into()
 }
 
 struct VideoExportJob {
@@ -7612,15 +7713,21 @@ fn update_video_export_job(
         .expect("video export state poisoned")
         .get_mut(pid)
     {
-        if job.status.phase != "encoding" {
+        let phase = if progress.encoder == "copy" {
+            "remuxing"
+        } else {
+            "encoding"
+        };
+        if job.status.phase != phase {
             tracing::info!(
                 pipeline = "video-export",
                 pid,
-                phase = "encoding",
+                phase,
+                encoder = %progress.encoder,
                 "pipeline phase changed"
             );
         }
-        job.status.phase = "encoding".into();
+        job.status.phase = phase.into();
         job.status.progress = advance_progress(job.status.progress, progress.progress);
         job.status.current_seconds = Some(progress.current_seconds);
         job.status.total_seconds = Some(progress.total_seconds);
@@ -7635,6 +7742,7 @@ async fn export_video_impl(
     requested_settings: Option<crate::data::export_settings::VideoExportSettings>,
     on_progress: Option<crate::export::video::VideoRenderProgressCallback>,
 ) -> AppResult<String> {
+    let export_started = std::time::Instant::now();
     let _heavy_work = crate::performance::acquire_heavy("video-export").await?;
     let dir = resolve_project_dir(&pid, root)?;
     let probe_dir = dir.clone();
@@ -7645,6 +7753,7 @@ async fn export_video_impl(
     let media_info = crate::media::probe(&media_path).await?;
     let source_dimensions = media_info.width.zip(media_info.height);
     let prepare_dir = dir.clone();
+    let prepare_started = std::time::Instant::now();
     let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings) = {
         // Hold the project mutation lock only while taking an export snapshot.
         // Encoding may take minutes and must not stall transcript editing.
@@ -7731,9 +7840,26 @@ async fn export_video_impl(
         })
         .await?
     };
+    let prepare_ms = prepare_started.elapsed().as_millis() as u64;
+    let path_kind = crate::export::video::export_render_path(
+        &settings,
+        &cuts.cuts,
+        &broll,
+        &audio_mix,
+        include_ass,
+    );
+    tracing::info!(
+        pipeline = "video-export",
+        pid = %pid,
+        phase = "prepare",
+        prepare_ms,
+        render_path = ?path_kind,
+        "video export preparation finished"
+    );
     let output = dir.join(format!("export.{}", settings.extension()));
     let in_progress = dir.join(format!("export.in-progress.{}", settings.extension()));
     let _ = tokio::fs::remove_file(&in_progress).await;
+    let render_started = std::time::Instant::now();
     let render = crate::export::video::render_video_with_broll_options(
         &doc,
         &cuts.cuts,
@@ -7755,7 +7881,9 @@ async fn export_video_impl(
         let _ = tokio::fs::remove_file(&in_progress).await;
         return Err(error);
     }
+    let render_ms = render_started.elapsed().as_millis() as u64;
     let final_path = output.clone();
+    let finalize_started = std::time::Instant::now();
     run_blocking("finalize video export", move || {
         std::fs::File::open(&in_progress)?.sync_all()?;
         std::fs::rename(&in_progress, &final_path)?;
@@ -7764,6 +7892,17 @@ async fn export_video_impl(
         Ok(())
     })
     .await?;
+    tracing::info!(
+        pipeline = "video-export",
+        pid = %pid,
+        phase = "complete",
+        prepare_ms,
+        render_ms,
+        finalize_ms = finalize_started.elapsed().as_millis() as u64,
+        total_ms = export_started.elapsed().as_millis() as u64,
+        render_path = ?path_kind,
+        "video export finished"
+    );
     Ok(output.to_string_lossy().into_owned())
 }
 
@@ -7780,15 +7919,21 @@ pub async fn video_export_start(
     state: tauri::State<'_, VideoExportState>,
 ) -> AppResult<VideoExportJobStatus> {
     let settings = settings.unwrap_or_else(|| crate::data::export_settings::VideoExportSettings {
-        encoding_speed: if mode.as_deref() == Some("quality") {
-            crate::data::export_settings::ExportEncodingSpeed::Quality
-        } else {
-            crate::data::export_settings::ExportEncodingSpeed::Fast
+        encoding_speed: match mode.as_deref() {
+            Some("quality") => crate::data::export_settings::ExportEncodingSpeed::Quality,
+            Some("fast") => crate::data::export_settings::ExportEncodingSpeed::Fast,
+            _ => crate::data::export_settings::ExportEncodingSpeed::MatchSource,
         },
         ..Default::default()
     });
     settings.validate()?;
-    crate::export::video::encoder_for_settings(&settings)?;
+    // Remux path does not need a video encoder; still validate when re-encoding.
+    if !settings.allows_stream_copy() {
+        crate::export::video::encoder_for_settings(&settings)?;
+    } else {
+        // Soft/none may still re-encode if titles/cuts exist; preflight catches that.
+        let _ = crate::export::video::encoder_for_settings(&settings);
+    }
     let mode = settings.legacy_mode().to_string();
     let project_dir = resolve_project_dir(&pid, None)?;
     let settings_to_save = settings.clone();

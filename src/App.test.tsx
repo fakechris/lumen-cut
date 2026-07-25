@@ -95,7 +95,7 @@ let videoExportStatusState: {
     subtitleLanguage: string | null;
     bilingualSubtitles: boolean;
     audioCodec: "aac" | "pcm";
-    encodingSpeed: "fast" | "quality";
+    encodingSpeed: "match-source" | "fast" | "quality";
   };
   state: string;
   phase: string;
@@ -239,6 +239,7 @@ beforeEach(() => {
       brollItems: 0,
       titleItems: 0,
       encoder: "h264_videotoolbox",
+      renderPath: "reencode",
       estimatedMinMb: 12,
       estimatedMaxMb: 28,
     },
@@ -286,7 +287,7 @@ beforeEach(() => {
   videoExportHasExistingJob = false;
   videoExportStatusState = {
     pid: "project-1",
-    mode: "fast",
+    mode: "match-source",
     settings: {
       container: "mp4",
       videoCodec: "h264",
@@ -297,7 +298,7 @@ beforeEach(() => {
       subtitleLanguage: null,
       bilingualSubtitles: false,
       audioCodec: "aac",
-      encodingSpeed: "fast",
+      encodingSpeed: "match-source",
     },
     state: "running",
     phase: "encoding",
@@ -607,7 +608,7 @@ beforeEach(() => {
           subtitleLanguage: null,
           bilingualSubtitles: false,
           audioCodec: "aac",
-          encodingSpeed: "fast",
+          encodingSpeed: "match-source",
         };
       case "export_settings_set":
         return args?.settings;
@@ -2265,6 +2266,7 @@ test("delivery preflight localizes blockers and links directly to the repair wor
       brollItems: 0,
       titleItems: 0,
       encoder: "h264_videotoolbox",
+      renderPath: "reencode",
       estimatedMinMb: 12,
       estimatedMaxMb: 28,
     },
@@ -2359,7 +2361,7 @@ test("video export reports hardware backend, real progress, and cancellation", a
       subtitleLanguage: null,
       bilingualSubtitles: false,
       audioCodec: "aac",
-      encodingSpeed: "fast",
+      encodingSpeed: "match-source",
     },
   }));
   expect(await screen.findByRole("progressbar", { name: "视频导出进度" })).toHaveValue(47);
@@ -2423,7 +2425,7 @@ test("professional video export keeps compatible container, codec, subtitle, and
       subtitleLanguage: "zh-Hans",
       bilingualSubtitles: true,
       audioCodec: "pcm",
-      encodingSpeed: "fast",
+      encodingSpeed: "match-source",
     },
     root: null,
   }));
@@ -2445,7 +2447,7 @@ test("professional video export keeps compatible container, codec, subtitle, and
       subtitleLanguage: "zh-Hans",
       bilingualSubtitles: true,
       audioCodec: "pcm",
-      encodingSpeed: "fast",
+      encodingSpeed: "match-source",
     },
   }));
 });

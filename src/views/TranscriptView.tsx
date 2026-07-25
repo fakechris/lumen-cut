@@ -204,7 +204,7 @@ const DEFAULT_VIDEO_EXPORT_SETTINGS: VideoExportSettings = {
   subtitleLanguage: null,
   bilingualSubtitles: false,
   audioCodec: "aac",
-  encodingSpeed: "fast",
+  encodingSpeed: "match-source",
 };
 const BROLL_DRAFTS_KEY_PREFIX = "lumen-cut.brollDrafts.";
 const STYLE_DRAFTS_KEY_PREFIX = "lumen-cut.styleDrafts.";
@@ -558,6 +558,7 @@ function exportPreflightLabel(code: string, lang: Lang) {
     titles: ["标题图层", "Title layers"],
     audio: ["音频混合", "Audio mix"],
     encoder: ["视频编码器", "Video encoder"],
+    "render-path": ["导出路径", "Render path"],
     "size-estimate": ["文件体积", "File size"],
   };
   return labels[code]?.[lang === "zh" ? 0 : 1] ?? code;
@@ -573,7 +574,16 @@ function exportPreflightMessage(
     return `${report.summary.hiddenCaptions} 行隐藏字幕不会进入成片。`;
   }
   if (item.code === "size-estimate") {
-    return `预计输出 ${report.summary.estimatedMinMb}–${report.summary.estimatedMaxMb} MB，实际体积会随画面复杂度变化。`;
+    return report.summary.renderPath === "remux"
+      ? `预计输出 ${report.summary.estimatedMinMb}–${report.summary.estimatedMaxMb} MB（封装≈源片，不重编码）。`
+      : `预计输出 ${report.summary.estimatedMinMb}–${report.summary.estimatedMaxMb} MB；重编码体积会随压缩档位与画面变化。`;
+  }
+  if (item.code === "render-path") {
+    return report.summary.renderPath === "remux"
+      ? "仅封装：复制音视频流，可选软字幕轨（快、体积接近源片）。"
+      : item.message.includes("burned")
+        ? "需要完整重编码（烧录字幕、剪辑、B-roll、画布或音频处理）。"
+        : `需要完整重编码：${item.message.replace(/^full re-encode required \(/, "").replace(/\)$/, "")}`;
   }
   const prefixes: Record<string, string> = {
     settings: "当前容器、编码、字幕或音频组合不兼容",
@@ -841,6 +851,25 @@ export function TranscriptView({
   }, [brollDrafts, newBrollPlacementDirty, subtitleStyleDirty]);
 
   const previewRows = useMemo(() => {
+    // Program monitor follows export caption content so bilingual delivery is visible.
+    if (
+      doc
+      && videoExportSettings.subtitleMode !== "none"
+      && videoExportSettings.subtitleLanguage
+    ) {
+      const track = doc.translations[videoExportSettings.subtitleLanguage];
+      if (track) {
+        return subtitleRows.map((row) => {
+          const translation = track[row.id]?.text?.trim();
+          if (!translation) return row;
+          if (videoExportSettings.bilingualSubtitles) {
+            return { ...row, text: `${row.text}\n${translation}` };
+          }
+          return { ...row, text: translation };
+        });
+      }
+    }
+    // Translate workspace override when export caption track is still source-only.
     if (!doc || activeTab !== "translate" || !previewTranslationLanguage) {
       return subtitleRows;
     }
@@ -850,7 +879,15 @@ export function TranscriptView({
       ...row,
       text: track[row.id]?.text || row.text,
     }));
-  }, [activeTab, doc, previewTranslationLanguage, subtitleRows]);
+  }, [
+    activeTab,
+    doc,
+    previewTranslationLanguage,
+    subtitleRows,
+    videoExportSettings.bilingualSubtitles,
+    videoExportSettings.subtitleLanguage,
+    videoExportSettings.subtitleMode,
+  ]);
   const previewBrollOverview = useMemo<BrollOverview>(() => {
     if (activeTab !== "broll") return brollOverview;
     return {
@@ -3845,12 +3882,24 @@ export function TranscriptView({
                       }))
                     }
                   >
+                    <option value="match-source">
+                      {lang === "zh" ? "跟原片 · 可封装则不重编码" : "Match source · remux when possible"}
+                    </option>
                     <option value="fast">{lang === "zh" ? "快速 · 优先硬件编码" : "Fast · prefer hardware"}</option>
                     <option value="quality">{lang === "zh" ? "高质量 · CPU 精细压缩" : "Quality · CPU compression"}</option>
                   </select>
                 </label>
               </div>
               <p className="video-export-settings-note">
+                {exportPreflightReport?.summary.renderPath === "remux"
+                  ? (lang === "zh"
+                    ? "导出路径：仅封装（复制音视频流，不重编码，体积接近源片）。"
+                    : "Render path: remux only (copy A/V streams, size ≈ source). ")
+                  : exportPreflightReport?.summary.renderPath === "reencode"
+                    ? (lang === "zh"
+                      ? "导出路径：完整重编码（有烧录字幕、剪辑、B-roll 或画布变更）。"
+                      : "Render path: full re-encode (burn-in, cuts, B-roll, or canvas change). ")
+                    : ""}
                 {lang === "zh"
                   ? `成片画布：${videoCanvasSummary(videoExportSettings, lang)}。`
                   : `Delivery canvas: ${videoCanvasSummary(videoExportSettings, lang)}. `}
@@ -3898,6 +3947,10 @@ export function TranscriptView({
               {exportPreflightReport && (
                 <p className="export-queue-summary">
                   {Math.round(exportPreflightReport.summary.durationSeconds)}s ·{" "}
+                  {exportPreflightReport.summary.renderPath === "remux"
+                    ? (lang === "zh" ? "仅封装" : "remux")
+                    : (lang === "zh" ? "重编码" : "re-encode")}
+                  {" · "}
                   {exportPreflightReport.summary.estimatedMinMb}–{exportPreflightReport.summary.estimatedMaxMb} MB
                 </p>
               )}
@@ -3923,6 +3976,9 @@ export function TranscriptView({
               <span>
                 <strong>{c.exportVideo}</strong>
                 <small>
+                  {exportPreflightReport?.summary.renderPath === "remux"
+                    ? (lang === "zh" ? "封装 · 不重编码 · " : "remux · no re-encode · ")
+                    : ""}
                   {videoExportSettings.container.toUpperCase()} ·{" "}
                   {videoExportSettings.videoCodec === "prores"
                     ? "ProRes 422 HQ"
@@ -3956,6 +4012,8 @@ export function TranscriptView({
                     ? lang === "zh" ? "正在准备视频导出" : "Preparing video export"
                     : videoExportJob.phase === "waiting"
                       ? lang === "zh" ? "正在等待计算资源" : "Waiting for compute capacity"
+                    : videoExportJob.phase === "remuxing"
+                      ? lang === "zh" ? "正在封装（不重编码）" : "Remuxing (no re-encode)"
                     : videoExportJob.state === "cancelling"
                       ? lang === "zh" ? "正在停止导出" : "Stopping export"
                       : lang === "zh" ? "正在编码视频" : "Encoding video"}
@@ -3968,7 +4026,9 @@ export function TranscriptView({
                 value={videoExportJob.progress}
               />
               <small>
-                {videoExportJob.encoder === "h264_videotoolbox"
+                {videoExportJob.encoder === "copy"
+                  ? lang === "zh" ? "Stream copy · 仅封装" : "Stream copy · remux only"
+                  : videoExportJob.encoder === "h264_videotoolbox"
                   ? "H.264 VideoToolbox · Apple Media Engine"
                   : videoExportJob.encoder === "hevc_videotoolbox"
                     ? "HEVC VideoToolbox · Apple Media Engine"
