@@ -1745,11 +1745,8 @@ async fn run_cli() -> AppResult<()> {
                     let settings = lumen_cut::data::export_settings::load(&dir)?;
                     let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
                     let caption_doc =
-                        lumen_cut::data::export_settings::project_caption_doc_with_hidden(
-                            &doc,
-                            settings.subtitle_language.as_deref(),
-                            settings.bilingual_subtitles,
-                            &hidden,
+                        lumen_cut::data::export_settings::project_caption_doc_for_settings(
+                            &doc, &settings, &hidden,
                         )?;
                     write_ass_with_style(&caption_doc, &cuts.cuts, &style, &ass, 1920, 1080)?;
                     let preview_video = dir.join("broll-preview.mp4");
@@ -3211,25 +3208,38 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     };
     let export_settings = lumen_cut::data::export_settings::load(&dir)?;
     let hidden = lumen_cut::data::subtitle::load_hidden_checked(&dir)?;
-    let caption_lang = cmd.lang.or(export_settings.subtitle_language.as_deref());
+    let available: Vec<&str> = doc.translations.keys().map(String::as_str).collect();
+    let resolved_lang = lumen_cut::data::export_settings::resolve_subtitle_language(
+        &export_settings,
+        available.iter().copied(),
+    );
+    let caption_lang: Option<String> = cmd
+        .lang
+        .as_ref()
+        .map(|s| (*s).to_string())
+        .or_else(|| export_settings.subtitle_language.clone())
+        .or(resolved_lang);
     let bilingual = if cmd.translated {
         false
     } else if cmd.bilingual {
         true
+    } else if cmd.lang.is_some() {
+        false
     } else {
-        export_settings.bilingual_subtitles && cmd.lang.is_none()
+        export_settings.wants_bilingual()
     };
-    let use_translation = cmd.translated || cmd.bilingual || caption_lang.is_some();
-    let caption_doc = if use_translation {
+    let caption_doc = if cmd.translated || cmd.bilingual || cmd.lang.is_some() {
         lumen_cut::data::export_settings::project_caption_doc_with_hidden(
             &doc,
-            caption_lang,
-            bilingual && !cmd.translated,
+            caption_lang.as_deref(),
+            bilingual,
             &hidden,
         )?
     } else {
-        lumen_cut::data::export_settings::project_caption_doc_with_hidden(
-            &doc, None, false, &hidden,
+        lumen_cut::data::export_settings::project_caption_doc_for_settings(
+            &doc,
+            &export_settings,
+            &hidden,
         )?
     };
 
@@ -3353,6 +3363,19 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
                 "lang": caption_lang,
                 "translated": cmd.translated,
                 "bilingual": bilingual && !cmd.translated,
+                "captionStyle": match (
+                    cmd.translated,
+                    cmd.bilingual || (bilingual && !cmd.translated),
+                    caption_lang.is_some(),
+                ) {
+                    (true, _, _) => "translation",
+                    (_, true, _) => "bilingual",
+                    (_, _, true) if !bilingual => "translation",
+                    _ if export_settings.wants_source_only() => "source",
+                    _ if export_settings.wants_translation_only() => "translation",
+                    _ if export_settings.wants_bilingual() => "bilingual",
+                    _ => "source",
+                },
                 "window": match (cmd.start, cmd.end) {
                     (Some(start), Some(end)) => serde_json::json!({"start": start, "end": end}),
                     _ => serde_json::Value::Null,

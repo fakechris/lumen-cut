@@ -248,6 +248,8 @@ export interface VideoExportSettings {
   aspectRatio: "source" | "16:9" | "9:16" | "1:1" | "4:5";
   canvasFit: "contain" | "cover";
   subtitleMode: "burn" | "soft" | "none";
+  /** source = 只英文/原文, translation = 只中文/译文, bilingual = 对照 */
+  captionStyle: "source" | "translation" | "bilingual";
   subtitleLanguage: string | null;
   bilingualSubtitles: boolean;
   audioCodec: "aac" | "pcm";

@@ -62,6 +62,19 @@ pub enum ExportSubtitleMode {
     None,
 }
 
+/// What text appears on the caption track (monitor + export).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportCaptionStyle {
+    /// Original / source language only (e.g. English only).
+    Source,
+    /// Translation only (e.g. Chinese only).
+    Translation,
+    /// Source + translation on two lines (对照). Default delivery.
+    #[default]
+    Bilingual,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportAudioCodec {
@@ -91,7 +104,11 @@ pub struct VideoExportSettings {
     pub aspect_ratio: ExportAspectRatio,
     pub canvas_fit: ExportCanvasFit,
     pub subtitle_mode: ExportSubtitleMode,
+    /// Caption text style: source / translation / bilingual (对照).
+    #[serde(default)]
+    pub caption_style: ExportCaptionStyle,
     pub subtitle_language: Option<String>,
+    /// Legacy flag kept for older clients; derived from `caption_style` on save/load.
     pub bilingual_subtitles: bool,
     pub audio_codec: ExportAudioCodec,
     pub encoding_speed: ExportEncodingSpeed,
@@ -106,8 +123,9 @@ impl Default for VideoExportSettings {
             aspect_ratio: ExportAspectRatio::Source,
             canvas_fit: ExportCanvasFit::Contain,
             subtitle_mode: ExportSubtitleMode::Burn,
+            caption_style: ExportCaptionStyle::Bilingual,
             subtitle_language: None,
-            bilingual_subtitles: false,
+            bilingual_subtitles: true,
             audio_codec: ExportAudioCodec::Aac,
             encoding_speed: ExportEncodingSpeed::MatchSource,
         }
@@ -115,6 +133,29 @@ impl Default for VideoExportSettings {
 }
 
 impl VideoExportSettings {
+    /// Align legacy `bilingual_subtitles` with `caption_style` (and vice versa for old JSON).
+    pub fn normalize_caption_fields(mut self) -> Self {
+        // Prefer explicit caption_style when present in new files. For files saved
+        // before caption_style existed, serde defaulted it to Bilingual — recover
+        // Source/Translation from the legacy pair when they disagree.
+        if self.caption_style == ExportCaptionStyle::Bilingual
+            && !self.bilingual_subtitles
+            && self.subtitle_language.is_none()
+        {
+            // Old default: source-only delivery.
+            self.caption_style = ExportCaptionStyle::Source;
+        } else if self.caption_style == ExportCaptionStyle::Bilingual
+            && !self.bilingual_subtitles
+            && self.subtitle_language.is_some()
+        {
+            self.caption_style = ExportCaptionStyle::Translation;
+        } else if self.bilingual_subtitles && self.subtitle_language.is_some() {
+            self.caption_style = ExportCaptionStyle::Bilingual;
+        }
+        self.bilingual_subtitles = matches!(self.caption_style, ExportCaptionStyle::Bilingual);
+        self
+    }
+
     pub fn validate(&self) -> AppResult<()> {
         if self.video_codec == ExportVideoCodec::Prores && self.container != ExportContainer::Mov {
             return Err(AppError::Schema(
@@ -138,12 +179,20 @@ impl VideoExportSettings {
                 ));
             }
         }
-        if self.bilingual_subtitles && self.subtitle_language.is_none() {
-            return Err(AppError::Schema(
-                "bilingual subtitles require a translation language".into(),
-            ));
-        }
         Ok(())
+    }
+
+    /// Effective caption projection mode for export/monitor.
+    pub fn wants_bilingual(&self) -> bool {
+        matches!(self.caption_style, ExportCaptionStyle::Bilingual)
+    }
+
+    pub fn wants_translation_only(&self) -> bool {
+        matches!(self.caption_style, ExportCaptionStyle::Translation)
+    }
+
+    pub fn wants_source_only(&self) -> bool {
+        matches!(self.caption_style, ExportCaptionStyle::Source)
     }
 
     pub const fn extension(&self) -> &'static str {
@@ -267,13 +316,42 @@ pub fn load(project_dir: &Path) -> AppResult<VideoExportSettings> {
         return Ok(VideoExportSettings::default());
     }
     let settings: VideoExportSettings = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let settings = settings.normalize_caption_fields();
     settings.validate()?;
     Ok(settings)
 }
 
+/// Prefer zh / zh-Hans when present so 中英对照 works out of the box.
+pub fn preferred_translation_language<'a>(
+    languages: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let languages: Vec<&str> = languages.into_iter().collect();
+    languages
+        .iter()
+        .copied()
+        .find(|code| *code == "zh-Hans" || *code == "zh" || code.starts_with("zh"))
+        .or_else(|| languages.first().copied())
+}
+
+/// Fill subtitle language when caption style needs a translation track.
+pub fn resolve_subtitle_language<'a>(
+    settings: &VideoExportSettings,
+    available: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if settings.wants_source_only() {
+        return None;
+    }
+    if let Some(language) = settings.subtitle_language.as_deref() {
+        return Some(language.to_string());
+    }
+    preferred_translation_language(available).map(str::to_string)
+}
+
 pub fn save(project_dir: &Path, settings: &VideoExportSettings) -> AppResult<()> {
+    let mut settings = settings.clone();
+    settings.bilingual_subtitles = settings.wants_bilingual();
     settings.validate()?;
-    crate::data::storage::write_json(&project_dir.join("export-settings.json"), settings)
+    crate::data::storage::write_json(&project_dir.join("export-settings.json"), &settings)
 }
 
 pub fn project_caption_doc(
@@ -282,6 +360,33 @@ pub fn project_caption_doc(
     bilingual: bool,
 ) -> AppResult<crate::data::Doc> {
     project_caption_doc_with_hidden(doc, language, bilingual, &std::collections::BTreeSet::new())
+}
+
+/// Project captions from export settings (resolves language + 对照/仅译文/仅原文).
+pub fn project_caption_doc_for_settings(
+    doc: &crate::data::Doc,
+    settings: &VideoExportSettings,
+    hidden: &std::collections::BTreeSet<String>,
+) -> AppResult<crate::data::Doc> {
+    if settings.wants_source_only() || settings.subtitle_mode == ExportSubtitleMode::None {
+        return project_caption_doc_with_hidden(doc, None, false, hidden);
+    }
+    let available: Vec<&str> = doc.translations.keys().map(String::as_str).collect();
+    let language = resolve_subtitle_language(settings, available.iter().copied());
+    let Some(language) = language else {
+        if settings.wants_source_only() {
+            return project_caption_doc_with_hidden(doc, None, false, hidden);
+        }
+        return Err(AppError::Schema(
+            "caption style needs a translation track; translate the project first".into(),
+        ));
+    };
+    project_caption_doc_with_hidden(
+        doc,
+        Some(language.as_str()),
+        settings.wants_bilingual(),
+        hidden,
+    )
 }
 
 pub fn project_caption_doc_with_hidden(
@@ -439,18 +544,40 @@ mod tests {
         assert_eq!(settings.extension(), "mp4");
         assert_eq!(settings.legacy_mode(), "match-source");
         assert_eq!(settings.dimensions(), None);
+        assert_eq!(settings.caption_style, ExportCaptionStyle::Bilingual);
+        assert!(settings.wants_bilingual());
         assert!(!settings.allows_stream_copy());
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json["videoCodec"], "h264");
         assert_eq!(json["aspectRatio"], "source");
         assert_eq!(json["canvasFit"], "contain");
         assert_eq!(json["subtitleMode"], "burn");
+        assert_eq!(json["captionStyle"], "bilingual");
         assert_eq!(json["encodingSpeed"], "match-source");
         assert!(VideoExportSettings {
             subtitle_mode: ExportSubtitleMode::Soft,
             ..Default::default()
         }
         .allows_stream_copy());
+    }
+
+    #[test]
+    fn legacy_source_only_export_settings_normalize_to_source_caption_style() {
+        let legacy = serde_json::json!({
+            "container": "mp4",
+            "videoCodec": "h264",
+            "resolution": "source",
+            "subtitleMode": "burn",
+            "subtitleLanguage": null,
+            "bilingualSubtitles": false,
+            "audioCodec": "aac",
+            "encodingSpeed": "fast"
+        });
+        let settings: VideoExportSettings = serde_json::from_value(legacy).unwrap();
+        let settings = settings.normalize_caption_fields();
+        assert_eq!(settings.caption_style, ExportCaptionStyle::Source);
+        assert!(settings.wants_source_only());
+        assert!(!settings.bilingual_subtitles);
     }
 
     #[test]
@@ -540,6 +667,7 @@ mod tests {
             aspect_ratio: ExportAspectRatio::Portrait4x5,
             canvas_fit: ExportCanvasFit::Cover,
             subtitle_mode: ExportSubtitleMode::Soft,
+            caption_style: ExportCaptionStyle::Bilingual,
             subtitle_language: Some("zh-Hans".into()),
             bilingual_subtitles: true,
             audio_codec: ExportAudioCodec::Pcm,

@@ -219,11 +219,8 @@ fn call_tool(name: &str, args: &Value) -> AppResult<String> {
             };
             let settings = crate::data::export_settings::load(&dir)?;
             let hidden = crate::data::subtitle::load_hidden_checked(&dir)?;
-            let caption_doc = crate::data::export_settings::project_caption_doc_with_hidden(
-                &doc,
-                settings.subtitle_language.as_deref(),
-                settings.bilingual_subtitles,
-                &hidden,
+            let caption_doc = crate::data::export_settings::project_caption_doc_for_settings(
+                &doc, &settings, &hidden,
             )?;
             crate::export::write_srt_with(&caption_doc, &cuts.cuts, &dir.join("export.srt"))?;
             crate::export::write_vtt_with(&caption_doc, &cuts.cuts, &dir.join("export.vtt"))?;

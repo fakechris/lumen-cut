@@ -273,9 +273,7 @@ pub fn max_line_cells(text: &str) -> f64 {
     if text.trim().is_empty() {
         return 0.0;
     }
-    text.lines()
-        .map(target_cells)
-        .fold(0.0_f64, f64::max)
+    text.lines().map(target_cells).fold(0.0_f64, f64::max)
 }
 
 /// Result of the one-click local Phase-2 fit (split over-long translation lines).
