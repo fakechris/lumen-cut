@@ -70,6 +70,21 @@ fn start_openai_fixture() -> (String, std::thread::JoinHandle<()>) {
     (endpoint, handle)
 }
 
+fn write_provider_settings(home: &Path, endpoint: &str) {
+    std::fs::create_dir_all(home.join(".lumen-cut")).expect("settings directory");
+    std::fs::write(
+        home.join(".lumen-cut/settings.json"),
+        serde_json::json!({
+            "llmEndpoint": endpoint,
+            "llmApiKey": "",
+            "llmModel": "e2e-fixture",
+            "workerCount": 1,
+        })
+        .to_string(),
+    )
+    .expect("provider settings");
+}
+
 #[test]
 fn real_media_workflow_persists_ai_edits_and_exports_playable_video() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -167,18 +182,7 @@ fn real_media_workflow_persists_ai_edits_and_exports_playable_video() {
 
     let (endpoint, provider) = start_openai_fixture();
     let home = temp.path().join("home");
-    std::fs::create_dir_all(home.join(".lumen-cut")).expect("settings directory");
-    std::fs::write(
-        home.join(".lumen-cut/settings.json"),
-        serde_json::json!({
-            "llmEndpoint": endpoint,
-            "llmApiKey": "",
-            "llmModel": "e2e-fixture",
-            "workerCount": 1,
-        })
-        .to_string(),
-    )
-    .expect("provider settings");
+    write_provider_settings(&home, &endpoint);
     let translated = cli()
         .args([
             "--json",
@@ -269,6 +273,30 @@ fn real_media_workflow_persists_ai_edits_and_exports_playable_video() {
     ] {
         assert_success(&output, label);
     }
+
+    // Editing the source line ("world" → "universe") makes the zh-Hans track
+    // stale, and the default bilingual export refuses stale lines — refresh
+    // the translation first, exactly what the export error tells users to do.
+    let (retranslate_endpoint, retranslate_provider) = start_openai_fixture();
+    write_provider_settings(&home, &retranslate_endpoint);
+    let retranslated = cli()
+        .args([
+            "--json",
+            "task",
+            "start",
+            "translate",
+            "interview",
+            "--lang",
+            "zh-Hans",
+            "--root",
+        ])
+        .arg(&projects)
+        .env("HOME", &home)
+        .output()
+        .expect("run retranslation task");
+    let retranslated = json_output(retranslated, "retranslation task");
+    assert_eq!(retranslated["pending"], 1);
+    retranslate_provider.join().expect("provider fixture");
 
     let broll_added = cli()
         .args(["--json", "broll"])
