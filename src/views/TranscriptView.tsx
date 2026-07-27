@@ -851,36 +851,49 @@ export function TranscriptView({
   }, [brollDrafts, newBrollPlacementDirty, subtitleStyleDirty]);
 
   const previewRows = useMemo(() => {
-    // Program monitor follows export caption content so bilingual delivery is visible.
+    const projectCaptionRows = (
+      language: string,
+      mode: "bilingual" | "translation",
+    ) => {
+      const track = doc?.translations[language];
+      if (!track) return null;
+      return subtitleRows.map((row) => {
+        const translation = track[row.id]?.text?.trim();
+        if (!translation) return row;
+        if (mode === "bilingual") {
+          return { ...row, text: `${row.text}\n${translation}` };
+        }
+        return { ...row, text: translation };
+      });
+    };
+
+    // Explicit export caption content wins (matches final delivery).
     if (
       doc
       && videoExportSettings.subtitleMode !== "none"
       && videoExportSettings.subtitleLanguage
     ) {
-      const track = doc.translations[videoExportSettings.subtitleLanguage];
-      if (track) {
-        return subtitleRows.map((row) => {
-          const translation = track[row.id]?.text?.trim();
-          if (!translation) return row;
-          if (videoExportSettings.bilingualSubtitles) {
-            return { ...row, text: `${row.text}\n${translation}` };
-          }
-          return { ...row, text: translation };
-        });
-      }
+      const projected = projectCaptionRows(
+        videoExportSettings.subtitleLanguage,
+        videoExportSettings.bilingualSubtitles ? "bilingual" : "translation",
+      );
+      if (projected) return projected;
     }
-    // Translate workspace override when export caption track is still source-only.
-    if (!doc || activeTab !== "translate" || !previewTranslationLanguage) {
-      return subtitleRows;
+
+    // Translate workspace / known target language: 中英对照 (原文 + 译文).
+    const monitorLanguage = previewTranslationLanguage
+      || (doc
+        ? Object.keys(doc.translations).find(
+          (code) => code === "zh-Hans" || code === "zh" || code.startsWith("zh"),
+        ) || Object.keys(doc.translations)[0]
+        : null);
+    if (doc && monitorLanguage && videoExportSettings.subtitleMode !== "none") {
+      const bilingual = projectCaptionRows(monitorLanguage, "bilingual");
+      if (bilingual) return bilingual;
     }
-    const track = doc.translations[previewTranslationLanguage];
-    if (!track) return subtitleRows;
-    return subtitleRows.map((row) => ({
-      ...row,
-      text: track[row.id]?.text || row.text,
-    }));
+
+    return subtitleRows;
   }, [
-    activeTab,
     doc,
     previewTranslationLanguage,
     subtitleRows,
