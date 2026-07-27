@@ -9804,14 +9804,31 @@ mod tests {
             encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
             ..Default::default()
         };
-        let blocked = export_preflight_impl("p1", settings.clone(), Some(tmp.path().to_path_buf()))
-            .await
-            .unwrap();
+        // A missing pinned translation track only blocks explicit
+        // translation-only delivery; bilingual falls back to source captions
+        // instead of blocking the export (cd3bda5).
+        let blocked = export_preflight_impl(
+            "p1",
+            crate::data::export_settings::VideoExportSettings {
+                caption_style: crate::data::export_settings::ExportCaptionStyle::Translation,
+                ..settings.clone()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
         assert!(!blocked.ready);
         assert!(blocked
             .items
             .iter()
             .any(|item| item.code == "captions" && item.level == "blocker"));
+
+        // The same missing track under bilingual delivery is not a blocker.
+        let fallback =
+            export_preflight_impl("p1", settings.clone(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap();
+        assert!(fallback.ready, "{:?}", fallback.items);
 
         crate::data::subtitle::hide(&project, "s1").unwrap();
         let ready = export_preflight_impl("p1", settings, Some(tmp.path().to_path_buf()))
