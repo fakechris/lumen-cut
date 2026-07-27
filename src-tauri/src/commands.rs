@@ -7610,7 +7610,7 @@ pub async fn performance_status() -> PerformanceStatus {
     }
 }
 
-/// Burn-in export: write export.ass then ffmpeg → export.mp4.
+/// Burn-in export: write `{stem}.ass` then ffmpeg → `{stem}.mp4` (see `export::naming`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoExportJobStatus {
@@ -7730,13 +7730,16 @@ async fn export_video_impl(
     let _heavy_work = crate::performance::acquire_heavy("video-export").await?;
     let dir = resolve_project_dir(&pid, root)?;
     let probe_dir = dir.clone();
-    let media_path = run_blocking("load video export media", move || {
-        Ok(Doc::load(&probe_dir)?.media.path)
+    let (media_path, project_title) = run_blocking("load video export media", move || {
+        let doc = Doc::load(&probe_dir)?;
+        Ok((doc.media.path.clone(), doc.meta.title.clone()))
     })
     .await?;
+    let export_stem = crate::export::naming::export_file_stem(&project_title, chrono::Local::now());
     let media_info = crate::media::probe(&media_path).await?;
     let source_dimensions = media_info.width.zip(media_info.height);
     let prepare_dir = dir.clone();
+    let prepare_stem = export_stem.clone();
     let prepare_started = std::time::Instant::now();
     let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings) = {
         // Hold the project mutation lock only while taking an export snapshot.
@@ -7750,7 +7753,7 @@ async fn export_video_impl(
             };
             settings.validate()?;
             let cuts = load_project_cuts(&prepare_dir)?;
-            let ass = prepare_dir.join("export.ass");
+            let ass = prepare_dir.join(format!("{prepare_stem}.ass"));
             let titles = crate::data::title::load(&prepare_dir)?;
             let style = crate::data::substyle::SubStyle::load(&prepare_dir)?;
             let hidden = crate::data::subtitle::load_hidden_checked(&prepare_dir)?;
@@ -7797,7 +7800,7 @@ async fn export_video_impl(
             };
             let soft_subtitle = (settings.subtitle_mode
                 == crate::data::export_settings::ExportSubtitleMode::Soft)
-                .then(|| prepare_dir.join("export-soft.srt"));
+                .then(|| prepare_dir.join(format!("{prepare_stem}-soft.srt")));
             if let Some(path) = &soft_subtitle {
                 crate::export::write_srt_with(&caption_doc, &cuts.cuts, path)?;
             }
@@ -7837,8 +7840,9 @@ async fn export_video_impl(
         render_path = ?path_kind,
         "video export preparation finished"
     );
-    let output = dir.join(format!("export.{}", settings.extension()));
-    let in_progress = dir.join(format!("export.in-progress.{}", settings.extension()));
+    let output =
+        crate::export::naming::unique_export_path(&dir, &export_stem, settings.extension());
+    let in_progress = crate::export::naming::in_progress_path(&output);
     let _ = tokio::fs::remove_file(&in_progress).await;
     let render_started = std::time::Instant::now();
     let render = crate::export::video::render_video_with_broll_options(
@@ -8168,7 +8172,8 @@ pub async fn export_fcp(pid: String, root: Option<PathBuf>) -> AppResult<String>
     run_blocking("Final Cut export", move || {
         let doc = Doc::load(&dir)?;
         let cuts = load_project_cuts(&dir)?;
-        let path = dir.join("export.fcpxml");
+        let stem = crate::export::naming::export_file_stem(&doc.meta.title, chrono::Local::now());
+        let path = crate::export::naming::unique_export_path(&dir, &stem, "fcpxml");
         let broll = crate::data::broll::load(&dir)?;
         let titles = crate::data::title::load(&dir)?;
         crate::export::write_fcp_with_broll_titles(
@@ -8186,11 +8191,16 @@ pub async fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<V
     run_blocking("subtitle export", move || {
         let doc = Doc::load(&dir)?;
         let cuts = load_project_cuts(&dir)?;
+        let stem = crate::export::naming::unique_export_stem(
+            &dir,
+            &crate::export::naming::export_file_stem(&doc.meta.title, chrono::Local::now()),
+            "srt",
+        );
         let paths = [
-            dir.join("export.srt"),
-            dir.join("export.vtt"),
-            dir.join("export.ass"),
-            dir.join("export.md"),
+            dir.join(format!("{stem}.srt")),
+            dir.join(format!("{stem}.vtt")),
+            dir.join(format!("{stem}.ass")),
+            dir.join(format!("{stem}.md")),
         ];
         let style = crate::data::substyle::SubStyle::load(&dir)?;
         let settings = crate::data::export_settings::load(&dir)?;
@@ -9459,10 +9469,15 @@ mod tests {
         .await
         .unwrap();
         assert!(project.join("style.json").exists());
-        export_subtitles("p1".into(), Some(tmp.path().to_path_buf()))
+        let exported_paths = export_subtitles("p1".into(), Some(tmp.path().to_path_buf()))
             .await
             .unwrap();
-        let exported_ass = std::fs::read_to_string(project.join("export.ass")).unwrap();
+        let ass_path = exported_paths
+            .iter()
+            .find(|path| path.ends_with(".ass"))
+            .expect("subtitle export should include an .ass path");
+        assert!(ass_path.contains("Interview-"), "got {ass_path}");
+        let exported_ass = std::fs::read_to_string(ass_path).unwrap();
         assert!(exported_ass.contains("Style: Default,Arial,58,"));
         assert!(exported_ass.contains(",-1,0,0,0,100,100"));
         assert!(exported_ass.contains("Hello\\N你好"));
@@ -9789,14 +9804,31 @@ mod tests {
             encoding_speed: crate::data::export_settings::ExportEncodingSpeed::Quality,
             ..Default::default()
         };
-        let blocked = export_preflight_impl("p1", settings.clone(), Some(tmp.path().to_path_buf()))
-            .await
-            .unwrap();
+        // A missing pinned translation track only blocks explicit
+        // translation-only delivery; bilingual falls back to source captions
+        // instead of blocking the export (cd3bda5).
+        let blocked = export_preflight_impl(
+            "p1",
+            crate::data::export_settings::VideoExportSettings {
+                caption_style: crate::data::export_settings::ExportCaptionStyle::Translation,
+                ..settings.clone()
+            },
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
         assert!(!blocked.ready);
         assert!(blocked
             .items
             .iter()
             .any(|item| item.code == "captions" && item.level == "blocker"));
+
+        // The same missing track under bilingual delivery is not a blocker.
+        let fallback =
+            export_preflight_impl("p1", settings.clone(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap();
+        assert!(fallback.ready, "{:?}", fallback.items);
 
         crate::data::subtitle::hide(&project, "s1").unwrap();
         let ready = export_preflight_impl("p1", settings, Some(tmp.path().to_path_buf()))

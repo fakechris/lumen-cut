@@ -413,7 +413,15 @@ fn export_srt_flag_writes_only_selected_output_path() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("export json");
     assert!(out.is_file(), "expected {}", out.display());
-    assert!(!temp.path().join("export.vtt").exists());
+    assert!(
+        !std::fs::read_dir(temp.path()).unwrap().any(|entry| entry
+            .as_ref()
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "vtt")),
+        "no .vtt artifact should be written for an srt-only export"
+    );
     assert_eq!(
         value["artifacts"]["srt"].as_str(),
         Some(out.to_str().unwrap())

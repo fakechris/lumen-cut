@@ -325,12 +325,20 @@ pub fn prepare_task_with_task_options(
             failed_path,
         });
     }
+    // A task with no payloads has nothing to run; record it as completed so
+    // status readers never report a phantom "running" task. Auto phase-2
+    // align hits this whenever no translated line is over fit.
+    let state = if calls.is_empty() {
+        "completed"
+    } else {
+        "running"
+    };
     crate::data::storage::write_json(
         &ai_dir.join("task.json"),
         &serde_json::json!({
             "kind": kind,
             "lang": lang,
-            "state": "running",
+            "state": state,
             "runId": &run_id,
             "staleOnly": options.stale_only,
             "groups": &options.groups,
@@ -3068,6 +3076,24 @@ mod tests {
             "translations": translations,
         })
         .to_string()
+    }
+
+    #[test]
+    fn empty_task_is_recorded_as_completed_instead_of_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doc = sample_doc();
+        doc.paragraphs.clear();
+        doc.save(tmp.path()).unwrap();
+        let task = prepare_task(tmp.path(), "translate", Some("zh")).unwrap();
+        assert!(task.calls.is_empty());
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("ai/translate/task.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["state"], "completed");
+        let statuses = task_kind_statuses(tmp.path());
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, "completed");
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 pub mod ass;
 pub mod fcp;
 pub mod markdown;
+pub mod naming;
 pub mod project;
 pub mod srt_vtt;
 pub mod video;
