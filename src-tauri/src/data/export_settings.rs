@@ -374,13 +374,20 @@ pub fn project_caption_doc_for_settings(
     let available: Vec<&str> = doc.translations.keys().map(String::as_str).collect();
     let language = resolve_subtitle_language(settings, available.iter().copied());
     let Some(language) = language else {
-        if settings.wants_source_only() {
-            return project_caption_doc_with_hidden(doc, None, false, hidden);
-        }
-        return Err(AppError::Schema(
-            "caption style needs a translation track; translate the project first".into(),
-        ));
+        // Default is bilingual, but many projects export before translate.
+        // Fall back to source instead of blocking the whole export path.
+        return project_caption_doc_with_hidden(doc, None, false, hidden);
     };
+    // If the pinned language track is missing entirely, surface a clear error
+    // only for explicit translation-only delivery.
+    if settings.wants_translation_only() && !doc.translations.contains_key(&language) {
+        return Err(AppError::Schema(format!(
+            "translation track `{language}` does not exist; translate the project before exporting"
+        )));
+    }
+    if settings.wants_bilingual() && !doc.translations.contains_key(&language) {
+        return project_caption_doc_with_hidden(doc, None, false, hidden);
+    }
     project_caption_doc_with_hidden(
         doc,
         Some(language.as_str()),
