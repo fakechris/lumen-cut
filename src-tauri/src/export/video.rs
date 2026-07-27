@@ -1043,11 +1043,13 @@ fn encoder_args(
             "yuv420p".into(),
         ];
         // Match-source + known bitrate: constrain rate instead of high fixed q.
+        // Re-encoding with a (usually less efficient) encoder at the source
+        // bitrate visibly degrades quality, so target 1.5x the source rate.
         let use_bitrate = purpose == RenderPurpose::Final
             && speed == ExportEncodingSpeed::MatchSource
             && source_bitrate.is_some_and(|br| br >= 100_000);
         if use_bitrate {
-            let br = source_bitrate.unwrap();
+            let br = source_bitrate.unwrap().saturating_mul(3) / 2;
             let maxrate = ((br as f64) * 1.25).round() as u64;
             let bufsize = br.saturating_mul(2);
             args.extend([
@@ -1063,7 +1065,8 @@ fn encoder_args(
                 (RenderPurpose::Preview, _) => "55",
                 // Was 65 (near-master); 58 is still clean but much smaller.
                 (RenderPurpose::Final, ExportEncodingSpeed::Fast) => "58",
-                (RenderPurpose::Final, ExportEncodingSpeed::MatchSource) => "60",
+                // Was 60; 70 preserves more source detail when bitrate is unknown.
+                (RenderPurpose::Final, ExportEncodingSpeed::MatchSource) => "70",
                 (RenderPurpose::Final, ExportEncodingSpeed::Quality) => "55",
             };
             args.extend(["-q:v".into(), quality.into()]);
@@ -1088,7 +1091,9 @@ fn encoder_args(
             && source_bitrate.is_some_and(|br| br >= 100_000);
         let mut args = vec!["-c:v".into(), encoder.into()];
         if use_bitrate {
-            let br = source_bitrate.unwrap();
+            // Same 1.5x headroom as the VideoToolbox path above: re-encoding
+            // at the source bitrate loses visible quality.
+            let br = source_bitrate.unwrap().saturating_mul(3) / 2;
             let maxrate = ((br as f64) * 1.25).round() as u64;
             let bufsize = br.saturating_mul(2);
             let preset = "veryfast";
@@ -1713,7 +1718,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             ExportEncodingSpeed::MatchSource,
             Some(2_000_000),
         );
-        assert!(args.windows(2).any(|pair| pair == ["-b:v", "2000000"]));
+        assert!(args.windows(2).any(|pair| pair == ["-b:v", "3000000"]));
         assert!(!args.windows(2).any(|pair| pair[0] == "-crf"));
     }
 

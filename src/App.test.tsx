@@ -663,9 +663,9 @@ beforeEach(() => {
       case "export_preflight":
         return exportPreflightState;
       case "export_subtitles":
-        return ["/projects/project-1/export.srt"];
+        return ["/projects/project-1/Interview-20260727-094533.srt"];
       case "export_video":
-        return "/projects/project-1/export.mp4";
+        return "/projects/project-1/Interview-20260727-094533.mp4";
       case "video_export_start":
         videoExportHasExistingJob = true;
         return videoExportStatusState;
@@ -683,7 +683,7 @@ beforeEach(() => {
       case "setup_job_cancel":
         return { ...setupJobStatusState, state: "cancelling", phase: "cancelling" };
       case "export_fcp":
-        return "/projects/project-1/export.fcpxml";
+        return "/projects/project-1/Interview-20260727-094533.fcpxml";
       case "project_reveal":
         return "/projects/project-1";
       case "style_get":

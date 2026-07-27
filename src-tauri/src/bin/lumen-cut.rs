@@ -3250,6 +3250,25 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     let want_ass = write_all_text || cmd.ass || cmd.video; // video burn-in needs ASS
     let want_md = write_all_text || cmd.markdown;
 
+    // Default artifact names share one timestamped stem so a new export never
+    // silently overwrites earlier deliverables in the project directory.
+    let export_stem =
+        lumen_cut::export::naming::export_file_stem(&doc.meta.title, chrono::Local::now());
+    let probe_ext = if cmd.video {
+        "mp4"
+    } else if want_srt {
+        "srt"
+    } else if want_vtt {
+        "vtt"
+    } else if want_ass {
+        "ass"
+    } else if want_md {
+        "md"
+    } else {
+        "fcpxml"
+    };
+    let export_stem = lumen_cut::export::naming::unique_export_stem(&dir, &export_stem, probe_ext);
+
     let single_text = [cmd.srt, cmd.vtt, cmd.ass, cmd.markdown, cmd.video, cmd.fcp]
         .into_iter()
         .filter(|f| *f)
@@ -3290,7 +3309,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
 
     let mut artifacts = serde_json::Map::new();
     if want_srt {
-        let path = resolve("export.srt", "srt");
+        let path = resolve(&format!("{export_stem}.srt"), "srt");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -3298,7 +3317,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
         artifacts.insert("srt".into(), serde_json::json!(path));
     }
     if want_vtt {
-        let path = resolve("export.vtt", "vtt");
+        let path = resolve(&format!("{export_stem}.vtt"), "vtt");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -3308,7 +3327,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     let style = lumen_cut::data::substyle::SubStyle::load(&dir)?;
     let mut ass_path_for_video: Option<PathBuf> = None;
     if want_ass {
-        let path = resolve("export.ass", "ass");
+        let path = resolve(&format!("{export_stem}.ass"), "ass");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -3317,7 +3336,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
         artifacts.insert("ass".into(), serde_json::json!(path));
     }
     if want_md {
-        let path = resolve("export.md", "md");
+        let path = resolve(&format!("{export_stem}.md"), "md");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -3333,7 +3352,7 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
 
     let broll = lumen_cut::data::broll::load(&dir)?;
     if cmd.fcp {
-        let path = resolve("export.fcpxml", "fcpxml");
+        let path = resolve(&format!("{export_stem}.fcpxml"), "fcpxml");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -3341,11 +3360,11 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
         artifacts.insert("fcp".into(), serde_json::json!(path));
     }
     if cmd.video {
-        let ass_path = ass_path_for_video.unwrap_or_else(|| dir.join("export.ass"));
+        let ass_path = ass_path_for_video.unwrap_or_else(|| dir.join(format!("{export_stem}.ass")));
         if !ass_path.exists() {
             write_ass_with_style(&caption_doc, &cuts.cuts, &style, &ass_path, 1920, 1080)?;
         }
-        let mp4 = resolve("export.mp4", "mp4");
+        let mp4 = resolve(&format!("{export_stem}.mp4"), "mp4");
         if let Some(parent) = mp4.parent() {
             std::fs::create_dir_all(parent)?;
         }

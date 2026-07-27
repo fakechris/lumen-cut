@@ -1512,7 +1512,7 @@ export function TranscriptView({
           setVideoExportJob(status);
           setFeedback({
             tone: "info",
-            text: lang === "zh" ? "视频导出已取消，原有导出文件未被覆盖。" : "Video export cancelled; the previous export was preserved.",
+            text: lang === "zh" ? "视频导出已取消，未生成新文件；已有导出文件不受影响。" : "Video export cancelled; no new file was created and existing exports were left untouched.",
           });
           return;
         }

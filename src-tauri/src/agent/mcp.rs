@@ -222,18 +222,31 @@ fn call_tool(name: &str, args: &Value) -> AppResult<String> {
             let caption_doc = crate::data::export_settings::project_caption_doc_for_settings(
                 &doc, &settings, &hidden,
             )?;
-            crate::export::write_srt_with(&caption_doc, &cuts.cuts, &dir.join("export.srt"))?;
-            crate::export::write_vtt_with(&caption_doc, &cuts.cuts, &dir.join("export.vtt"))?;
+            let stem = crate::export::naming::unique_export_stem(
+                &dir,
+                &crate::export::naming::export_file_stem(&doc.meta.title, chrono::Local::now()),
+                "srt",
+            );
+            crate::export::write_srt_with(
+                &caption_doc,
+                &cuts.cuts,
+                &dir.join(format!("{stem}.srt")),
+            )?;
+            crate::export::write_vtt_with(
+                &caption_doc,
+                &cuts.cuts,
+                &dir.join(format!("{stem}.vtt")),
+            )?;
             let style = crate::data::substyle::SubStyle::load(&dir)?;
             crate::export::write_ass_with_style(
                 &caption_doc,
                 &cuts.cuts,
                 &style,
-                &dir.join("export.ass"),
+                &dir.join(format!("{stem}.ass")),
                 1920,
                 1080,
             )?;
-            crate::export::write_md_with(&doc, &cuts.cuts, &dir.join("export.md"))?;
+            crate::export::write_md_with(&doc, &cuts.cuts, &dir.join(format!("{stem}.md")))?;
             crate::data::cues::save(&dir, &crate::data::cues::to_cues(&doc, None))?;
             Ok(format!("exported srt+vtt+ass+md+cues to {}", dir.display()))
         }
@@ -321,9 +334,21 @@ mod tests {
         });
         let result = call_tool("export", &args).unwrap();
         assert!(result.contains(&project.display().to_string()));
-        assert!(project.join("export.srt").exists());
+        let files: Vec<String> = std::fs::read_dir(&project)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let srt = files
+            .iter()
+            .find(|name| name.ends_with(".srt"))
+            .expect("timestamped .srt export");
+        assert!(srt.starts_with("demo-"), "got {srt}");
+        let ass = files
+            .iter()
+            .find(|name| name.ends_with(".ass"))
+            .expect("timestamped .ass export");
         assert!(project.join("cues.json").exists());
-        assert!(std::fs::read_to_string(project.join("export.ass"))
+        assert!(std::fs::read_to_string(project.join(ass))
             .unwrap()
             .contains("Style: Default,Courier New,66,"));
     }

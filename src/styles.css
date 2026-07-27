@@ -6515,6 +6515,7 @@ pre.out {
 }
 
 .editor-view > .export-layout.export-layout-split {
+  align-items: stretch;
   display: grid;
   gap: 14px;
   grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.9fr);
@@ -6552,6 +6553,8 @@ pre.out {
 @media (max-width: 1100px) {
   .editor-view > .export-layout.export-layout-split {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    overflow: auto;
   }
 }
 

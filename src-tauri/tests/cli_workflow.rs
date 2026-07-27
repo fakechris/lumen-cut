@@ -305,8 +305,12 @@ fn real_media_workflow_persists_ai_edits_and_exports_playable_video() {
         "video export",
     );
     assert_eq!(exported["cuts"], 1);
-    let output = project.join("export.mp4");
-    assert!(output.is_file());
+    let output = std::path::PathBuf::from(
+        exported["artifacts"]["video"]
+            .as_str()
+            .expect("video artifact path"),
+    );
+    assert!(output.is_file(), "expected {}", output.display());
     let probe = Command::new("ffprobe")
         .args([
             "-v",
