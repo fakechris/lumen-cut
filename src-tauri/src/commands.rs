@@ -5707,11 +5707,8 @@ async fn export_preflight_impl(
             message: "video export is configured without captions".into(),
         });
     } else {
-        match crate::data::export_settings::project_caption_doc_with_hidden(
-            &doc,
-            settings.subtitle_language.as_deref(),
-            settings.bilingual_subtitles,
-            &hidden,
+        match crate::data::export_settings::project_caption_doc_for_settings(
+            &doc, &settings, &hidden,
         ) {
             Ok(_) => items.push(ExportPreflightItem {
                 code: "captions".into(),
@@ -6355,11 +6352,8 @@ async fn broll_preview_impl(
                 let style = crate::data::substyle::SubStyle::load(&prepare_dir)?;
                 let settings = crate::data::export_settings::load(&prepare_dir)?;
                 let hidden = crate::data::subtitle::load_hidden_checked(&prepare_dir)?;
-                let caption_doc = crate::data::export_settings::project_caption_doc_with_hidden(
-                    &doc,
-                    settings.subtitle_language.as_deref(),
-                    settings.bilingual_subtitles,
-                    &hidden,
+                let caption_doc = crate::data::export_settings::project_caption_doc_for_settings(
+                    &doc, &settings, &hidden,
                 )?;
                 crate::export::write_ass_with_style(
                     &caption_doc,
@@ -7765,11 +7759,8 @@ async fn export_video_impl(
             {
                 doc.clone()
             } else {
-                crate::data::export_settings::project_caption_doc_with_hidden(
-                    &doc,
-                    settings.subtitle_language.as_deref(),
-                    settings.bilingual_subtitles,
-                    &hidden,
+                crate::data::export_settings::project_caption_doc_for_settings(
+                    &doc, &settings, &hidden,
                 )?
             };
             let (canvas_width, canvas_height) =
@@ -8204,11 +8195,8 @@ pub async fn export_subtitles(pid: String, root: Option<PathBuf>) -> AppResult<V
         let style = crate::data::substyle::SubStyle::load(&dir)?;
         let settings = crate::data::export_settings::load(&dir)?;
         let hidden = crate::data::subtitle::load_hidden_checked(&dir)?;
-        let caption_doc = crate::data::export_settings::project_caption_doc_with_hidden(
-            &doc,
-            settings.subtitle_language.as_deref(),
-            settings.bilingual_subtitles,
-            &hidden,
+        let caption_doc = crate::data::export_settings::project_caption_doc_for_settings(
+            &doc, &settings, &hidden,
         )?;
         crate::export::write_srt_with(&caption_doc, &cuts.cuts, &paths[0])?;
         crate::export::write_vtt_with(&caption_doc, &cuts.cuts, &paths[1])?;

@@ -201,11 +201,56 @@ const DEFAULT_VIDEO_EXPORT_SETTINGS: VideoExportSettings = {
   aspectRatio: "source",
   canvasFit: "contain",
   subtitleMode: "burn",
+  captionStyle: "bilingual",
   subtitleLanguage: null,
-  bilingualSubtitles: false,
+  bilingualSubtitles: true,
   audioCodec: "aac",
   encodingSpeed: "match-source",
 };
+
+function preferredTranslationLanguage(languages: string[]): string | null {
+  return languages.find((code) => code === "zh-Hans" || code === "zh" || code.startsWith("zh"))
+    || languages[0]
+    || null;
+}
+
+/** Keep captionStyle / bilingualSubtitles in sync; recover legacy source-only files. */
+function normalizeVideoExportSettings(
+  settings: Partial<VideoExportSettings> | null | undefined,
+  translationLanguages: string[] = [],
+): VideoExportSettings {
+  const merged: VideoExportSettings = {
+    ...DEFAULT_VIDEO_EXPORT_SETTINGS,
+    ...(settings ?? {}),
+  };
+  let captionStyle = merged.captionStyle;
+  // Old files without captionStyle deserialize as default bilingual; recover source/translation.
+  if (
+    captionStyle === "bilingual"
+    && settings
+    && !("captionStyle" in settings)
+    && settings.bilingualSubtitles === false
+  ) {
+    captionStyle = settings.subtitleLanguage ? "translation" : "source";
+  }
+  if (!captionStyle) {
+    captionStyle = merged.bilingualSubtitles
+      ? "bilingual"
+      : merged.subtitleLanguage
+        ? "translation"
+        : "source";
+  }
+  let subtitleLanguage = merged.subtitleLanguage;
+  if (captionStyle !== "source" && !subtitleLanguage) {
+    subtitleLanguage = preferredTranslationLanguage(translationLanguages);
+  }
+  return {
+    ...merged,
+    captionStyle,
+    subtitleLanguage,
+    bilingualSubtitles: captionStyle === "bilingual",
+  };
+}
 const BROLL_DRAFTS_KEY_PREFIX = "lumen-cut.brollDrafts.";
 const STYLE_DRAFTS_KEY_PREFIX = "lumen-cut.styleDrafts.";
 const INSPECTOR_PERCENT_KEY = "lumen-cut.inspectorPercent";
@@ -220,12 +265,6 @@ export function resolveTimelineCollapsed(
   if (preference === "collapsed") return true;
   if (preference === "expanded") return false;
   return compactViewport;
-}
-
-function normalizeVideoExportSettings(
-  settings: Partial<VideoExportSettings> | null | undefined,
-): VideoExportSettings {
-  return { ...DEFAULT_VIDEO_EXPORT_SETTINGS, ...(settings ?? {}) };
 }
 
 function videoCanvasSummary(settings: VideoExportSettings, lang: Lang) {
@@ -851,40 +890,52 @@ export function TranscriptView({
   }, [brollDrafts, newBrollPlacementDirty, subtitleStyleDirty]);
 
   const previewRows = useMemo(() => {
-    // Program monitor follows export caption content so bilingual delivery is visible.
-    if (
-      doc
-      && videoExportSettings.subtitleMode !== "none"
-      && videoExportSettings.subtitleLanguage
-    ) {
-      const track = doc.translations[videoExportSettings.subtitleLanguage];
-      if (track) {
-        return subtitleRows.map((row) => {
-          const translation = track[row.id]?.text?.trim();
-          if (!translation) return row;
-          if (videoExportSettings.bilingualSubtitles) {
-            return { ...row, text: `${row.text}\n${translation}` };
-          }
-          return { ...row, text: translation };
-        });
-      }
-    }
-    // Translate workspace override when export caption track is still source-only.
-    if (!doc || activeTab !== "translate" || !previewTranslationLanguage) {
+    if (!doc || videoExportSettings.subtitleMode === "none") {
       return subtitleRows;
     }
-    const track = doc.translations[previewTranslationLanguage];
-    if (!track) return subtitleRows;
-    return subtitleRows.map((row) => ({
-      ...row,
-      text: track[row.id]?.text || row.text,
-    }));
+    const projectCaptionRows = (
+      language: string,
+      mode: "bilingual" | "translation",
+    ) => {
+      const track = doc.translations[language];
+      if (!track) return null;
+      return subtitleRows.map((row) => {
+        const translation = track[row.id]?.text?.trim();
+        if (!translation) return row;
+        if (mode === "bilingual") {
+          return { ...row, text: `${row.text}\n${translation}` };
+        }
+        return { ...row, text: translation };
+      });
+    };
+
+    const style = videoExportSettings.captionStyle
+      || (videoExportSettings.bilingualSubtitles
+        ? "bilingual"
+        : videoExportSettings.subtitleLanguage
+          ? "translation"
+          : "source");
+
+    if (style === "source") {
+      return subtitleRows;
+    }
+
+    const language = videoExportSettings.subtitleLanguage
+      || previewTranslationLanguage
+      || preferredTranslationLanguage(Object.keys(doc.translations));
+    if (!language) return subtitleRows;
+
+    const projected = projectCaptionRows(
+      language,
+      style === "bilingual" ? "bilingual" : "translation",
+    );
+    return projected ?? subtitleRows;
   }, [
-    activeTab,
     doc,
     previewTranslationLanguage,
     subtitleRows,
     videoExportSettings.bilingualSubtitles,
+    videoExportSettings.captionStyle,
     videoExportSettings.subtitleLanguage,
     videoExportSettings.subtitleMode,
   ]);
@@ -902,9 +953,14 @@ export function TranscriptView({
     () => Object.keys(doc?.translations ?? {}).sort((left, right) => left.localeCompare(right)),
     [doc],
   );
-  const exportCaptionTrack = videoExportSettings.subtitleLanguage
-    ? `${videoExportSettings.bilingualSubtitles ? "bilingual" : "translation"}:${videoExportSettings.subtitleLanguage}`
-    : "source";
+  const exportCaptionStyle = videoExportSettings.captionStyle
+    || (videoExportSettings.bilingualSubtitles
+      ? "bilingual"
+      : videoExportSettings.subtitleLanguage
+        ? "translation"
+        : "source");
+  const exportCaptionLanguage = videoExportSettings.subtitleLanguage
+    || preferredTranslationLanguage(translationLanguages);
   const timelineCutIntervals = useMemo(
     () => doc ? resolveTimelineCuts(doc, cuts) : [],
     [cuts, doc],
@@ -1075,7 +1131,10 @@ export function TranscriptView({
     setTitles(nextTitles);
     setEditHistory(nextEditHistory);
     setAudioMix(nextAudioMix);
-    setVideoExportSettings(normalizeVideoExportSettings(nextExportSettings));
+    setVideoExportSettings(normalizeVideoExportSettings(
+      nextExportSettings,
+      Object.keys(nextDoc.translations ?? {}),
+    ));
     setChapters(nextChapters);
     exportSettingsProject.current = projectId;
     if (resetTab) {
@@ -3819,40 +3878,56 @@ export function TranscriptView({
                   <span>{lang === "zh" ? "字幕内容" : "Caption content"}</span>
                   <select
                     disabled={videoExportSettings.subtitleMode === "none"}
-                    value={exportCaptionTrack}
+                    value={exportCaptionStyle}
                     onChange={(event) => {
-                      const [kind, ...languageParts] = event.target.value.split(":");
-                      const subtitleLanguage = languageParts.join(":") || null;
+                      const captionStyle = event.target.value as VideoExportSettings["captionStyle"];
+                      const language = exportCaptionLanguage
+                        || preferredTranslationLanguage(translationLanguages);
                       setVideoExportSettings((current) => ({
                         ...current,
-                        subtitleLanguage,
-                        bilingualSubtitles: kind === "bilingual",
+                        captionStyle,
+                        bilingualSubtitles: captionStyle === "bilingual",
+                        subtitleLanguage: captionStyle === "source" ? null : (language || current.subtitleLanguage),
                       }));
                     }}
                   >
-                    <option value="source">
-                      {lang === "zh" ? `原文 · ${doc.meta.language || "自动"}` : `Original · ${doc.meta.language || "auto"}`}
+                    <option value="bilingual">
+                      {lang === "zh"
+                        ? `对照 · 原文 + ${exportCaptionLanguage || "译文"}（默认）`
+                        : `Bilingual · original + ${exportCaptionLanguage || "translation"} (default)`}
                     </option>
-                    {videoExportSettings.subtitleLanguage
-                      && !translationLanguages.includes(videoExportSettings.subtitleLanguage) && (
-                      <option value={exportCaptionTrack}>
-                        {lang === "zh"
-                          ? `译文不可用 · ${videoExportSettings.subtitleLanguage}`
-                          : `Translation unavailable · ${videoExportSettings.subtitleLanguage}`}
-                      </option>
-                    )}
-                    {translationLanguages.map((language) => (
-                      <option key={`translation-${language}`} value={`translation:${language}`}>
-                        {lang === "zh" ? `仅译文 · ${language}` : `Translation only · ${language}`}
-                      </option>
-                    ))}
-                    {translationLanguages.map((language) => (
-                      <option key={`bilingual-${language}`} value={`bilingual:${language}`}>
-                        {lang === "zh" ? `双语 · 原文 + ${language}` : `Bilingual · original + ${language}`}
-                      </option>
-                    ))}
+                    <option value="source">
+                      {lang === "zh"
+                        ? `只英文 · ${doc.meta.language || "原文"}`
+                        : `Source only · ${doc.meta.language || "original"}`}
+                    </option>
+                    <option value="translation" disabled={translationLanguages.length === 0}>
+                      {lang === "zh"
+                        ? `只中文 · ${exportCaptionLanguage || "译文"}`
+                        : `Translation only · ${exportCaptionLanguage || "target"}`}
+                    </option>
                   </select>
                 </label>
+                {translationLanguages.length > 1 && exportCaptionStyle !== "source" && (
+                  <label>
+                    <span>{lang === "zh" ? "译文语言" : "Translation language"}</span>
+                    <select
+                      disabled={videoExportSettings.subtitleMode === "none"}
+                      value={exportCaptionLanguage || translationLanguages[0]}
+                      onChange={(event) => {
+                        const subtitleLanguage = event.target.value;
+                        setVideoExportSettings((current) => ({
+                          ...current,
+                          subtitleLanguage,
+                        }));
+                      }}
+                    >
+                      {translationLanguages.map((language) => (
+                        <option key={language} value={language}>{language}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <label>
                   <span>{lang === "zh" ? "音频" : "Audio"}</span>
                   <select
@@ -3928,15 +4003,17 @@ export function TranscriptView({
                     ? " 字幕可在播放器中开关；标题与图形仍会渲染进画面。"
                     : " Captions remain switchable; titles and graphics are still rendered into the picture."
                   : ""}
-                {videoExportSettings.subtitleLanguage
-                  ? videoExportSettings.bilingualSubtitles
+                {exportCaptionStyle === "bilingual"
+                  ? lang === "zh"
+                    ? ` 字幕默认对照：原文 + ${exportCaptionLanguage || "译文"} 双行。`
+                    : ` Captions default to bilingual: original + ${exportCaptionLanguage || "translation"}.`
+                  : exportCaptionStyle === "translation"
                     ? lang === "zh"
-                      ? ` 字幕将按“原文 + ${videoExportSettings.subtitleLanguage}”双行输出。`
-                      : ` Captions will contain original + ${videoExportSettings.subtitleLanguage} on two lines.`
+                      ? ` 字幕仅输出译文（${exportCaptionLanguage || "目标语言"}）。`
+                      : ` Captions use translation only (${exportCaptionLanguage || "target"}).`
                     : lang === "zh"
-                      ? ` 字幕将使用 ${videoExportSettings.subtitleLanguage} 译文。`
-                      : ` Captions will use the ${videoExportSettings.subtitleLanguage} translation.`
-                  : ""}
+                      ? " 字幕仅输出原文。"
+                      : " Captions use the source language only."}
               </p>
             </fieldset>
           </div>

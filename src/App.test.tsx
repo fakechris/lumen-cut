@@ -92,6 +92,7 @@ let videoExportStatusState: {
     aspectRatio: "source" | "16:9" | "9:16" | "1:1" | "4:5";
     canvasFit: "contain" | "cover";
     subtitleMode: "burn" | "soft" | "none";
+    captionStyle: "source" | "translation" | "bilingual";
     subtitleLanguage: string | null;
     bilingualSubtitles: boolean;
     audioCodec: "aac" | "pcm";
@@ -295,8 +296,9 @@ beforeEach(() => {
       aspectRatio: "source",
       canvasFit: "contain",
       subtitleMode: "burn",
+      captionStyle: "bilingual",
       subtitleLanguage: null,
-      bilingualSubtitles: false,
+      bilingualSubtitles: true,
       audioCodec: "aac",
       encodingSpeed: "match-source",
     },
@@ -605,8 +607,9 @@ beforeEach(() => {
           aspectRatio: "source",
           canvasFit: "contain",
           subtitleMode: "burn",
+          captionStyle: "bilingual",
           subtitleLanguage: null,
-          bilingualSubtitles: false,
+          bilingualSubtitles: true,
           audioCodec: "aac",
           encodingSpeed: "match-source",
         };
@@ -2358,8 +2361,9 @@ test("video export reports hardware backend, real progress, and cancellation", a
       aspectRatio: "source",
       canvasFit: "contain",
       subtitleMode: "burn",
+      captionStyle: "bilingual",
       subtitleLanguage: null,
-      bilingualSubtitles: false,
+      bilingualSubtitles: true,
       audioCodec: "aac",
       encodingSpeed: "match-source",
     },
@@ -2410,7 +2414,7 @@ test("professional video export keeps compatible container, codec, subtitle, and
   fireEvent.change(screen.getByLabelText("源画面适配"), { target: { value: "cover" } });
   fireEvent.change(screen.getByLabelText("字幕"), { target: { value: "soft" } });
   fireEvent.change(screen.getByLabelText("字幕内容"), {
-    target: { value: "bilingual:zh-Hans" },
+    target: { value: "bilingual" },
   });
   fireEvent.change(screen.getByLabelText("音频"), { target: { value: "pcm" } });
   await waitFor(() => expect(invoke).toHaveBeenCalledWith("export_preflight", {
@@ -2422,6 +2426,7 @@ test("professional video export keeps compatible container, codec, subtitle, and
       aspectRatio: "9:16",
       canvasFit: "cover",
       subtitleMode: "soft",
+      captionStyle: "bilingual",
       subtitleLanguage: "zh-Hans",
       bilingualSubtitles: true,
       audioCodec: "pcm",
@@ -2444,6 +2449,7 @@ test("professional video export keeps compatible container, codec, subtitle, and
       aspectRatio: "9:16",
       canvasFit: "cover",
       subtitleMode: "soft",
+      captionStyle: "bilingual",
       subtitleLanguage: "zh-Hans",
       bilingualSubtitles: true,
       audioCodec: "pcm",
