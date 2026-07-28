@@ -220,6 +220,26 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         stale_only: bool,
     },
+    /// Import a `lumen-transcript.v1` file (from lumen-navi / lumen-asr /
+    /// diar-rs) as a new project, skipping ASR entirely.
+    ///
+    /// When the transcript's `media.path` is missing on disk the project is
+    /// still created, pending relink from the app.
+    Import {
+        /// Path of the `lumen-transcript.v1` JSON file.
+        #[arg(long)]
+        transcript: PathBuf,
+        /// Bind this media file instead of the transcript's `media.path`.
+        #[arg(long)]
+        media: Option<PathBuf>,
+        /// Project id; defaults to the transcript file stem.
+        #[arg(long)]
+        pid: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
     /// Drive one of the eight agent task contracts.
     Task {
         #[command(subcommand)]
@@ -933,6 +953,58 @@ async fn run_cli() -> AppResult<()> {
                 result.polished,
                 result.translated.as_deref().unwrap_or("-"),
                 result.cuts_added
+            );
+        }
+        Cmd::Import {
+            transcript,
+            media,
+            pid,
+            title,
+            root,
+        } => {
+            let pid = match pid.filter(|pid| !pid.trim().is_empty()) {
+                Some(pid) => pid,
+                None => {
+                    lumen_cut::commands::transcript_default_pid(&transcript).ok_or_else(|| {
+                        AppError::Schema(
+                            "cannot derive a project id from the transcript file name; pass --pid"
+                                .into(),
+                        )
+                    })?
+                }
+            };
+            std::fs::create_dir_all(&root)?;
+            let dir = root.join(&pid);
+            let outcome = lumen_cut::import::import_transcript_file(
+                &dir,
+                lumen_cut::import::ImportOptions {
+                    transcript,
+                    media,
+                    pid,
+                    title,
+                },
+            )
+            .await?;
+            if !json {
+                if let Some(issue) = &outcome.media_issue {
+                    eprintln!("note: {issue}");
+                }
+            }
+            emit!(
+                json,
+                &outcome,
+                "✓ imported {} → {}: paragraphs={} sentences={} words={} speakers={} media={}",
+                outcome.pid,
+                outcome.dir.display(),
+                outcome.paragraphs,
+                outcome.sentences,
+                outcome.words,
+                outcome.speakers.len(),
+                if outcome.media_bound {
+                    "bound"
+                } else {
+                    "pending relink"
+                }
             );
         }
         Cmd::Task { action } => match action {
@@ -3479,6 +3551,39 @@ mod tests {
             Cmd::Project {
                 action: ProjectCmd::Create { root, .. },
             } => assert_eq!(root, PathBuf::from("/tmp/projects")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_parses_transcript_media_and_root_flags() {
+        let cli = Cli::try_parse_from([
+            "lumen-cut-cli",
+            "import",
+            "--transcript",
+            "/tmp/standup.lumen-transcript.json",
+            "--media",
+            "/tmp/standup.mp4",
+            "--root",
+            "/tmp/projects",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Import {
+                transcript,
+                media,
+                pid,
+                root,
+                ..
+            } => {
+                assert_eq!(
+                    transcript,
+                    PathBuf::from("/tmp/standup.lumen-transcript.json")
+                );
+                assert_eq!(media, Some(PathBuf::from("/tmp/standup.mp4")));
+                assert_eq!(pid, None);
+                assert_eq!(root, PathBuf::from("/tmp/projects"));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

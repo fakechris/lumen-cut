@@ -484,6 +484,70 @@ pub async fn project_create(args: CreateProjectArgs) -> AppResult<ProjectSummary
     })
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImportTranscriptArgs {
+    /// Path of a `lumen-transcript.v1` interchange file.
+    pub transcript: PathBuf,
+    /// Bind this media file instead of the transcript's `media.path`.
+    pub media: Option<PathBuf>,
+    /// Project id; defaults to the transcript file stem.
+    pub pid: Option<String>,
+    pub title: Option<String>,
+    pub root: Option<PathBuf>,
+}
+
+/// Derive a project id from an interchange file name:
+/// `standup.lumen-transcript.json` → `standup`.
+pub fn transcript_default_pid(transcript: &std::path::Path) -> Option<String> {
+    let stem = transcript.file_stem()?.to_string_lossy().into_owned();
+    let stem = stem
+        .strip_suffix(".lumen-transcript")
+        .unwrap_or(&stem)
+        .trim()
+        .to_string();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// "Import from Navi/Voice": build a project from a `lumen-transcript.v1`
+/// file, skipping ASR entirely. Missing media leaves the project in the
+/// pending-relink state that `project_media_status`/`project_media_relink`
+/// already handle.
+#[tauri::command]
+pub async fn import_transcript(args: ImportTranscriptArgs) -> AppResult<ProjectSummary> {
+    let pid = match args.pid.filter(|pid| !pid.trim().is_empty()) {
+        Some(pid) => pid,
+        None => transcript_default_pid(&args.transcript).ok_or_else(|| {
+            AppError::Schema("cannot derive a project id from the transcript file name".into())
+        })?,
+    };
+    let root = resolve_project_root(args.root.clone());
+    tokio::fs::create_dir_all(&root).await?;
+    let dir = resolve_project_dir(&pid, args.root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    let outcome = crate::import::import_transcript_file(
+        &dir,
+        crate::import::ImportOptions {
+            transcript: args.transcript,
+            media: args.media,
+            pid,
+            title: args.title,
+        },
+    )
+    .await?;
+    let doc = run_blocking("imported project load", {
+        let dir = dir.clone();
+        move || Doc::load(&dir)
+    })
+    .await?;
+    tracing::info!(
+        pid = %outcome.pid,
+        dir = %dir.display(),
+        media_bound = outcome.media_bound,
+        "imported lumen-transcript.v1 project"
+    );
+    Ok(project_summary(dir, &doc))
+}
+
 #[tauri::command]
 pub async fn project_show(pid: String, root: Option<PathBuf>) -> AppResult<Doc> {
     let dir = resolve_project_dir(&pid, root)?;

@@ -46,7 +46,11 @@ tracing-appender = "0.2"
 # Shared Lumen model discovery: reuse Qwen3-ASR weights installed by lumen-asr
 # (app dir or HF cache) instead of re-downloading per product. The `download`
 # feature (SenseVoice installer) is not needed here.
-lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "965d3b68411f8e04bb3675b58d6c16b4b8eba646", default-features = false }
+lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef449465d18865d3d819309a64b1e723ae329817", default-features = false }
+# Shared serde types for the lumen-transcript.v1 interchange format
+# ("Import from Navi/Voice"). Same suite rev as lumen-models so the two
+# git dependencies resolve to a single checkout.
+lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef449465d18865d3d819309a64b1e723ae329817" }
 
 [dev-dependencies]
 tempfile = "3"
