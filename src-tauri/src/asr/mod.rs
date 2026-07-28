@@ -1012,7 +1012,12 @@ mod tests {
 
         // Incomplete snapshot: fall back to the repo id (sidecar downloads).
         let unresolved = local_qwen_model_dir(SHARED_QWEN_MODEL_ID);
-        for name in ["config.json", "model.safetensors", "vocab.json", "merges.txt"] {
+        for name in [
+            "config.json",
+            "model.safetensors",
+            "vocab.json",
+            "merges.txt",
+        ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         let resolved = local_qwen_model_dir(SHARED_QWEN_MODEL_ID);
