@@ -2025,6 +2025,7 @@ dependencies = [
  "futures",
  "libc",
  "lumen-models",
+ "lumen-transcript",
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",
@@ -2048,12 +2049,21 @@ dependencies = [
 [[package]]
 name = "lumen-models"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=965d3b68411f8e04bb3675b58d6c16b4b8eba646#965d3b68411f8e04bb3675b58d6c16b4b8eba646"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=ef449465d18865d3d819309a64b1e723ae329817#ef449465d18865d3d819309a64b1e723ae329817"
 dependencies = [
  "fs2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lumen-transcript"
+version = "0.1.0"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=ef449465d18865d3d819309a64b1e723ae329817#ef449465d18865d3d819309a64b1e723ae329817"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

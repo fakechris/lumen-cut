@@ -13,6 +13,7 @@ pub mod diarize;
 pub mod doctor;
 pub mod error;
 pub mod export;
+pub mod import;
 pub mod media;
 pub mod media_url;
 pub mod performance;
@@ -55,6 +56,7 @@ pub fn run() {
             commands::pick_broll_file,
             commands::pick_audio_file,
             commands::project_create,
+            commands::import_transcript,
             commands::project_show,
             commands::project_pending_open_take,
             commands::project_list,
