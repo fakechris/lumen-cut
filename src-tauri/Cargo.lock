@@ -1042,6 +1042,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2014,6 +2024,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "libc",
+ "lumen-models",
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",
@@ -2032,6 +2043,17 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "lumen-models"
+version = "0.1.0"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=965d3b68411f8e04bb3675b58d6c16b4b8eba646#965d3b68411f8e04bb3675b58d6c16b4b8eba646"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

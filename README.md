@@ -71,7 +71,12 @@ lumen-cut-cli project open talk --root ./projects
 
 The app creates an isolated Python 3.12 runtime under `~/.lumen-cut/runtime`
 and downloads selected model files into the Hugging Face cache. Neither is
-stored in this repository. Node.js 20+ and Rust stable are development-only
+stored in this repository. Qwen3-ASR weights already installed by another
+Lumen app (for example lumen-asr's
+`~/Library/Application Support/LumenAsr/models` directory or an existing
+Hugging Face cache snapshot) are discovered through the shared
+[`lumen-models`](https://github.com/fakechris/lumen-suite) crate and reused
+instead of being downloaded again. Node.js 20+ and Rust stable are development-only
 requirements.
 
 ## Development

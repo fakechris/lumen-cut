@@ -121,6 +121,33 @@ fn report_setup(
     }
 }
 
+/// The Qwen3-ASR checkpoint covered by the Lumen cluster's shared model
+/// discovery (`lumen-models`): lumen-asr's app dir and the HF cache snapshot.
+const SHARED_QWEN_MODEL_ID: &str = "mlx-community/Qwen3-ASR-0.6B-8bit";
+
+/// Locally-ready snapshot directory for the shared Qwen3-ASR checkpoint, if
+/// the configured model is that checkpoint and the cluster discovery chain
+/// (explicit lumen-asr install dir → HF cache snapshots) finds complete
+/// weights. `None` means "keep using the HF repo id".
+pub fn local_qwen_model_dir(model_id: &str) -> Option<PathBuf> {
+    if model_id.trim() != SHARED_QWEN_MODEL_ID {
+        return None;
+    }
+    let dir = lumen_models::default_qwen_dir();
+    lumen_models::qwen_ready(&dir).then_some(dir)
+}
+
+/// Prefer an already-installed local snapshot over the HF repo id so the
+/// sidecar never re-downloads weights another Lumen app already has on disk.
+/// The sidecar's `mlx_qwen3_asr` loader accepts a directory containing
+/// `config.json` verbatim.
+fn resolve_model_arg(model_id: &str) -> String {
+    match local_qwen_model_dir(model_id) {
+        Some(dir) => dir.display().to_string(),
+        None => model_id.to_string(),
+    }
+}
+
 pub fn managed_python(home: &Path) -> PathBuf {
     home.join(".lumen-cut/runtime/bin/python3")
 }
@@ -239,7 +266,11 @@ pub fn runtime_status() -> RuntimeStatus {
         .cloned()
         .into_iter()
         .find_map(|candidate| package_version(&candidate).map(|version| (candidate, version)));
-    let model_cached = crate::data::modelconfig::model_cached(&home, &config.asr_model);
+    // A snapshot shared by another Lumen app (discovered via lumen-models)
+    // counts as downloaded: transcription passes that directory to the
+    // sidecar, so no per-app copy is ever fetched.
+    let model_cached = crate::data::modelconfig::model_cached(&home, &config.asr_model)
+        || local_qwen_model_dir(&config.asr_model).is_some();
     let aligner_cached = crate::data::modelconfig::model_cached(&home, &config.asr_aligner);
     let runtime_ready = runtime.is_some();
     let diarize_runtime = candidates.into_iter().find_map(|candidate| {
@@ -600,7 +631,12 @@ pub async fn download_asr_models_with_progress(
         sidecar: "lumen_cut_asr",
         message: "install the local transcription runtime before downloading models".into(),
     })?;
-    let models = [&status.model_id, &status.aligner_id];
+    // Skip snapshots that shared discovery already resolved locally (e.g. a
+    // lumen-asr install); downloading them again would duplicate gigabytes.
+    let models: Vec<&String> = [&status.model_id, &status.aligner_id]
+        .into_iter()
+        .filter(|model| local_qwen_model_dir(model).is_none())
+        .collect();
     for (index, model) in models.iter().enumerate() {
         download_snapshot(&python, model, index, models.len(), &[], progress.clone()).await?;
     }
@@ -840,7 +876,11 @@ pub async fn transcribe_file_with_aligner_progress(
     })?;
 
     let py = resolve_python();
-    let args = build_sidecar_args(wav, model, language, aligner, &sidecar);
+    let model_arg = resolve_model_arg(model);
+    if model_arg != model {
+        info!(model, dir = %model_arg, "using shared local Qwen snapshot");
+    }
+    let args = build_sidecar_args(wav, &model_arg, language, aligner, &sidecar);
 
     info!(bin = %py.display(), args = ?args, "spawning ASR sidecar");
 
@@ -936,6 +976,61 @@ fn locate_sidecar(rel: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate process environment variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn non_shared_model_ids_keep_the_hf_repo_id() {
+        // Only the checkpoint covered by lumen-models discovery may be
+        // rewritten; every other configured model must reach the sidecar
+        // unchanged.
+        for id in [
+            "Qwen/Qwen3-ASR-0.6B",
+            "mlx-community/Qwen3-ASR-1.7B-8bit",
+            "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
+        ] {
+            assert!(local_qwen_model_dir(id).is_none());
+            assert_eq!(resolve_model_arg(id), id);
+        }
+    }
+
+    #[test]
+    fn shared_qwen_model_resolves_to_ready_local_snapshot() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        // lumen-asr's app model dir (per-platform layout used by lumen-models).
+        let dir = if cfg!(target_os = "macos") {
+            home.path()
+                .join("Library/Application Support/LumenAsr/models/qwen3-asr-0.6b-8bit")
+        } else {
+            home.path().join(".lumen-asr/models/qwen3-asr-0.6b-8bit")
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        // Incomplete snapshot: fall back to the repo id (sidecar downloads).
+        let unresolved = local_qwen_model_dir(SHARED_QWEN_MODEL_ID);
+        for name in [
+            "config.json",
+            "model.safetensors",
+            "vocab.json",
+            "merges.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let resolved = local_qwen_model_dir(SHARED_QWEN_MODEL_ID);
+        let arg = resolve_model_arg(SHARED_QWEN_MODEL_ID);
+
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(unresolved, None);
+        assert_eq!(resolved, Some(dir.clone()));
+        assert_eq!(arg, dir.display().to_string());
+    }
 
     #[test]
     fn parses_structured_snapshot_progress_with_real_transfer_units() {

@@ -125,6 +125,19 @@ pub fn checks() -> Vec<Check> {
         ("ForcedAligner", config.asr_aligner.as_str()),
         ("pyannote", config.diarize_model.as_str()),
     ] {
+        // Transcription passes a shared local snapshot (discovered via
+        // lumen-models, e.g. a lumen-asr install) to the sidecar when one
+        // exists, so report that directory as the effective source.
+        if name == "Qwen3-ASR" {
+            if let Some(dir) = crate::asr::local_qwen_model_dir(model) {
+                output.push(Check {
+                    name: name.into(),
+                    ok: true,
+                    detail: format!("shared: {}", dir.display()),
+                });
+                continue;
+            }
+        }
         let ok = if name == "pyannote" {
             crate::data::modelconfig::diarize_model_cached(&home, model)
         } else {
