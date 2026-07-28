@@ -43,6 +43,10 @@ rand = "0.8"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 tracing-appender = "0.2"
+# Shared Lumen model discovery: reuse Qwen3-ASR weights installed by lumen-asr
+# (app dir or HF cache) instead of re-downloading per product. The `download`
+# feature (SenseVoice installer) is not needed here.
+lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "965d3b68411f8e04bb3675b58d6c16b4b8eba646", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
