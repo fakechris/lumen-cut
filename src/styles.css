@@ -6412,10 +6412,17 @@ pre.out {
   color: var(--accent);
 }
 
-.editor-view .transcript-word.is-cut,
+.editor-view .transcript-word.is-cut {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
 .editor-view .transcript-word:disabled {
   cursor: default;
   opacity: 0.45;
+}
+
+.editor-view .transcript-word.is-cut:disabled {
   text-decoration: line-through;
 }
 

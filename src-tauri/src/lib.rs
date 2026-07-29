@@ -101,6 +101,7 @@ pub fn run() {
             commands::cut_manual,
             commands::cut_manual_many,
             commands::cut_restore,
+            commands::cuts_restore,
             commands::cut_list,
             commands::audit_pid,
             commands::version_merge,

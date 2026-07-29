@@ -690,6 +690,14 @@ export async function cutRestore(pid: string, cutId: string): Promise<boolean> {
   return invoke("cut_restore", { pid, cutId, root: null });
 }
 
+/**
+ * Restore previously removed transcript words (inverse of cutWords):
+ * overlapping cuts are removed or split. Returns the seconds given back.
+ */
+export async function cutsRestore(pid: string, wordIds: string[]): Promise<number> {
+  return invoke("cuts_restore", { pid, wordIds, root: null });
+}
+
 export async function cutList(pid: string): Promise<CutSummary[]> {
   return invoke("cut_list", { pid, root: null });
 }

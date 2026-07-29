@@ -3191,6 +3191,60 @@ pub async fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> 
     .await
 }
 
+/// Restore previously removed transcript words (the inverse of
+/// [`cut_words`]): every cut overlapping the selected words' source range is
+/// removed or split so the words return to the timeline. Returns the seconds
+/// given back (0 = nothing to restore).
+#[tauri::command]
+pub async fn cuts_restore(
+    pid: String,
+    word_ids: Vec<String>,
+    root: Option<PathBuf>,
+) -> AppResult<f64> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("restore removed words", move || {
+        crate::data::edit_history::record(
+            &dir,
+            if word_ids.len() == 1 {
+                "Restore word"
+            } else {
+                "Restore words"
+            },
+            || {
+                let doc = Doc::load(&dir)?;
+                let wanted: HashSet<&str> = word_ids.iter().map(String::as_str).collect();
+                let mut start = f64::INFINITY;
+                let mut end = f64::NEG_INFINITY;
+                for word in doc.all_words() {
+                    if wanted.contains(word.id.as_str()) {
+                        start = start.min(word.start);
+                        end = end.max(word.end);
+                    }
+                }
+                if !start.is_finite() {
+                    return Err(AppError::Schema(
+                        "none of the selected words are in the transcript".into(),
+                    ));
+                }
+                let cuts_path = dir.join("cuts.json");
+                let mut cuts: ClipCuts = if cuts_path.exists() {
+                    serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+                } else {
+                    ClipCuts::new()
+                };
+                let restored = cuts.restore_range(&doc, start, end);
+                if restored > 0.0 {
+                    crate::data::storage::write_json(&cuts_path, &cuts)?;
+                }
+                Ok(restored)
+            },
+            |restored| *restored > 0.0,
+        )
+    })
+    .await
+}
+
 #[derive(Debug, Serialize)]
 pub struct CutSummary {
     pub id: String,
@@ -10462,6 +10516,117 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_words_splits_the_cut_and_undoes_as_one_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "one two three",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].sentences[0].words = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| crate::data::Word {
+                id: format!("w{index}"),
+                text: (*text).into(),
+                start: index as f64,
+                end: index as f64 + 1.0,
+            })
+            .collect();
+        doc.save(&project).unwrap();
+
+        assert_eq!(
+            cut_words(
+                "p1".into(),
+                vec!["w0".into(), "w1".into(), "w2".into()],
+                Some(tmp.path().to_path_buf()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Restoring the middle word splits the cut into two word cuts.
+        let restored = cuts_restore(
+            "p1".into(),
+            vec!["w1".into()],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!((restored - 1.0).abs() < 1e-9);
+        let remaining = cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].a_word, "w0");
+        assert_eq!(remaining[0].b_word, "w0");
+        assert_eq!(remaining[1].a_word, "w2");
+        assert_eq!(remaining[1].b_word, "w2");
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(history.undo_label.as_deref(), Some("Restore word"));
+
+        // One undo brings the original three-word cut back.
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Redo returns to the split state, where w1 is no longer cut:
+        // restoring it is a no-op and adds no history entry.
+        assert!(
+            edit_redo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        let restored = cuts_restore(
+            "p1".into(),
+            vec!["w1".into()],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored, 0.0);
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(history.undo_label.as_deref(), Some("Restore word"));
+
+        // Unknown words are an error, matching `cut_words`.
+        assert!(cuts_restore(
+            "p1".into(),
+            vec!["missing".into()],
+            Some(tmp.path().to_path_buf())
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
