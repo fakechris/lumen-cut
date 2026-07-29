@@ -13,11 +13,13 @@ import {
 } from "../../vendor/pireel/caption-fx";
 import {
   CAPTION_PRESET_GROUPS,
+  CAPTION_SUB_LINE_SCALE,
   captionPresetAssFont,
   captionPresetById,
   captionPresetFontFamily,
   captionPresetLineCss,
   captionPresetName,
+  captionPresetSubLineCss,
   captionPresetWordCss,
   captionPresetsForMode,
 } from "./captionPresets";
@@ -70,11 +72,21 @@ describe("captionPresetLineCss (preset → CSS)", () => {
     expect(css.background).toBeUndefined();
   });
 
-  it("maps backed presets to a clone-decorated pill", () => {
+  it("maps backed presets to a clone-decorated pill without a drop shadow", () => {
     const css = captionPresetLineCss(getCaptionPreset("ln-black"));
     expect(css.background).toBe("rgba(0,0,0,0.85)");
     expect(css.borderRadius).toBe("0.3em");
     expect(css.boxDecorationBreak).toBe("clone");
+    // Backed text gets no shadow (pireel's bare-vs-backed rule).
+    expect(css.textShadow).toBe("none");
+  });
+
+  it("never owns font size or weight — those stay on the user's SubtitleStyle", () => {
+    for (const preset of CAPTION_PRESETS) {
+      const css = captionPresetLineCss(preset);
+      expect(css.fontSize).toBeUndefined();
+      expect(css.fontWeight).toBeUndefined();
+    }
   });
 
   it("maps italic and fonts", () => {
@@ -84,6 +96,16 @@ describe("captionPresetLineCss (preset → CSS)", () => {
     expect(captionPresetFontFamily(getCaptionPreset("ln-clean"))).toBeUndefined();
     expect(captionPresetAssFont(getCaptionPreset("em-gold-serif"))).toBe("Noto Serif SC");
     expect(captionPresetAssFont(getCaptionPreset("ln-clean"))).toBeUndefined();
+  });
+});
+
+describe("captionPresetSubLineCss (translation line)", () => {
+  it("scales relative to the main line in em so it follows the user's font size", () => {
+    expect(CAPTION_SUB_LINE_SCALE).toBeGreaterThan(0);
+    expect(CAPTION_SUB_LINE_SCALE).toBeLessThan(1);
+    expect(captionPresetSubLineCss().fontSize).toBe(`${CAPTION_SUB_LINE_SCALE}em`);
+    // No color/font of its own: the sub-line inherits the preset's look.
+    expect(captionPresetSubLineCss().color).toBeUndefined();
   });
 });
 

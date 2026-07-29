@@ -968,6 +968,18 @@ export function TranscriptView({
         : "source");
   const exportCaptionLanguage = videoExportSettings.subtitleLanguage
     || preferredTranslationLanguage(translationLanguages);
+  // Shared by the export tab's 字幕内容 select and the style workspace's copy:
+  // one persisted setting (videoExportSettings → export-settings.json).
+  const applyCaptionStyle = (captionStyle: VideoExportSettings["captionStyle"]) => {
+    const language = exportCaptionLanguage
+      || preferredTranslationLanguage(translationLanguages);
+    setVideoExportSettings((current) => ({
+      ...current,
+      captionStyle,
+      bilingualSubtitles: captionStyle === "bilingual",
+      subtitleLanguage: captionStyle === "source" ? null : (language || current.subtitleLanguage),
+    }));
+  };
   const timelineCutIntervals = useMemo(
     () => doc ? resolveTimelineCuts(doc, cuts) : [],
     [cuts, doc],
@@ -3439,9 +3451,14 @@ export function TranscriptView({
       {activeTab === "style" && savedSubtitleStyle && subtitleStyle && (
         <StyleWorkspace
           busy={operation === "style"}
+          captionLanguage={exportCaptionLanguage}
+          captionStyle={exportCaptionStyle}
           lang={lang}
           savedStyle={savedSubtitleStyle}
+          sourceLanguage={doc.meta.language || null}
           style={subtitleStyle}
+          translationsAvailable={translationLanguages.length > 0}
+          onCaptionStyleChange={applyCaptionStyle}
           onPreview={setSubtitleStyle}
           onReset={resetStylePreview}
           onSave={saveStyle}
@@ -3907,17 +3924,9 @@ export function TranscriptView({
                   <select
                     disabled={videoExportSettings.subtitleMode === "none"}
                     value={exportCaptionStyle}
-                    onChange={(event) => {
-                      const captionStyle = event.target.value as VideoExportSettings["captionStyle"];
-                      const language = exportCaptionLanguage
-                        || preferredTranslationLanguage(translationLanguages);
-                      setVideoExportSettings((current) => ({
-                        ...current,
-                        captionStyle,
-                        bilingualSubtitles: captionStyle === "bilingual",
-                        subtitleLanguage: captionStyle === "source" ? null : (language || current.subtitleLanguage),
-                      }));
-                    }}
+                    onChange={(event) => applyCaptionStyle(
+                      event.target.value as VideoExportSettings["captionStyle"],
+                    )}
                   >
                     <option value="bilingual">
                       {lang === "zh"

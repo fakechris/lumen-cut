@@ -73,6 +73,11 @@ export function captionPresetAssFont(preset: CaptionPreset): string | undefined 
   return undefined;
 }
 
+/** Translation (sub) line size relative to the main line — pireel renders its
+ *  bilingual sub-line at 0.7× the main line's scale; the main line itself is
+ *  always the user's SubtitleStyle font size (presets never own size). */
+export const CAPTION_SUB_LINE_SCALE = 0.7;
+
 /** Whole-line preset look as CSS (color / backing pill / typeface / italic).
  *  Callers layer font size, weight and position from the user's SubtitleStyle;
  *  bare presets (no bg) should also keep the user's outline + shadow. */
@@ -88,9 +93,18 @@ export function captionPresetLineCss(preset: CaptionPreset): CSSProperties {
         padding: "0.12em 0.45em",
         boxDecorationBreak: "clone",
         WebkitBoxDecorationBreak: "clone",
+        // Backed text gets no drop shadow (pireel's bare-vs-backed rule); the
+        // overlay's base CSS paints one otherwise.
+        textShadow: "none",
       }
       : {}),
   };
+}
+
+/** Translation-line CSS under a preset: same look as the main line (inherited),
+ *  just scaled down — em keeps it proportional to the user's font size. */
+export function captionPresetSubLineCss(): CSSProperties {
+  return { fontSize: `${CAPTION_SUB_LINE_SCALE}em` };
 }
 
 /** Current-word treatment for emphasis presets: accent color and/or the

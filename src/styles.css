@@ -6198,7 +6198,11 @@ pre.out {
   z-index: 4;
 }
 
-.program-subtitle span {
+/* Direct child only: emphasis-preset captions nest per-word spans inside the
+   caption span — a bare descendant selector would leak this font-size/padding
+   onto every word (giant words, double padding, unresponsive to the user's
+   font-size setting). */
+.program-subtitle > span {
   background: transparent;
   box-decoration-break: clone;
   color: #f6f3ea;

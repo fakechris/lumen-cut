@@ -20,9 +20,17 @@ type SavedStyle = {
 
 interface Props {
   busy: boolean;
+  /** Effective caption content mode (shared with the export tab's 字幕内容 select). */
+  captionStyle: "source" | "translation" | "bilingual";
+  /** Language tag of the translation shown in the bilingual/translation options. */
+  captionLanguage: string | null;
   lang: Lang;
   savedStyle: SubtitleStyle;
+  /** Language tag of the source transcript, for the source option label. */
+  sourceLanguage: string | null;
   style: SubtitleStyle;
+  translationsAvailable: boolean;
+  onCaptionStyleChange: (captionStyle: "source" | "translation" | "bilingual") => void;
   onPreview: (style: SubtitleStyle) => void;
   onReset: () => void;
   onSave: (style: SubtitleStyle) => Promise<void>;
@@ -218,9 +226,14 @@ const STYLE_PRESETS: Array<{
 
 export function StyleWorkspace({
   busy,
+  captionStyle,
+  captionLanguage,
   lang,
   savedStyle,
+  sourceLanguage,
   style,
+  translationsAvailable,
+  onCaptionStyleChange,
   onPreview,
   onReset,
   onSave,
@@ -376,6 +389,36 @@ export function StyleWorkspace({
       </section>
 
       <section className="style-controls">
+        <div className="control-row">
+          <label>
+            <span>{lang === "zh" ? "字幕内容" : "Caption content"}</span>
+            {/* Same setting as the export tab's 字幕内容 select — both write the
+                persisted video export settings, and the preview follows immediately. */}
+            <select
+              value={captionStyle}
+              onChange={(event) => onCaptionStyleChange(
+                event.target.value as "source" | "translation" | "bilingual",
+              )}
+            >
+              <option value="bilingual">
+                {lang === "zh"
+                  ? `对照 · 原文 + ${captionLanguage || "译文"}`
+                  : `Bilingual · original + ${captionLanguage || "translation"}`}
+              </option>
+              <option value="source">
+                {lang === "zh"
+                  ? `只英文 · ${sourceLanguage || "原文"}`
+                  : `Source only · ${sourceLanguage || "original"}`}
+              </option>
+              <option value="translation" disabled={!translationsAvailable}>
+                {lang === "zh"
+                  ? `只中文 · ${captionLanguage || "译文"}`
+                  : `Translation only · ${captionLanguage || "target"}`}
+              </option>
+            </select>
+          </label>
+        </div>
+
         <div className="saved-style-library">
           <header>
             <span>{lang === "zh" ? "我的样式" : "My styles"}</span>

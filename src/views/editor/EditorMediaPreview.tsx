@@ -32,6 +32,7 @@ import { audioGainAt, musicGainAt } from "./audioMix";
 import {
   captionPresetById,
   captionPresetLineCss,
+  captionPresetSubLineCss,
   captionPresetWordCss,
 } from "./captionPresets";
 import { framingAtTime, shotTransformCss } from "./shotFraming";
@@ -610,7 +611,12 @@ export function EditorMediaPreview({
                           {captionWords.translation && (
                             <>
                               <br />
-                              {captionWords.translation}
+                              {/* Sub-line: same preset look (inherited), scaled
+                                  down so it stays proportional to the user's
+                                  font size instead of matching the main line. */}
+                              <span style={captionPresetSubLineCss()}>
+                                {captionWords.translation}
+                              </span>
                             </>
                           )}
                         </>
