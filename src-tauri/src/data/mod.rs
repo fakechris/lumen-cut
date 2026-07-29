@@ -9,6 +9,7 @@ pub mod doc;
 pub mod edit;
 pub mod edit_history;
 pub mod export_settings;
+pub mod framing;
 pub mod modelconfig;
 pub mod rebind;
 pub mod reindex;

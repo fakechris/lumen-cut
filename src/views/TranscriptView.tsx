@@ -70,6 +70,8 @@ import {
   taskResume,
   taskPause,
   taskStatus,
+  framingList,
+  framingSet,
   titleAdd,
   titleList,
   titleRemove,
@@ -107,6 +109,8 @@ import type {
   SubtitleRow,
   SubtitleStyle,
   ReportSummary,
+  ShotFraming,
+  ShotFramingInput,
   SpeakerEvidence,
   SpeakerAnalysisJobStatus,
   SpeakerReidentifyProposal,
@@ -732,6 +736,7 @@ export function TranscriptView({
   const [brollPreviewJob, setBrollPreviewJob] = useState<BrollPreviewJobStatus | null>(null);
   const [brollPreviewPaths, setBrollPreviewPaths] = useState<string[]>([]);
   const [titles, setTitles] = useState<TitleClip[]>([]);
+  const [framings, setFramings] = useState<ShotFraming[]>([]);
   const [audioMix, setAudioMix] = useState<AudioMix>(DEFAULT_AUDIO_MIX);
   const workbenchPlayerRef = useRef<HTMLMediaElement | null>(null);
   const [workbenchTime, setWorkbenchTime] = useState(0);
@@ -1088,6 +1093,7 @@ export function TranscriptView({
       nextEvidence,
       nextBroll,
       nextTitles,
+      nextFramings,
       nextEditHistory,
       nextAudioMix,
       nextExportSettings,
@@ -1107,6 +1113,7 @@ export function TranscriptView({
         return { suggestions: [], accepted: [], errors: [friendlyError(error, lang)] };
       }),
       titleList(projectId).catch(() => []),
+      framingList(projectId).catch(() => []),
       editHistoryStatus(projectId).catch(() => EMPTY_EDIT_HISTORY),
       audioMixGet(projectId).catch(() => DEFAULT_AUDIO_MIX),
       exportSettingsGet(projectId).catch(() => DEFAULT_VIDEO_EXPORT_SETTINGS),
@@ -1129,6 +1136,7 @@ export function TranscriptView({
     setSpeakerEvidenceState(nextEvidence);
     setBrollOverview(nextBroll);
     setTitles(nextTitles);
+    setFramings(nextFramings);
     setEditHistory(nextEditHistory);
     setAudioMix(nextAudioMix);
     setVideoExportSettings(normalizeVideoExportSettings(
@@ -1174,6 +1182,7 @@ export function TranscriptView({
     setSpeakerAnalysisJob(null);
     setBrollOverview({ suggestions: [], accepted: [], errors: [] });
     setTitles([]);
+    setFramings([]);
     setAudioMix(DEFAULT_AUDIO_MIX);
     setEditHistory(EMPTY_EDIT_HISTORY);
     setBrollPreviewJob(null);
@@ -2263,6 +2272,17 @@ export function TranscriptView({
     setTitles(await titleList(pid));
   };
 
+  const setShotFraming = async (input: ShotFramingInput) => {
+    await performRecoverable("shot-framing", async () => {
+      setFramings(await framingSet(pid, input));
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "取景已保存。" : "Saved the shot framing.",
+      });
+    });
+  };
+
   const refreshEditHistory = async () => {
     invalidateDeliveryCheck();
     try {
@@ -2844,6 +2864,7 @@ export function TranscriptView({
             currentTime={workbenchTime}
             doc={doc}
             expanded={previewExpanded}
+            framings={framings}
             lang={lang}
             programDuration={programDuration}
             programTime={programTime}
@@ -4159,6 +4180,7 @@ export function TranscriptView({
         currentTime={workbenchTime}
         cuts={cuts}
         doc={doc}
+        framings={framings}
         history={editHistory}
         isPlaying={workbenchPlaying}
         lang={lang}
@@ -4171,6 +4193,7 @@ export function TranscriptView({
         onRedo={redoEditorEdit}
         onRemoveCues={removeTimelineCues}
         onSeek={seekWorkbench}
+        onSetFraming={setShotFraming}
         onSplit={splitSubtitleLine}
         onUpdateCueTiming={updateSubtitleTiming}
         onTogglePlayback={toggleWorkbenchPlayback}

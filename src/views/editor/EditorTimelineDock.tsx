@@ -25,10 +25,18 @@ import type {
   ChapterRow,
   Doc,
   MusicTrack,
+  ShotFraming,
+  ShotFramingInput,
+  ShotTreatment,
   SubtitleRow,
   TitleClip,
   TitleClipInput,
 } from "../../types";
+import {
+  framingForSegment,
+  keptIntervals,
+  TREAT_SIZE_DEFAULT,
+} from "./shotFraming";
 import {
   editedToSourceTime,
   editedTimelineDuration,
@@ -43,6 +51,7 @@ interface Props {
   currentTime: number;
   cuts: CutSummary[];
   doc: Doc;
+  framings: ShotFraming[];
   isPlaying: boolean;
   lang: Lang;
   pid: string;
@@ -57,6 +66,7 @@ interface Props {
   onRedo: () => Promise<void>;
   onRemoveCues: (ids: string[]) => Promise<void>;
   onSeek: (seconds: number, autoplay?: boolean) => void;
+  onSetFraming: (input: ShotFramingInput) => Promise<void>;
   onSplit: (id: string, at: number) => Promise<void>;
   onUpdateCueTiming: (id: string, start: number, end: number) => Promise<void>;
   onTogglePlayback: () => void;
@@ -300,6 +310,7 @@ interface TrackLayerProps {
   cuts: CutSummary[];
   doc: Doc;
   duration: number;
+  framings: ShotFraming[];
   lang: Lang;
   music: MusicTrack[];
   rows: SubtitleRow[];
@@ -308,6 +319,7 @@ interface TrackLayerProps {
   selectedCueId: string | null;
   selectedCueIds: string[];
   selectedMusicId: string | null;
+  selectedShot: { start: number; end: number } | null;
   selectedTitleId: string | null;
   contactSheet: string | null;
   waveform: string | null;
@@ -333,6 +345,7 @@ interface TrackLayerProps {
   onMusicPointerMove: (event: React.PointerEvent<HTMLButtonElement>) => void;
   onMusicPointerUp: (event: React.PointerEvent<HTMLButtonElement>) => void;
   onSelectMusic: (track: MusicTrack) => void;
+  onSelectShot: (segment: { start: number; end: number }) => void;
   onSelectTitle: (title: TitleClip) => void;
   onTitlePointerDown: (
     event: React.PointerEvent<HTMLButtonElement>,
@@ -349,6 +362,7 @@ const TimelineTrackLayers = memo(function TimelineTrackLayers({
   cuts,
   doc,
   duration,
+  framings,
   lang,
   music,
   rows,
@@ -357,6 +371,7 @@ const TimelineTrackLayers = memo(function TimelineTrackLayers({
   selectedCueId,
   selectedCueIds,
   selectedMusicId,
+  selectedShot,
   selectedTitleId,
   contactSheet,
   waveform,
@@ -373,6 +388,7 @@ const TimelineTrackLayers = memo(function TimelineTrackLayers({
   onMusicPointerMove,
   onMusicPointerUp,
   onSelectMusic,
+  onSelectShot,
   onSelectTitle,
   onTitlePointerDown,
   onTitlePointerMove,
@@ -382,6 +398,11 @@ const TimelineTrackLayers = memo(function TimelineTrackLayers({
   const timelineCuts = useMemo(
     () => resolveTimelineCuts(doc, cuts),
     [cuts, doc],
+  );
+  // Selectable shots = the kept segments between cuts (source time).
+  const shotSegments = useMemo(
+    () => keptIntervals(duration, timelineCuts),
+    [duration, timelineCuts],
   );
   const musicSourceRanges = useMemo(() => new Map(music.map((track) => [
     track.id,
@@ -551,6 +572,39 @@ const TimelineTrackLayers = memo(function TimelineTrackLayers({
             />
           )}
         </div>
+        {shotSegments.map((segment) => {
+          const framing = framingForSegment(framings, segment.start, segment.end);
+          const selected = selectedShot !== null
+            && Math.abs(selectedShot.start - segment.start) < 0.001
+            && Math.abs(selectedShot.end - segment.end) < 0.001;
+          return (
+            <button
+              aria-label={`${lang === "zh" ? "素材段" : "Shot"} ${clock(segment.start)}–${clock(segment.end)}${
+                framing
+                  ? lang === "zh" ? "（已设取景）" : " (framed)"
+                  : ""
+              }`}
+              aria-pressed={selected}
+              className={`timeline-shot-segment${selected ? " selected" : ""}${framing ? " framed" : ""}`}
+              key={`${segment.start.toFixed(3)}-${segment.end.toFixed(3)}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                onSelectShot(segment);
+                onSeek(segment.start, false);
+              }}
+              style={{
+                left: `${(segment.start / duration) * 100}%`,
+                width: `${Math.max(((segment.end - segment.start) / duration) * 100, 0.5)}%`,
+              }}
+              title={lang === "zh"
+                ? "选中这段素材并调整取景"
+                : "Select this shot to adjust its framing"}
+              type="button"
+            >
+              {framing && <span aria-hidden="true" className="timeline-shot-framing-dot" />}
+            </button>
+          );
+        })}
         {music.map((track) => {
           const sourceRange = musicSourceRanges.get(track.id);
           if (!sourceRange) return null;
@@ -922,6 +976,41 @@ interface SplitTarget {
   start: number;
 }
 
+const SHOT_TREATMENTS: Array<{ id: ShotTreatment; zh: string; en: string }> = [
+  { id: "full", zh: "全幅", en: "Full" },
+  { id: "punch-in", zh: "推近", en: "Punch in" },
+  { id: "corner-br", zh: "右下角", en: "Bottom right" },
+  { id: "corner-tl", zh: "左上角", en: "Top left" },
+  { id: "split-l", zh: "左半屏", en: "Left half" },
+  { id: "split-r", zh: "右半屏", en: "Right half" },
+];
+
+/** Miniature canvas diagram for a framing treatment. */
+function TreatmentIcon({ treatment }: { treatment: ShotTreatment }) {
+  const rect = {
+    full: { x: 1, y: 1, width: 26, height: 16 },
+    // Overflowing rect, clipped by the canvas viewBox = zoomed-in frame.
+    "punch-in": { x: -4, y: -3, width: 36, height: 24 },
+    "corner-br": { x: 17, y: 10, width: 10, height: 7 },
+    "corner-tl": { x: 1, y: 1, width: 10, height: 7 },
+    "split-l": { x: 1, y: 1, width: 13, height: 16 },
+    "split-r": { x: 14, y: 1, width: 13, height: 16 },
+  }[treatment];
+  return (
+    <svg aria-hidden="true" className="framing-icon" viewBox="0 0 28 18">
+      <rect className="framing-icon-canvas" height="17" rx="2" width="27" x="0.5" y="0.5" />
+      <rect
+        className="framing-icon-content"
+        height={rect.height}
+        rx="1"
+        width={rect.width}
+        x={rect.x}
+        y={rect.y}
+      />
+    </svg>
+  );
+}
+
 export function buildSplitTargetIndex(doc: Doc): SplitTarget[] {
   const targets: SplitTarget[] = [];
   for (const paragraph of doc.paragraphs) {
@@ -998,6 +1087,7 @@ export function EditorTimelineDock({
   currentTime,
   cuts,
   doc,
+  framings,
   history,
   isPlaying,
   lang,
@@ -1010,6 +1100,7 @@ export function EditorTimelineDock({
   onRedo,
   onRemoveCues,
   onSeek,
+  onSetFraming,
   onSplit,
   onUpdateCueTiming,
   onTogglePlayback,
@@ -1041,6 +1132,9 @@ export function EditorTimelineDock({
     useState<TitleClipInput | null>(initialDrafts.titleSource);
   const [titlePanelOpen, setTitlePanelOpen] = useState(initialDrafts.titlePanelOpen);
   const [audioPanelOpen, setAudioPanelOpen] = useState(initialDrafts.audioPanelOpen);
+  const [selectedShot, setSelectedShot] = useState<{ start: number; end: number } | null>(null);
+  const [framingPanelOpen, setFramingPanelOpen] = useState(false);
+  const [framingSizeDraft, setFramingSizeDraft] = useState<number | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [audioDraft, setAudioDraft] = useState(initialDrafts.audioDraft);
   const [audioDraftSource, setAudioDraftSource] = useState(initialDrafts.audioSource);
@@ -1057,6 +1151,42 @@ export function EditorTimelineDock({
     () => editedTimelineDuration(duration, cutIntervals),
     [cutIntervals, duration],
   );
+  // Shot selection: the kept segment the user clicked on the media track.
+  // A stale selection (cuts changed underneath) simply shows no panel.
+  const shotSegments = useMemo(
+    () => keptIntervals(duration, cutIntervals),
+    [cutIntervals, duration],
+  );
+  const selectedSegment = selectedShot === null
+    ? undefined
+    : shotSegments.find((segment) =>
+      Math.abs(segment.start - selectedShot.start) < 0.001
+      && Math.abs(segment.end - selectedShot.end) < 0.001
+    );
+  const selectedFraming = selectedSegment
+    ? framingForSegment(framings, selectedSegment.start, selectedSegment.end)
+    : undefined;
+  const currentTreatment: ShotTreatment = selectedFraming?.treatment ?? "full";
+  const currentFramingSize = framingSizeDraft
+    ?? selectedFraming?.size
+    ?? TREAT_SIZE_DEFAULT[currentTreatment];
+  const selectShot = useCallback((segment: { start: number; end: number }) => {
+    setSelectedShot(segment);
+    setFramingSizeDraft(null);
+    setTitlePanelOpen(false);
+    setAudioPanelOpen(false);
+    setFramingPanelOpen(true);
+  }, []);
+  const applyFraming = useCallback((treatment: ShotTreatment, size?: number | null) => {
+    if (!selectedSegment) return;
+    setFramingSizeDraft(null);
+    void onSetFraming({
+      start: selectedSegment.start,
+      end: selectedSegment.end,
+      treatment,
+      size: treatment === "full" ? null : size ?? selectedFraming?.size ?? null,
+    }).catch(() => undefined);
+  }, [onSetFraming, selectedFraming?.size, selectedSegment]);
   const staticSnapPoints = useMemo(() => [
     0,
     duration,
@@ -1995,7 +2125,7 @@ export function EditorTimelineDock({
   return (
     <section className={`workbench-timeline${collapsed ? " collapsed" : ""}`} aria-label={lang === "zh" ? "编辑时间线" : "Editing timeline"}>
       <header className="timeline-dock-toolbar">
-        <div className={`timeline-edit-actions${audioPanelOpen || titlePanelOpen ? " popover-open" : ""}`}>
+        <div className={`timeline-edit-actions${audioPanelOpen || titlePanelOpen || framingPanelOpen ? " popover-open" : ""}`}>
           <button
             aria-label={lang === "zh" ? "撤销" : "Undo"}
             className="timeline-icon-button"
@@ -2703,6 +2833,77 @@ export function EditorTimelineDock({
               </footer>
             </form>
           )}
+          {framingPanelOpen && selectedSegment && (
+            <div
+              aria-label={lang === "zh" ? "素材段取景" : "Shot framing"}
+              className="timeline-framing-popover"
+              role="group"
+            >
+              <header>
+                <strong>
+                  {lang === "zh" ? "取景" : "Framing"} · {clock(selectedSegment.start)}–{clock(selectedSegment.end)}
+                </strong>
+                <button
+                  aria-label={lang === "zh" ? "关闭取景设置" : "Close framing settings"}
+                  onClick={() => setFramingPanelOpen(false)}
+                  type="button"
+                >
+                  ×
+                </button>
+              </header>
+              <div
+                aria-label={lang === "zh" ? "取景方式" : "Framing treatment"}
+                className="framing-treatments"
+                role="listbox"
+              >
+                {SHOT_TREATMENTS.map((treatment) => (
+                  <button
+                    aria-label={lang === "zh" ? treatment.zh : treatment.en}
+                    aria-selected={currentTreatment === treatment.id}
+                    className={currentTreatment === treatment.id ? "selected" : ""}
+                    key={treatment.id}
+                    onClick={() => applyFraming(treatment.id)}
+                    role="option"
+                    type="button"
+                  >
+                    <TreatmentIcon treatment={treatment.id} />
+                    <span>{lang === "zh" ? treatment.zh : treatment.en}</span>
+                  </button>
+                ))}
+              </div>
+              {currentTreatment !== "full" && (
+                <label className="framing-size">
+                  <span>
+                    {lang === "zh" ? "尺寸" : "Size"} · {Math.round(currentFramingSize)}
+                  </span>
+                  <input
+                    aria-label={lang === "zh" ? "取景尺寸" : "Framing size"}
+                    max={100}
+                    min={0}
+                    onChange={(event) => setFramingSizeDraft(event.target.valueAsNumber)}
+                    onKeyUp={(event) => {
+                      if (framingSizeDraft !== null && event.key.startsWith("Arrow")) {
+                        applyFraming(currentTreatment, framingSizeDraft);
+                      }
+                    }}
+                    onPointerUp={() => {
+                      if (framingSizeDraft !== null) {
+                        applyFraming(currentTreatment, framingSizeDraft);
+                      }
+                    }}
+                    step={1}
+                    type="range"
+                    value={Math.round(currentFramingSize)}
+                  />
+                </label>
+              )}
+              <small>
+                {lang === "zh"
+                  ? "取景只作用于这段素材，导出与节目监看一致。"
+                  : "Framing applies to this shot only and matches the export."}
+              </small>
+            </div>
+          )}
         </div>
         <div className="timeline-transport">
           <button
@@ -2836,6 +3037,7 @@ export function EditorTimelineDock({
               cuts={cuts}
               doc={doc}
               duration={duration}
+              framings={framings}
               lang={lang}
               music={displayedMusic}
               rows={displayedRows}
@@ -2844,6 +3046,7 @@ export function EditorTimelineDock({
               selectedCueId={selectedCueId}
               selectedCueIds={selectedCueIds}
               selectedMusicId={selectedMusicId}
+              selectedShot={selectedShot}
               selectedTitleId={selectedTitleId}
               contactSheet={contactSheet}
               waveform={waveform}
@@ -2860,6 +3063,7 @@ export function EditorTimelineDock({
               onMusicPointerMove={moveMusicDrag}
               onMusicPointerUp={finishMusicDrag}
               onSelectMusic={selectMusic}
+              onSelectShot={selectShot}
               onSelectTitle={selectTitle}
               onTitlePointerDown={beginTitleDrag}
               onTitlePointerMove={moveTitleDrag}
