@@ -5269,6 +5269,105 @@ pub async fn title_remove(pid: String, id: String, root: Option<PathBuf>) -> App
     .await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShotFramingInput {
+    /// Kept-segment bounds in source-timeline seconds.
+    pub start: f64,
+    pub end: f64,
+    pub treatment: crate::data::framing::ShotTreatment,
+    #[serde(default)]
+    pub size: Option<f64>,
+}
+
+#[tauri::command]
+pub async fn framing_list(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<crate::data::framing::ShotFraming>> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("framing list", move || {
+        Doc::load(&dir)?;
+        crate::data::framing::load(&dir)
+    })
+    .await
+}
+
+/// Set the framing for the kept segment `[start, end)`: every entry
+/// overlapping the segment is replaced. `full` clears the segment's framing.
+#[tauri::command]
+pub async fn framing_set(
+    pid: String,
+    input: ShotFramingInput,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<crate::data::framing::ShotFraming>> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("framing set", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Set shot framing",
+            || {
+                let doc = Doc::load(&dir)?;
+                let mut framings = crate::data::framing::load(&dir)?;
+                framings.retain(|framing| framing.end <= input.start || framing.start >= input.end);
+                if input.treatment != crate::data::framing::ShotTreatment::Full {
+                    let framing = crate::data::framing::ShotFraming {
+                        id: format!("framing-{}", uuid::Uuid::new_v4().simple()),
+                        start: input.start,
+                        end: input.end,
+                        treatment: input.treatment,
+                        size: input.size,
+                    };
+                    framing.validate()?;
+                    if doc.media.duration_seconds > 0.0
+                        && framing.end > doc.media.duration_seconds + 0.05
+                    {
+                        return Err(AppError::Schema(format!(
+                            "framing end {:.2}s exceeds media duration {:.2}s",
+                            framing.end, doc.media.duration_seconds
+                        )));
+                    }
+                    framings.push(framing);
+                    framings.sort_by(|left, right| {
+                        left.start
+                            .partial_cmp(&right.start)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                crate::data::framing::save(&dir, &framings)?;
+                Ok(framings)
+            },
+            |_| true,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn framing_remove(pid: String, id: String, root: Option<PathBuf>) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("framing remove", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Remove shot framing",
+            || {
+                let mut framings = crate::data::framing::load(&dir)?;
+                let before = framings.len();
+                framings.retain(|framing| framing.id != id);
+                if framings.len() == before {
+                    return Ok(false);
+                }
+                crate::data::framing::save(&dir, &framings)?;
+                Ok(true)
+            },
+            |changed| *changed,
+        )
+    })
+    .await
+}
+
 fn load_project_cuts(dir: &std::path::Path) -> AppResult<ClipCuts> {
     let cuts_path = dir.join("cuts.json");
     if cuts_path.exists() {
@@ -5486,6 +5585,7 @@ async fn export_preflight_impl(
         titles_result,
         audio_mix_result,
         style_result,
+        framing_result,
     ) = run_blocking("export preflight snapshot", move || {
         let doc = Doc::load(&snapshot_dir)?;
         let cuts = load_project_cuts(&snapshot_dir);
@@ -5494,7 +5594,8 @@ async fn export_preflight_impl(
         let titles = crate::data::title::load(&snapshot_dir);
         let audio_mix = crate::data::audio_mix::load(&snapshot_dir);
         let style = crate::data::substyle::SubStyle::load(&snapshot_dir);
-        Ok((doc, cuts, broll, hidden, titles, audio_mix, style))
+        let framing = crate::data::framing::load(&snapshot_dir);
+        Ok((doc, cuts, broll, hidden, titles, audio_mix, style, framing))
     })
     .await?;
 
@@ -5531,6 +5632,18 @@ async fn export_preflight_impl(
                 "titles",
                 "blocker",
                 format!("titles cannot be read: {error}"),
+            );
+            Vec::new()
+        }
+    };
+    let framings = match framing_result {
+        Ok(framings) => framings,
+        Err(error) => {
+            push_export_preflight_item(
+                &mut items,
+                "timeline-data",
+                "blocker",
+                format!("shot framing cannot be read: {error}"),
             );
             Vec::new()
         }
@@ -5873,6 +5986,7 @@ async fn export_preflight_impl(
         &broll,
         &audio_mix_for_path,
         include_ass_for_path,
+        &framings,
     );
     let render_path_label = match render_path {
         crate::export::video::ExportRenderPath::StreamCopy => "remux",
@@ -5884,6 +5998,7 @@ async fn export_preflight_impl(
         &broll,
         &audio_mix_for_path,
         include_ass_for_path,
+        &framings,
     );
     items.push(ExportPreflightItem {
         code: "render-path".into(),
@@ -7805,7 +7920,7 @@ async fn export_video_impl(
     let prepare_dir = dir.clone();
     let prepare_stem = export_stem.clone();
     let prepare_started = std::time::Instant::now();
-    let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings) = {
+    let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings, framings) = {
         // Hold the project mutation lock only while taking an export snapshot.
         // Encoding may take minutes and must not stall transcript editing.
         let _mutation = lock_project_mutation(&dir).await;
@@ -7875,6 +7990,7 @@ async fn export_video_impl(
                     .map(|(start, end)| end - start)
                     .sum(),
             )?;
+            let framings = crate::data::framing::load(&prepare_dir)?;
             Ok((
                 doc,
                 cuts,
@@ -7884,6 +8000,7 @@ async fn export_video_impl(
                 broll,
                 audio_mix,
                 settings,
+                framings,
             ))
         })
         .await?
@@ -7895,6 +8012,7 @@ async fn export_video_impl(
         &broll,
         &audio_mix,
         include_ass,
+        &framings,
     );
     tracing::info!(
         pipeline = "video-export",
@@ -7923,6 +8041,7 @@ async fn export_video_impl(
             settings: Some(settings),
             soft_subtitle,
             include_ass,
+            framings,
         },
     )
     .await;

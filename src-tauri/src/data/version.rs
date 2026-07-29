@@ -30,6 +30,7 @@ const VERSIONED_FILES: &[&str] = &[
     "titles.json",
     "audio-mix.json",
     "chapters.json",
+    "framing.json",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

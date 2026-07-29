@@ -574,6 +574,31 @@ export interface TitleClip {
 
 export type TitleClipInput = Omit<TitleClip, "id">;
 
+export type ShotTreatment =
+  | "full"
+  | "punch-in"
+  | "corner-br"
+  | "corner-tl"
+  | "split-l"
+  | "split-r";
+
+/** Per-shot framing for one kept media segment (source-timeline seconds). */
+export interface ShotFraming {
+  id: string;
+  start: number;
+  end: number;
+  treatment: ShotTreatment;
+  /** Unitless 0–100 size; absent = the treatment's default. */
+  size?: number | null;
+}
+
+export interface ShotFramingInput {
+  start: number;
+  end: number;
+  treatment: ShotTreatment;
+  size?: number | null;
+}
+
 export interface AudioMix {
   volume: number;
   muted: boolean;

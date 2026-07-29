@@ -28,6 +28,8 @@ import type {
   ReportSummary,
   Settings,
   SetupJobStatus,
+  ShotFraming,
+  ShotFramingInput,
   SpeakerEvidence,
   SpeakerAnalysisJobStatus,
   SpeakerInfo,
@@ -585,6 +587,21 @@ export async function titleUpdate(
 
 export async function titleRemove(pid: string, id: string): Promise<boolean> {
   return invoke("title_remove", { pid, id, root: null });
+}
+
+export async function framingList(pid: string): Promise<ShotFraming[]> {
+  return invoke("framing_list", { pid, root: null });
+}
+
+export async function framingSet(
+  pid: string,
+  input: ShotFramingInput,
+): Promise<ShotFraming[]> {
+  return invoke("framing_set", { pid, input, root: null });
+}
+
+export async function framingRemove(pid: string, id: string): Promise<boolean> {
+  return invoke("framing_remove", { pid, id, root: null });
 }
 
 export async function audioMixGet(pid: string): Promise<AudioMix> {

@@ -20,6 +20,7 @@ import type {
   BrollPlacement,
   BrollPlacementInput,
   Doc,
+  ShotFraming,
   SubtitleRow,
   SubtitleStyle,
   TitleClip,
@@ -33,6 +34,7 @@ import {
   captionPresetLineCss,
   captionPresetWordCss,
 } from "./captionPresets";
+import { framingAtTime, shotTransformCss } from "./shotFraming";
 import { titleOpacityAt } from "./titleAnimation";
 import { latinJoin } from "../../vendor/pireel/caption-fx";
 import type { CaptionPreset } from "../../vendor/pireel/caption-presets";
@@ -46,6 +48,7 @@ interface Props {
   doc: Doc;
   exportSettings: VideoExportSettings;
   expanded: boolean;
+  framings: ShotFraming[];
   lang: Lang;
   playerRef: MutableRefObject<HTMLMediaElement | null>;
   rows: SubtitleRow[];
@@ -111,6 +114,7 @@ export function EditorMediaPreview({
   doc,
   exportSettings,
   expanded,
+  framings,
   lang,
   playerRef,
   rows,
@@ -214,6 +218,12 @@ export function EditorMediaPreview({
     [exportSettings, sourceDimensions],
   );
   const stageAspect = canvasDimensions.width / canvasDimensions.height;
+  // Per-shot framing: the video is first fitted to the canvas by object-fit
+  // (canvasFit), then the current shot's transform is applied on top.
+  const shotTransform = useMemo(() => {
+    const framing = framingAtTime(framings, currentTime);
+    return framing ? shotTransformCss(framing.treatment, framing.size) : "none";
+  }, [currentTime, framings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -403,6 +413,7 @@ export function EditorMediaPreview({
               className="program-stage"
               style={stageSize ?? undefined}
             >
+              <div className="program-shot" style={{ transform: shotTransform }}>
               <video
                 controls
                 playsInline
@@ -420,6 +431,7 @@ export function EditorMediaPreview({
                 onTimeUpdate={(event) => onTimeChange(event.currentTarget.currentTime)}
                 style={{ objectFit: exportSettings.canvasFit }}
               />
+              </div>
               {activeBroll && brollSource && (
                 <div
                   aria-label={lang === "zh" ? "当前 B-roll 画面；拖动可调整位置" : "Current B-roll; drag to position"}

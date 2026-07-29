@@ -15,6 +15,9 @@ use crate::data::broll::{BackgroundMode, BrollPlacement, FitMode, PlacementMode,
 use crate::data::export_settings::{
     ExportAudioCodec, ExportCanvasFit, ExportEncodingSpeed, ExportVideoCodec, VideoExportSettings,
 };
+use crate::data::framing::{
+    any_non_full, framing_for_interval, treat_scale, ShotFraming, ShotTreatment,
+};
 use crate::data::{Cut, Doc};
 use crate::error::{AppError, AppResult};
 use crate::proc;
@@ -43,6 +46,8 @@ pub struct VideoRenderOptions {
     pub settings: Option<VideoExportSettings>,
     pub soft_subtitle: Option<PathBuf>,
     pub include_ass: bool,
+    /// Per-shot framing entries (empty = every shot rendered `full`).
+    pub framings: Vec<ShotFraming>,
 }
 
 /// How the final video will be produced.
@@ -61,12 +66,14 @@ pub fn can_stream_copy_export(
     placements: &[BrollPlacement],
     audio_mix: &AudioMix,
     include_ass: bool,
+    framings: &[ShotFraming],
 ) -> bool {
     settings.allows_stream_copy()
         && cuts.is_empty()
         && placements.is_empty()
         && audio_mix.is_passthrough()
         && !include_ass
+        && !any_non_full(framings)
 }
 
 pub fn export_render_path(
@@ -75,8 +82,9 @@ pub fn export_render_path(
     placements: &[BrollPlacement],
     audio_mix: &AudioMix,
     include_ass: bool,
+    framings: &[ShotFraming],
 ) -> ExportRenderPath {
-    if can_stream_copy_export(settings, cuts, placements, audio_mix, include_ass) {
+    if can_stream_copy_export(settings, cuts, placements, audio_mix, include_ass, framings) {
         ExportRenderPath::StreamCopy
     } else {
         ExportRenderPath::Reencode
@@ -90,8 +98,9 @@ pub fn reencode_reason(
     placements: &[BrollPlacement],
     audio_mix: &AudioMix,
     include_ass: bool,
+    framings: &[ShotFraming],
 ) -> String {
-    if can_stream_copy_export(settings, cuts, placements, audio_mix, include_ass) {
+    if can_stream_copy_export(settings, cuts, placements, audio_mix, include_ass, framings) {
         return "stream-copy remux".into();
     }
     let mut reasons = Vec::new();
@@ -106,6 +115,9 @@ pub fn reencode_reason(
     }
     if !cuts.is_empty() {
         reasons.push("soft cuts on the timeline");
+    }
+    if any_non_full(framings) {
+        reasons.push("per-shot framing");
     }
     if !placements.is_empty() {
         reasons.push("B-roll overlays");
@@ -174,6 +186,7 @@ pub fn build_video_filter_with_broll_audio(
         Some(ass),
         placements,
         audio_mix,
+        &[],
         VideoCanvas::default(),
     )
 }
@@ -184,24 +197,63 @@ fn build_video_filter_inner(
     ass: Option<&Path>,
     placements: &[BrollPlacement],
     audio_mix: &AudioMix,
+    framings: &[ShotFraming],
     canvas: VideoCanvas,
 ) -> AppResult<VideoFilter> {
     let mut graph = String::new();
-    let output_duration: f64 = super::project::kept_intervals(doc, cuts)
-        .iter()
-        .map(|(start, end)| end - start)
-        .sum();
+    let kept = super::project::kept_intervals(doc, cuts);
+    let output_duration: f64 = kept.iter().map(|(start, end)| end - start).sum();
     audio_mix.validate(output_duration)?;
+    // Per-shot framing, resolved onto the kept segments. `full` (or no entry)
+    // renders the segment unchanged.
+    let shot_framings: Vec<Option<&ShotFraming>> = kept
+        .iter()
+        .map(|(start, end)| {
+            framing_for_interval(framings, *start, *end)
+                .filter(|framing| framing.treatment != ShotTreatment::Full)
+        })
+        .collect();
+    let framing_active = shot_framings.iter().any(Option::is_some);
+    // Framing is computed in canvas pixels, so a framed export must know the
+    // canvas size (always probed on the render path).
+    let framing_dims = canvas.output_dimensions.or(canvas.frame_size);
+    if framing_active && framing_dims.is_none() {
+        return Err(AppError::Schema(
+            "per-shot framing requires known canvas dimensions".into(),
+        ));
+    }
     let mut audio_map;
     let mut dialogue_source = None;
+    // When any shot is framed, the canvas fit moves into each segment chain so
+    // the framing can position the fitted frame; the post-concat canvas step
+    // is skipped.
+    let segment_canvas = |chain: &mut String| {
+        if let Some((width, height)) = framing_dims {
+            if !chain.is_empty() {
+                chain.push(',');
+            }
+            chain.push_str(&canvas_fit_filter(canvas, width, height));
+        }
+    };
     if cuts.is_empty() {
-        graph.push_str("[0:v]setpts=PTS-STARTPTS[vbase];");
+        let mut chain = String::new();
+        if framing_active {
+            segment_canvas(&mut chain);
+            if let Some(framing) = shot_framings.first().copied().flatten() {
+                if let Some(filters) = framing_filter_chain(framing, framing_dims.unwrap()) {
+                    chain.push(',');
+                    chain.push_str(&filters);
+                }
+            }
+            graph.push_str(&format!("[0:v]setpts=PTS-STARTPTS,{chain}[vbase];"));
+        } else {
+            graph.push_str("[0:v]setpts=PTS-STARTPTS[vbase];");
+        }
         audio_map = Some("0:a:0?".into());
         if doc.media.channels.is_some_and(|channels| channels > 0) {
             dialogue_source = Some("0:a".to_string());
         }
     } else {
-        let kept = super::project::kept_intervals(doc, cuts);
         if kept.is_empty() {
             return Err(AppError::Schema(
                 "video export removed the entire media timeline".into(),
@@ -209,8 +261,19 @@ fn build_video_filter_inner(
         }
         let has_audio = doc.media.channels.is_some_and(|channels| channels > 0);
         for (index, (start, end)) in kept.iter().enumerate() {
+            let mut chain = String::new();
+            if framing_active {
+                segment_canvas(&mut chain);
+                if let Some(framing) = shot_framings[index] {
+                    if let Some(filters) = framing_filter_chain(framing, framing_dims.unwrap()) {
+                        chain.push(',');
+                        chain.push_str(&filters);
+                    }
+                }
+            }
+            let separator = if chain.is_empty() { "" } else { "," };
             graph.push_str(&format!(
-                "[0:v]trim=start={start:.6}:end={end:.6},setpts=PTS-STARTPTS[v{index}];"
+                "[0:v]trim=start={start:.6}:end={end:.6},setpts=PTS-STARTPTS{separator}{chain}[v{index}];"
             ));
             if has_audio {
                 graph.push_str(&format!(
@@ -274,7 +337,10 @@ fn build_video_filter_inner(
     }
 
     let cut_intervals = super::project::cut_intervals(doc, cuts);
-    let mut current = if let Some((width, height)) = canvas.output_dimensions {
+    let mut current = if framing_active {
+        // The canvas fit already ran inside each segment chain.
+        "vbase".to_string()
+    } else if let Some((width, height)) = canvas.output_dimensions {
         match canvas.fit {
             ExportCanvasFit::Contain => graph.push_str(&format!(
                 "[vbase]scale=w={width}:h={height}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,\
@@ -496,6 +562,82 @@ fn build_video_filter_inner(
     })
 }
 
+/// Canvas-fit filter used inside a per-segment chain when framing is active.
+/// Mirrors the post-concat canvas step: `contain` scales down and pads black,
+/// `cover` scales up and crops. Without explicit output dimensions the source
+/// frame is the canvas; every segment is normalized to the same size so
+/// framed and unframed segments concat cleanly.
+fn canvas_fit_filter(canvas: VideoCanvas, width: u32, height: u32) -> String {
+    if canvas.output_dimensions.is_some() {
+        match canvas.fit {
+            ExportCanvasFit::Contain => format!(
+                "scale=w={width}:h={height}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,\
+                 pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            ),
+            ExportCanvasFit::Cover => format!(
+                "scale=w={width}:h={height}:force_original_aspect_ratio=increase:force_divisible_by=2:reset_sar=1,\
+                 crop={width}:{height}:(iw-ow)/2:(ih-oh)/2"
+            ),
+        }
+    } else {
+        format!("scale=w={width}:h={height}:reset_sar=1")
+    }
+}
+
+fn even_dim(value: f64) -> u32 {
+    ((value.round() as u32) & !1).max(2)
+}
+
+/// Filter chain rendering one shot's framing on a canvas-sized frame.
+/// Adapted from pireel (AGPL-3.0), `composition-core.ts` `shotTransformVars`:
+/// the frame scales about its center and is then positioned. `punch-in`
+/// crops a centered window and scales it back to the canvas; corner/split
+/// scale down and pad onto black — the same background the `contain`
+/// canvas fit uses.
+fn framing_filter_chain(framing: &ShotFraming, dims: (u32, u32)) -> Option<String> {
+    let (width, height) = dims;
+    let scale = treat_scale(framing.treatment, framing.size);
+    match framing.treatment {
+        ShotTreatment::Full => None,
+        ShotTreatment::PunchIn => {
+            let crop_w = even_dim(f64::from(width) / scale);
+            let crop_h = even_dim(f64::from(height) / scale);
+            Some(format!(
+                "crop=w={crop_w}:h={crop_h}:x=(iw-ow)/2:y=(ih-oh)/2,scale=w={width}:h={height}"
+            ))
+        }
+        ShotTreatment::CornerBr | ShotTreatment::CornerTl => {
+            let small_w = even_dim(f64::from(width) * scale);
+            let small_h = even_dim(f64::from(height) * scale);
+            // pireel leaves a 2% margin from the corner.
+            let margin_x = (f64::from(width) * 0.02).round() as u32;
+            let margin_y = (f64::from(height) * 0.02).round() as u32;
+            let (x, y) = if framing.treatment == ShotTreatment::CornerBr {
+                (width - small_w - margin_x, height - small_h - margin_y)
+            } else {
+                (margin_x, margin_y)
+            };
+            Some(format!(
+                "scale=w={small_w}:h={small_h},pad={width}:{height}:{x}:{y}:color=black"
+            ))
+        }
+        ShotTreatment::SplitL | ShotTreatment::SplitR => {
+            let small_w = even_dim(f64::from(width) * scale);
+            let small_h = even_dim(f64::from(height) * scale);
+            // Half-split hugs its edge, vertically centered.
+            let x = if framing.treatment == ShotTreatment::SplitL {
+                0
+            } else {
+                width - small_w
+            };
+            let y = (height - small_h) / 2;
+            Some(format!(
+                "scale=w={small_w}:h={small_h},pad={width}:{height}:{x}:{y}:color=black"
+            ))
+        }
+    }
+}
+
 fn scale_design_rect(rect: Rect, frame_size: Option<(u32, u32)>) -> Rect {
     let Some((width, height)) = frame_size else {
         return rect;
@@ -564,6 +706,7 @@ pub async fn render_video_with_broll_progress(
             settings: None,
             soft_subtitle: None,
             include_ass: true,
+            framings: Vec::new(),
         },
     )
     .await
@@ -586,6 +729,7 @@ pub async fn render_video_with_broll_options(
         settings,
         soft_subtitle,
         include_ass,
+        framings,
     } = options;
     let settings = settings.unwrap_or_else(|| VideoExportSettings {
         encoding_speed: match mode.as_deref() {
@@ -612,7 +756,14 @@ pub async fn render_video_with_broll_options(
         .map(|(start, end)| end - start)
         .sum();
 
-    let path = export_render_path(&settings, cuts, placements, &audio_mix, include_ass);
+    let path = export_render_path(
+        &settings,
+        cuts,
+        placements,
+        &audio_mix,
+        include_ass,
+        &framings,
+    );
     if path == ExportRenderPath::StreamCopy && purpose == RenderPurpose::Final {
         info!(
             path = "stream-copy",
@@ -649,6 +800,7 @@ pub async fn render_video_with_broll_options(
         include_ass.then_some(ass),
         placements,
         &audio_mix,
+        &framings,
         VideoCanvas {
             frame_size,
             output_dimensions,
@@ -739,7 +891,7 @@ pub async fn render_video_with_broll_options(
         speed = ?settings.encoding_speed,
         source_bitrate,
         filter_prepare_ms = filter_ms,
-        reason = %reencode_reason(&settings, cuts, placements, &audio_mix, include_ass),
+        reason = %reencode_reason(&settings, cuts, placements, &audio_mix, include_ass, &framings),
         "video export re-encode starting"
     );
     if let Some(callback) = &on_progress {
@@ -938,6 +1090,7 @@ pub async fn render_broll_snapshot(
         None,
         std::slice::from_ref(&snapshot_placement),
         &AudioMix::default(),
+        &[],
         VideoCanvas {
             frame_size,
             ..Default::default()
@@ -1516,6 +1669,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             Some(Path::new("/tmp/a.ass")),
             &[placement],
             &AudioMix::default(),
+            &[],
             VideoCanvas {
                 frame_size: Some((1280, 720)),
                 ..Default::default()
@@ -1536,6 +1690,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             None,
             &[],
             &AudioMix::default(),
+            &[],
             VideoCanvas {
                 frame_size: Some((1920, 1080)),
                 output_dimensions: Some((1920, 1080)),
@@ -1579,6 +1734,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             None,
             &[placement],
             &AudioMix::default(),
+            &[],
             VideoCanvas {
                 frame_size: Some((1080, 1920)),
                 output_dimensions: Some((1080, 1920)),
@@ -1591,6 +1747,225 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
         let broll = plan.filter_complex.find("[1:v]trim=").unwrap();
         assert!(crop < broll);
         assert!(plan.filter_complex.contains("overlay=x=540:y=960"));
+    }
+
+    fn framing(treatment: ShotTreatment, size: Option<f64>) -> ShotFraming {
+        ShotFraming {
+            id: "fr-1".into(),
+            start: 0.0,
+            end: 6.0,
+            treatment,
+            size,
+        }
+    }
+
+    #[test]
+    fn framing_chain_computes_each_treatment_geometry() {
+        let dims = (1920, 1080);
+        // punch-in: centered crop window scaled back to the canvas.
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::PunchIn, None), dims).as_deref(),
+            Some("crop=w=1572:h=884:x=(iw-ow)/2:y=(ih-oh)/2,scale=w=1920:h=1080")
+        );
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::PunchIn, Some(100.0)), dims).as_deref(),
+            Some("crop=w=960:h=540:x=(iw-ow)/2:y=(ih-oh)/2,scale=w=1920:h=1080")
+        );
+        // corner: shrink to 0.34× and hug the corner with a 2% margin.
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::CornerBr, None), dims).as_deref(),
+            Some("scale=w=652:h=366,pad=1920:1080:1230:692:color=black")
+        );
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::CornerTl, None), dims).as_deref(),
+            Some("scale=w=652:h=366,pad=1920:1080:38:22:color=black")
+        );
+        // split: shrink to 0.5× and hug the left/right edge, vertically centered.
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::SplitL, None), dims).as_deref(),
+            Some("scale=w=960:h=540,pad=1920:1080:0:270:color=black")
+        );
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::SplitR, None), dims).as_deref(),
+            Some("scale=w=960:h=540,pad=1920:1080:960:270:color=black")
+        );
+        assert_eq!(
+            framing_filter_chain(&framing(ShotTreatment::Full, None), dims),
+            None
+        );
+    }
+
+    #[test]
+    fn framing_moves_the_canvas_fit_into_each_segment_chain() {
+        let cut = Cut {
+            id: "c1".into(),
+            note: None,
+            a_word: "w1".into(),
+            b_word: "w1".into(),
+            kind: CutKind::Manual,
+            duration: 2.0,
+        };
+        // Frame only the second kept segment (3..6).
+        let entries = vec![ShotFraming {
+            id: "fr-1".into(),
+            start: 3.0,
+            end: 6.0,
+            treatment: ShotTreatment::PunchIn,
+            size: None,
+        }];
+        let plan = build_video_filter_inner(
+            &doc(),
+            &[cut],
+            None,
+            &[],
+            &AudioMix::default(),
+            &entries,
+            VideoCanvas {
+                frame_size: Some((1920, 1080)),
+                output_dimensions: Some((1920, 1080)),
+                fit: ExportCanvasFit::Contain,
+            },
+        )
+        .unwrap();
+
+        // The first segment is canvas-fitted but not framed.
+        assert!(plan.filter_complex.contains(
+            "[0:v]trim=start=0.000000:end=1.000000,setpts=PTS-STARTPTS,\
+scale=w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,\
+pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black[v0];"
+        ));
+        // The second segment is canvas-fitted and then punch-in framed.
+        assert!(plan.filter_complex.contains(
+            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,\
+crop=w=1572:h=884:x=(iw-ow)/2:y=(ih-oh)/2,scale=w=1920:h=1080[v1];"
+        ));
+        // Concat still hard-cuts the segments; the global canvas step is gone.
+        assert!(plan
+            .filter_complex
+            .contains("concat=n=2:v=1:a=1[vbase][acat];"));
+        assert!(!plan.filter_complex.contains("[vcanvas]"));
+        assert!(plan.filter_complex.ends_with("[vbase]null[vout]"));
+    }
+
+    #[test]
+    fn framing_applies_after_a_cover_canvas_fit() {
+        let entries = vec![framing(ShotTreatment::CornerBr, None)];
+        let plan = build_video_filter_inner(
+            &doc(),
+            &[],
+            None,
+            &[],
+            &AudioMix::default(),
+            &entries,
+            VideoCanvas {
+                frame_size: Some((1080, 1920)),
+                output_dimensions: Some((1080, 1920)),
+                fit: ExportCanvasFit::Cover,
+            },
+        )
+        .unwrap();
+
+        assert!(plan.filter_complex.contains(
+            "[0:v]setpts=PTS-STARTPTS,\
+scale=w=1080:h=1920:force_original_aspect_ratio=increase:force_divisible_by=2:reset_sar=1,\
+crop=1080:1920:(iw-ow)/2:(ih-oh)/2,\
+scale=w=366:h=652,pad=1080:1920:692:1230:color=black[vbase];"
+        ));
+    }
+
+    #[test]
+    fn framing_without_output_dimensions_normalizes_to_the_source_frame() {
+        let entries = vec![framing(ShotTreatment::SplitR, Some(50.0))];
+        let plan = build_video_filter_inner(
+            &doc(),
+            &[],
+            None,
+            &[],
+            &AudioMix::default(),
+            &entries,
+            VideoCanvas {
+                frame_size: Some((1920, 1080)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(plan.filter_complex.contains(
+            "[0:v]setpts=PTS-STARTPTS,scale=w=1920:h=1080:reset_sar=1,\
+scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
+        ));
+        // Unknown canvas dimensions must not silently drop the framing.
+        assert!(build_video_filter_inner(
+            &doc(),
+            &[],
+            None,
+            &[],
+            &AudioMix::default(),
+            &entries,
+            VideoCanvas::default(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn real_export_with_shot_framing_renders_the_framed_canvas() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.mp4");
+        make_test_media(&source).await;
+        let mut media_doc = doc();
+        media_doc.media.path = source;
+        media_doc.media.duration_seconds = 0.6;
+        let output = temp.path().join("framed.mp4");
+        render_video_with_broll_options(
+            &media_doc,
+            &[],
+            &temp.path().join("unused.ass"),
+            &output,
+            &[],
+            VideoRenderOptions {
+                purpose: RenderPurpose::Final,
+                mode: None,
+                on_progress: None,
+                audio_mix: AudioMix::default(),
+                settings: Some(VideoExportSettings {
+                    encoding_speed: ExportEncodingSpeed::Fast,
+                    resolution: crate::data::export_settings::ExportResolution::Hd720,
+                    ..Default::default()
+                }),
+                soft_subtitle: None,
+                include_ass: false,
+                framings: vec![ShotFraming {
+                    id: "fr-1".into(),
+                    start: 0.0,
+                    end: 0.6,
+                    treatment: ShotTreatment::CornerBr,
+                    size: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        // The generated filter graph must run in ffmpeg and keep the canvas.
+        let rendered = crate::media::probe(&output).await.unwrap();
+        assert_eq!(rendered.width.zip(rendered.height), Some((1280, 720)));
+    }
+
+    #[test]
+    fn all_full_framing_keeps_the_legacy_graph() {
+        let entries = vec![framing(ShotTreatment::Full, None)];
+        let plan = build_video_filter_inner(
+            &doc(),
+            &[],
+            None,
+            &[],
+            &AudioMix::default(),
+            &entries,
+            VideoCanvas::default(),
+        )
+        .unwrap();
+        assert!(plan
+            .filter_complex
+            .contains("[0:v]setpts=PTS-STARTPTS[vbase];"));
     }
 
     #[tokio::test]
@@ -1744,22 +2119,55 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
             &[],
             &[],
             &AudioMix::default(),
-            false
+            false,
+            &[]
         ));
         assert!(!can_stream_copy_export(
             &VideoExportSettings::default(), // burn
             &[],
             &[],
             &AudioMix::default(),
-            false
+            false,
+            &[]
         ));
         assert!(!can_stream_copy_export(
             &soft,
             &[],
             &[],
             &AudioMix::default(),
-            true // titles burn
+            true, // titles burn
+            &[]
         ));
+        // Any real framing work also forces a re-encode.
+        assert!(!can_stream_copy_export(
+            &soft,
+            &[],
+            &[],
+            &AudioMix::default(),
+            false,
+            &[ShotFraming {
+                id: "fr-1".into(),
+                start: 0.0,
+                end: 2.0,
+                treatment: ShotTreatment::PunchIn,
+                size: None,
+            }]
+        ));
+        assert!(reencode_reason(
+            &soft,
+            &[],
+            &[],
+            &AudioMix::default(),
+            false,
+            &[ShotFraming {
+                id: "fr-1".into(),
+                start: 0.0,
+                end: 2.0,
+                treatment: ShotTreatment::PunchIn,
+                size: None,
+            }]
+        )
+        .contains("per-shot framing"));
     }
 
     #[test]
@@ -1924,6 +2332,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 }),
                 soft_subtitle: Some(srt),
                 include_ass: false,
+                framings: Vec::new(),
             },
         )
         .await
@@ -1979,6 +2388,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 }),
                 soft_subtitle: Some(remux_srt),
                 include_ass: false,
+                framings: Vec::new(),
             },
         )
         .await
@@ -2073,6 +2483,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 }),
                 soft_subtitle: None,
                 include_ass: false,
+                framings: Vec::new(),
             },
         )
         .await
@@ -2103,6 +2514,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 }),
                 soft_subtitle: None,
                 include_ass: false,
+                framings: Vec::new(),
             },
         )
         .await
@@ -2140,6 +2552,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                     }),
                     soft_subtitle: None,
                     include_ass: false,
+                    framings: Vec::new(),
                 },
             )
             .await
@@ -2194,6 +2607,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 }),
                 soft_subtitle: None,
                 include_ass: true,
+                framings: Vec::new(),
             },
         )
         .await
