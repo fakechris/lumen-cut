@@ -37,6 +37,8 @@ interface Props {
   onReplace: (query: string, replacement: string) => Promise<number>;
   /** Descript-style: remove selected words from the edited timeline. */
   onRemoveWords?: (wordIds: string[]) => Promise<void>;
+  /** Restore previously removed (struck-through) words to the timeline. */
+  onRestoreWords?: (wordIds: string[]) => Promise<void>;
   onSave: (id: string, text: string) => Promise<void>;
   onSaveMany: (updates: Array<{ id: string; text: string }>) => Promise<void>;
   onSeek: (seconds: number, autoplay?: boolean) => void;
@@ -96,6 +98,7 @@ export function TranscriptEditor({
   onMerge,
   onReplace,
   onRemoveWords,
+  onRestoreWords,
   onSave,
   onSaveMany,
   onSeek,
@@ -377,10 +380,10 @@ export function TranscriptEditor({
                     <span>{lang === "zh" ? "导出时隐藏" : "Hidden from export"}</span>
                   )}
                 </div>
-                {mode === "transcript" && words.length > 0 && onRemoveWords && (
+                {mode === "transcript" && words.length > 0 && (onRemoveWords || onRestoreWords) && (
                   <div
                     className="transcript-word-stream"
-                    aria-label={lang === "zh" ? "点击词语可从成片去掉" : "Click a word to remove it from the edit"}
+                    aria-label={lang === "zh" ? "点击词语可从成片去掉或恢复" : "Click a word to remove it from, or restore it to, the edit"}
                   >
                     {words.map((word) => {
                       const cut = cutWordIds?.has(word.id) ?? false;
@@ -389,18 +392,28 @@ export function TranscriptEditor({
                           key={word.id}
                           type="button"
                           className={`transcript-word${cut ? " is-cut" : ""}`}
-                          disabled={busy || cut || !word.id || word.id.startsWith("legacy-")}
+                          disabled={
+                            busy
+                            || !word.id
+                            || word.id.startsWith("legacy-")
+                            || (cut ? !onRestoreWords : !onRemoveWords)
+                          }
                           title={
                             cut
-                              ? (lang === "zh" ? "已从成片去掉" : "Already removed from the edit")
+                              ? (lang === "zh"
+                                ? `已从成片去掉，点击恢复「${word.text}」`
+                                : `Removed from the edit — click to restore “${word.text}”`)
                               : (lang === "zh"
                                 ? `点击去掉「${word.text}」对应的画面和声音`
                                 : `Click to remove “${word.text}” from the edit`)
                           }
                           onClick={() => {
-                            if (cut) return;
                             onSeek(word.start, false);
-                            void onRemoveWords([word.id]);
+                            if (cut) {
+                              void onRestoreWords?.([word.id]);
+                            } else {
+                              void onRemoveWords?.([word.id]);
+                            }
                           }}
                         >
                           {word.text}

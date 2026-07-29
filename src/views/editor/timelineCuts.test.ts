@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import type { CutSummary } from "../../api";
 import type { Doc } from "../../types";
 import {
+  cutWordIdsForDoc,
   editedToSourceTime,
   editedTimelineDuration,
   nextPlayableTime,
@@ -106,5 +107,42 @@ describe("timeline cut preview", () => {
     }
     expect(editedToSourceTime(-1, intervals, 10)).toBe(0);
     expect(editedToSourceTime(100, intervals, 10)).toBe(10);
+  });
+});
+
+describe("cut word display", () => {
+  test("marks every word a word-cut interval covers", () => {
+    const removed = cutWordIdsForDoc(doc, [cut({ a_word: "w1", b_word: "w2" })]);
+
+    expect([...removed].sort()).toEqual(["w1", "w2"]);
+  });
+
+  test("silence cuts strike through nothing — only the gap is removed", () => {
+    const removed = cutWordIdsForDoc(doc, [
+      cut({ a_word: "w1", b_word: "w2", duration: 0.4, kind: "silence" }),
+    ]);
+
+    expect(removed.size).toBe(0);
+  });
+
+  test("a restored (split) cut no longer marks the restored word", () => {
+    // Mirrors the Rust `cuts_restore` split: w2 returns to the timeline and
+    // the original w1..w3 cut becomes two one-word cuts.
+    const restored = [
+      cut({ id: "cut~1", a_word: "w1", b_word: "w1" }),
+      cut({ id: "cut~2", a_word: "w3", b_word: "w3" }),
+    ];
+
+    const removed = cutWordIdsForDoc(doc, restored);
+    expect(removed.has("w1")).toBe(true);
+    expect(removed.has("w2")).toBe(false);
+    expect(removed.has("w3")).toBe(true);
+
+    const intervals = resolveTimelineCuts(doc, restored);
+    expect(editedTimelineDuration(10, intervals)).toBe(8);
+  });
+
+  test("with no cuts nothing is struck through", () => {
+    expect(cutWordIdsForDoc(doc, []).size).toBe(0);
   });
 });

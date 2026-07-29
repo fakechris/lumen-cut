@@ -31,6 +31,7 @@ import {
   cutSpeechCleanup,
   cutWords,
   cutRestore,
+  cutsRestore,
   editHistoryStatus,
   editRedo,
   editUndo,
@@ -147,6 +148,7 @@ import {
 } from "./editor/ChapterWorkspace";
 import { DEFAULT_AUDIO_MIX } from "./editor/audioMix";
 import {
+  cutWordIdsForDoc,
   editedTimelineDuration,
   nextPlayableTime,
   resolveTimelineCuts,
@@ -995,22 +997,7 @@ export function TranscriptView({
         if (next) nextCues[sentence.id] = next.id;
       });
     }
-    const removed = new Set<string>();
-    if (doc) {
-      const allWords = doc.paragraphs.flatMap((p) =>
-        p.sentences.flatMap((s) => s.words),
-      );
-      for (const cut of cuts) {
-        const a = allWords.find((w) => w.id === cut.a_word);
-        const b = allWords.find((w) => w.id === cut.b_word);
-        if (!a || !b) continue;
-        const lo = Math.min(a.start, b.start);
-        const hi = Math.max(a.end, b.end);
-        for (const word of allWords) {
-          if (word.start < hi && word.end > lo) removed.add(word.id);
-        }
-      }
-    }
+    const removed = doc ? cutWordIdsForDoc(doc, cuts) : new Set<string>();
     return { wordsByCue: words, nextCueById: nextCues, cutWordIds: removed };
   }, [cuts, doc, doc?.paragraphs]);
 
@@ -2570,6 +2557,25 @@ export function TranscriptView({
     });
   };
 
+  const restoreWords = async (wordIds: string[]) => {
+    if (wordIds.length === 0) return;
+    await perform("restore-words", async () => {
+      const restored = await cutsRestore(pid, wordIds);
+      setCuts(await cutList(pid));
+      if (restored > 0) await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? restored > 0
+            ? `已把选中的词恢复到成片（可撤销）。`
+            : "这些词已经在成片中。"
+          : restored > 0
+            ? "Restored the selected word(s) to the edit. Undoable."
+            : "Those words are already in the edit.",
+      });
+    });
+  };
+
   const runReview = () =>
     perform("audit", async () => {
       setAuditReport(await audit(pid));
@@ -3333,8 +3339,8 @@ export function TranscriptView({
               <h2>{lang === "zh" ? "编辑提示" : "Editing tip"}</h2>
               <p>
                 {lang === "zh"
-                  ? "点词去掉画面；改文字后按 ⌘↵ 保存。批量操作可一次撤销。"
-                  : "Click a word to cut its media; press ⌘↵ to save text edits. Batch cuts undo as one step."}
+                  ? "点词去掉画面，点划线词恢复；改文字后按 ⌘↵ 保存。批量操作可一次撤销。"
+                  : "Click a word to cut its media, or a struck-through word to restore it; press ⌘↵ to save text edits. Batch cuts undo as one step."}
               </p>
             </section>
           </aside>
@@ -3354,6 +3360,7 @@ export function TranscriptView({
             onMerge={mergeSubtitleLines}
             onRemoveWords={removeWords}
             onReplace={replaceSubtitles}
+            onRestoreWords={restoreWords}
             onSave={saveSubtitle}
             onSaveMany={saveSubtitles}
             onSeek={seekWorkbench}
