@@ -101,11 +101,36 @@ describe("captionPresetLineCss (preset → CSS)", () => {
 
 describe("captionPresetSubLineCss (translation line)", () => {
   it("scales relative to the main line in em so it follows the user's font size", () => {
-    expect(CAPTION_SUB_LINE_SCALE).toBeGreaterThan(0);
-    expect(CAPTION_SUB_LINE_SCALE).toBeLessThan(1);
+    // 0.85 (not pireel's 0.7): CJK glyphs read far smaller than Latin per em.
+    expect(CAPTION_SUB_LINE_SCALE).toBe(0.85);
     expect(captionPresetSubLineCss().fontSize).toBe(`${CAPTION_SUB_LINE_SCALE}em`);
     // No color/font of its own: the sub-line inherits the preset's look.
     expect(captionPresetSubLineCss().color).toBeUndefined();
+  });
+});
+
+describe("approximated translation word timing (wordsFromText)", () => {
+  it("partitions the cue window linearly by token length", () => {
+    const words = wordsFromText("你好世界", 2, 4);
+    expect(words).toHaveLength(2);
+    // Contiguous coverage of [2, 4): each token starts where the last ended.
+    expect(words[0].start).toBe(2);
+    expect(words[1].start).toBe(words[0].end);
+    expect(words[1].end).toBeCloseTo(4, 3);
+    expect(words[1].end - words[1].start).toBeCloseTo(
+      words[0].end - words[0].start,
+      3,
+    );
+  });
+
+  it("allocates Latin words proportionally and keeps their spaces out of timing", () => {
+    const words = wordsFromText("hello there", 0, 1);
+    expect(words.map((w) => w.text)).toEqual(["hello", "there"]);
+    expect(words[0].end - words[0].start).toBeCloseTo(0.5, 3);
+  });
+
+  it("returns no tokens for empty text (caller falls back to whole-line)", () => {
+    expect(wordsFromText("   ", 0, 1)).toEqual([]);
   });
 });
 

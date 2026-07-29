@@ -262,6 +262,13 @@ pub fn preset_fontname(preset: &CaptionPreset) -> Option<&'static str> {
     }
 }
 
+/// Translation sub-line size relative to the main line (applied as an ASS
+/// `\fs` override on the sub-line). pireel uses 0.7, but CJK glyphs read far
+/// smaller than Latin at the same em size, so lumen-cut uses 0.85. Kept in
+/// sync with CAPTION_SUB_LINE_SCALE in src/views/editor/captionPresets.ts so
+/// the preview matches the export.
+pub const CAPTION_SUB_LINE_SCALE: f64 = 0.85;
+
 /// CSS color (`#rgb`, `#rrggbb`, `#rrggbbaa`, `rgb()`/`rgba()`) → ASS `&HAABBGGRR`.
 /// ASS alpha is inverted opacity: 0 = opaque, 255 = transparent.
 pub fn css_color_to_ass(value: &str) -> Option<String> {
@@ -337,20 +344,98 @@ fn without_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// CJK scripts the approximation segments per character (same script ranges
+/// the frontend's detectLang/segmentation recognises).
+fn is_cjk(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch)
+        || ('\u{3040}'..='\u{30ff}').contains(&ch)
+        || ('\u{ac00}'..='\u{d7af}').contains(&ch)
+}
+
+/// Rough word segmentation for the NO-REAL-WORD-TIMING approximation: CJK
+/// splits per character, Latin splits on whitespace, punctuation glues onto
+/// the preceding token. This is the Rust counterpart of the frontend's
+/// segmentTokens (Intl.Segmenter) — coarser (single CJK chars where ICU
+/// groups dictionary words) but with the same contract: the tokens rebuild
+/// the input and punctuation never stands alone.
+fn approx_tokens(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut latin = String::new();
+    fn flush(latin: &mut String, tokens: &mut Vec<String>) {
+        if !latin.is_empty() {
+            tokens.push(std::mem::take(latin));
+        }
+    }
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            flush(&mut latin, &mut tokens);
+        } else if is_cjk(ch) {
+            flush(&mut latin, &mut tokens);
+            tokens.push(ch.to_string());
+        } else if ch.is_alphanumeric() || !latin.is_empty() {
+            // Latin letters/digits, plus punctuation inside or right after a
+            // Latin run, stay with that token ("hello,", "it's").
+            latin.push(ch);
+        } else if let Some(last) = tokens.last_mut() {
+            // Punctuation right after a CJK token glues backwards ("。").
+            last.push(ch);
+        } else {
+            latin.push(ch);
+        }
+    }
+    flush(&mut latin, &mut tokens);
+    tokens
+}
+
+/// Approximate karaoke tags for text without real word timing (translation
+/// lines, translation-only cues): split into tokens and allocate the cue
+/// window [start,end) linearly by token character count — the same algorithm
+/// as the frontend's wordsFromText. Returns None for empty text or a
+/// zero-length window (caller falls back to the plain line).
+fn approx_karaoke(text: &str, start: f64, end: f64) -> Option<String> {
+    let tokens = approx_tokens(text);
+    if tokens.is_empty() || end <= start {
+        return None;
+    }
+    let total: usize = tokens.iter().map(|t| t.chars().count()).sum();
+    if total == 0 {
+        return None;
+    }
+    let span = end - start;
+    let mut out = String::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        let dur = (tok.chars().count() as f64 / total as f64) * span;
+        let cs = (dur * 100.0).round().max(1.0) as u32;
+        out.push_str(&format!("{{\\k{cs}}}{tok}"));
+        if i + 1 < tokens.len() && latin_join(tok, &tokens[i + 1]) {
+            out.push(' ');
+        }
+    }
+    Some(out)
+}
+
 /// Build the Dialogue text for a caption-preset sentence.
 ///
-/// Emphasis presets with an emphasis colour get `\k` karaoke tags per ASR word:
-/// the inline `\1c` (sung = emphasis colour) / `\2c` (unsung = body colour)
-/// overrides make each word switch colour as it is spoken. Word timing comes
-/// from the transcript's ASR words, retimed onto the post-cut timeline.
+/// Emphasis presets with an emphasis colour get `\k` karaoke tags: the inline
+/// `\1c` (sung = emphasis colour) / `\2c` (unsung = body colour) overrides make
+/// each word switch colour as it is spoken. Timing sources, in priority order:
+///   - a source line the word stream rebuilds verbatim → REAL ASR word timing,
+///     retimed onto the post-cut timeline;
+///   - everything else (translation lines, translation-only cues, edited text)
+///     → APPROXIMATION: the cue window is allocated linearly across the text's
+///     tokens (approx_tokens/approx_karaoke) — translations have no real word
+///     timing of their own. The preview applies the same approximation.
+/// Bilingual cues ("source\ntranslation") karaoke both lines, and the
+/// translation gets a `\fs` override at CAPTION_SUB_LINE_SCALE so the export
+/// matches the preview's sub-line ratio.
 ///
-/// Returns `None` when the word stream cannot reproduce the visible source text
-/// (e.g. translation-only captions, whose words belong to the source language):
-/// the caller falls back to the plain whole-line style.
+/// Returns `None` when nothing can be timed (empty text, no words, zero-length
+/// window): the caller falls back to the plain whole-line style.
 pub fn preset_dialogue_text(
     text: &str,
     words: &[Word],
     preset: &CaptionPreset,
+    font_size: u32,
     retime: &dyn Fn(f64) -> f64,
 ) -> Option<String> {
     let emphasis = preset
@@ -366,25 +451,31 @@ pub fn preset_dialogue_text(
     if source.is_empty() || words.is_empty() {
         return None;
     }
-    // Guard: only karaoke when the words rebuild the source text exactly
-    // (whitespace-insensitive); otherwise real text beats pretty timing.
-    if without_whitespace(&join_words(words)) != without_whitespace(source) {
-        return None;
-    }
-    let mut out = format!("{{\\1c{primary}\\2c{secondary}}}");
-    for (i, w) in words.iter().enumerate() {
-        let start = retime(w.start);
-        let end = retime(w.end);
-        // \k duration is in centiseconds; cut-away words collapse to a 1cs blip.
-        let cs = ((end - start) * 100.0).round().max(1.0) as u32;
-        out.push_str(&format!("{{\\k{cs}}}{}", w.text));
-        if i + 1 < words.len() && latin_join(&w.text, &words[i + 1].text) {
-            out.push(' ');
+    // Karaoke window: the cue's retimed span (the same bounds ass.rs puts on
+    // the Dialogue event).
+    let start = retime(words.first()?.start);
+    let end = retime(words.last()?.end);
+    let main = if without_whitespace(&join_words(words)) == without_whitespace(source) {
+        // Real ASR word timing; cut-away words collapse to a 1cs blip.
+        let mut out = String::new();
+        for (i, w) in words.iter().enumerate() {
+            let cs = ((retime(w.end) - retime(w.start)) * 100.0).round().max(1.0) as u32;
+            out.push_str(&format!("{{\\k{cs}}}{}", w.text));
+            if i + 1 < words.len() && latin_join(&w.text, &words[i + 1].text) {
+                out.push(' ');
+            }
         }
-    }
+        out
+    } else {
+        // Approximation: translation-only cue, or text the word stream cannot
+        // reproduce — linear token timing over the cue window.
+        approx_karaoke(source, start, end)?
+    };
+    let mut out = format!("{{\\1c{primary}\\2c{secondary}}}{main}");
     if let Some(rest) = translation {
-        out.push_str("\\N");
-        out.push_str(&rest.replace('\n', "\\N"));
+        let sub_size = (font_size as f64 * CAPTION_SUB_LINE_SCALE).round().max(1.0) as u32;
+        let sub = approx_karaoke(rest, start, end)?;
+        out.push_str(&format!("\\N{{\\fs{sub_size}}}{sub}"));
     }
     Some(out)
 }
@@ -444,7 +535,7 @@ mod tests {
     fn karaoke_tags_follow_word_timing() {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("Hello", 1.0, 1.4), word("world", 1.4, 2.0)];
-        let text = preset_dialogue_text("Hello world", &words, preset, &|t| t).unwrap();
+        let text = preset_dialogue_text("Hello world", &words, preset, 52, &|t| t).unwrap();
         assert_eq!(
             text,
             "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k40}Hello {\\k60}world"
@@ -452,25 +543,60 @@ mod tests {
     }
 
     #[test]
-    fn bilingual_cue_karaokes_the_source_line_only() {
+    fn bilingual_cue_karaokes_both_lines_and_scales_the_sub_line() {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("你好", 0.0, 0.5), word("世界", 0.5, 1.0)];
-        let text = preset_dialogue_text("你好世界\nhello", &words, preset, &|t| t).unwrap();
+        let text = preset_dialogue_text("你好世界\nhello", &words, preset, 52, &|t| t).unwrap();
+        // Main line: real ASR timing. Sub-line: approximated (single token over
+        // the whole [0,1) window) and shrunk to 52 × 0.85 ≈ 44 via \fs.
         assert_eq!(
             text,
-            "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}你好{\\k50}世界\\Nhello"
+            "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}你好{\\k50}世界\\N{\\fs44}{\\k100}hello"
         );
     }
 
     #[test]
-    fn mismatched_words_fall_back_to_plain_line() {
+    fn approx_tokens_split_cjk_per_char_and_latin_on_whitespace() {
+        assert_eq!(approx_tokens("你好世界"), vec!["你", "好", "世", "界"]);
+        assert_eq!(approx_tokens("hello world"), vec!["hello", "world"]);
+        assert_eq!(approx_tokens("Hello, world"), vec!["Hello,", "world"]);
+        // Punctuation glues onto the preceding CJK token.
+        assert_eq!(approx_tokens("你好。世界"), vec!["你", "好。", "世", "界"]);
+        assert!(approx_tokens("  ").is_empty());
+    }
+
+    #[test]
+    fn sub_line_scale_is_the_cjk_adjusted_ratio() {
+        assert_eq!(CAPTION_SUB_LINE_SCALE, 0.85);
+    }
+
+    #[test]
+    fn translation_only_cue_gets_approximated_karaoke() {
         let preset = caption_preset("em-yellow").unwrap();
-        // Translation-only cue: the words describe the source, not this text.
+        // The words describe the source language, not this translation text:
+        // timing falls back to linear allocation over the cue window [0,1).
         let words = [word("你好", 0.0, 1.0)];
-        assert!(preset_dialogue_text("hello there", &words, preset, &|t| t).is_none());
+        let text = preset_dialogue_text("hello there", &words, preset, 52, &|t| t).unwrap();
+        assert_eq!(
+            text,
+            "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}hello {\\k50}there"
+        );
         // Line presets never karaoke.
         let line = caption_preset("ln-clean").unwrap();
-        assert!(preset_dialogue_text("你好", &words, line, &|t| t).is_none());
+        assert!(preset_dialogue_text("你好", &words, line, 52, &|t| t).is_none());
+    }
+
+    #[test]
+    fn untimeable_text_falls_back_to_plain_line() {
+        let preset = caption_preset("em-yellow").unwrap();
+        let words = [word("你好", 0.0, 1.0)];
+        // Empty translation line: nothing to allocate → no dialogue text.
+        assert!(preset_dialogue_text("你好世界\n  ", &words, preset, 52, &|t| t).is_none());
+        // No words at all: no window to allocate over.
+        assert!(preset_dialogue_text("hello", &[], preset, 52, &|t| t).is_none());
+        // Zero-length window.
+        let frozen = [word("你好", 1.0, 1.0)];
+        assert!(preset_dialogue_text("hello", &frozen, preset, 52, &|t| t).is_none());
     }
 
     #[test]
@@ -478,9 +604,14 @@ mod tests {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("ab", 0.0, 1.0), word("cd", 1.0, 2.0)];
         // Simulate a cut that removes the second word's span entirely.
-        let text =
-            preset_dialogue_text("abcd", &words, preset, &|t| if t >= 1.0 { 1.0 } else { t })
-                .unwrap();
+        let text = preset_dialogue_text("abcd", &words, preset, 52, &|t| {
+            if t >= 1.0 {
+                1.0
+            } else {
+                t
+            }
+        })
+        .unwrap();
         assert!(text.contains("{\\k100}ab {\\k1}cd"));
     }
 }

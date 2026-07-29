@@ -182,6 +182,7 @@ fn to_ass_with_titles_impl(
                             trimmed,
                             &sent.words,
                             p,
+                            render_style.fontsize,
                             &|t| retime(t, &iv),
                         )
                     })

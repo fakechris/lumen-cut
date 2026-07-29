@@ -37,7 +37,7 @@ import {
 } from "./captionPresets";
 import { framingAtTime, shotTransformCss } from "./shotFraming";
 import { titleOpacityAt } from "./titleAnimation";
-import { latinJoin } from "../../vendor/pireel/caption-fx";
+import { latinJoin, wordsFromText, type FxWord } from "../../vendor/pireel/caption-fx";
 import type { CaptionPreset } from "../../vendor/pireel/caption-presets";
 
 interface Props {
@@ -184,36 +184,52 @@ export function EditorMediaPreview({
     }
     return undefined;
   }, [activeCue, captionPreset, doc]);
-  // Emphasis presets highlight the spoken word using the transcript's ASR word
-  // timing. That timing only exists for the source-language line, so a
-  // translation-only cue (or any cue whose text no longer matches the source
-  // sentence) degrades to the whole-line preset look.
-  const captionWords = useMemo(() => {
-    if (!captionPreset || captionPreset.mode !== "emphasis" || !activeCue || !activeSentence) {
-      return null;
+  // Emphasis presets highlight the spoken word. The source line uses the
+  // transcript's real ASR word timing; translation text has no word timing, so
+  // it is APPROXIMATED — the cue window is split linearly across its tokens
+  // (wordsFromText/segmentTokens: ICU word boundaries, CJK words, Latin on
+  // spaces). The same approximation is applied on the ASS export side. Empty
+  // text or a zero-length window falls back to the whole-line look.
+  const captionLines = useMemo(() => {
+    if (!captionPreset || captionPreset.mode !== "emphasis" || !activeCue) return null;
+    const approximate = (text: string) =>
+      wordsFromText(text, activeCue.start, activeCue.end);
+    const real = (words: Doc["paragraphs"][number]["sentences"][number]["words"]): FxWord[] =>
+      words.map((word) => ({ text: word.text, start: word.start, end: word.end }));
+    const source = activeSentence?.text.trim();
+    if (activeSentence && source === activeCue.text) {
+      return { main: real(activeSentence.words), sub: null as FxWord[] | null };
     }
-    const source = activeSentence.text.trim();
-    if (activeCue.text === source) {
-      return { words: activeSentence.words, translation: null as string | null };
+    if (activeSentence && source && activeCue.text.startsWith(`${source}\n`)) {
+      const translation = activeCue.text.slice(source.length + 1);
+      const sub = approximate(translation);
+      return { main: real(activeSentence.words), sub: sub.length ? sub : null };
     }
-    if (activeCue.text.startsWith(`${source}\n`)) {
-      return {
-        words: activeSentence.words,
-        translation: activeCue.text.slice(source.length + 1),
-      };
-    }
-    return null;
+    // Translation-only cue (or the source sentence is unavailable): approximate
+    // over the whole cue text.
+    const main = approximate(activeCue.text);
+    return main.length ? { main, sub: null } : null;
   }, [activeCue, activeSentence, captionPreset]);
   // currentTime advances with the video's timeupdate events (~4Hz), so the
   // highlight steps word-to-word rather than sweeping — good enough for a preview.
-  const activeWordIndex = useMemo(() => {
-    if (!captionWords) return -1;
+  const activeMainIndex = useMemo(() => {
+    if (!captionLines) return -1;
     let index = -1;
-    captionWords.words.forEach((word, i) => {
+    captionLines.main.forEach((word, i) => {
       if (currentTime >= word.start) index = i;
     });
     return index;
-  }, [captionWords, currentTime]);
+  }, [captionLines, currentTime]);
+  const activeSubIndex = useMemo(() => {
+    if (!captionLines?.sub) return -1;
+    let index = -1;
+    captionLines.sub.forEach((word, i) => {
+      if (currentTime >= word.start) index = i;
+    });
+    return index;
+  }, [captionLines, currentTime]);
+  // Hoisted so JSX closures keep the non-null narrowing.
+  const captionSub = captionLines?.sub ?? null;
   const canvasDimensions = useMemo(
     () => resolveCanvasDimensions(exportSettings, sourceDimensions),
     [exportSettings, sourceDimensions],
@@ -592,30 +608,44 @@ export function EditorMediaPreview({
                 >
                   {subtitleStyle && captionPreset ? (
                     <span style={presetSpanStyle(captionPreset, subtitleStyle, canvasDimensions.width)}>
-                      {captionWords ? (
+                      {captionLines ? (
                         <>
-                          {captionWords.words.map((word, i) => (
+                          {captionLines.main.map((word, i) => (
                             <span
-                              key={word.id}
-                              style={i === activeWordIndex
+                              key={i}
+                              style={i === activeMainIndex
                                 ? captionPresetWordCss(captionPreset)
                                 : undefined}
                             >
                               {word.text}
-                              {i < captionWords.words.length - 1
-                                && latinJoin(word.text, captionWords.words[i + 1].text)
+                              {i < captionLines.main.length - 1
+                                && latinJoin(word.text, captionLines.main[i + 1].text)
                                 ? " "
                                 : ""}
                             </span>
                           ))}
-                          {captionWords.translation && (
+                          {captionSub && (
                             <>
                               <br />
                               {/* Sub-line: same preset look (inherited), scaled
                                   down so it stays proportional to the user's
-                                  font size instead of matching the main line. */}
+                                  font size; emphasis follows the approximated
+                                  token timing (no real word times exist). */}
                               <span style={captionPresetSubLineCss()}>
-                                {captionWords.translation}
+                                {captionSub.map((word, i) => (
+                                  <span
+                                    key={i}
+                                    style={i === activeSubIndex
+                                      ? captionPresetWordCss(captionPreset)
+                                      : undefined}
+                                  >
+                                    {word.text}
+                                    {i < captionSub.length - 1
+                                      && latinJoin(word.text, captionSub[i + 1].text)
+                                      ? " "
+                                      : ""}
+                                  </span>
+                                ))}
                               </span>
                             </>
                           )}

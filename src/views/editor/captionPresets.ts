@@ -73,10 +73,13 @@ export function captionPresetAssFont(preset: CaptionPreset): string | undefined 
   return undefined;
 }
 
-/** Translation (sub) line size relative to the main line — pireel renders its
- *  bilingual sub-line at 0.7× the main line's scale; the main line itself is
- *  always the user's SubtitleStyle font size (presets never own size). */
-export const CAPTION_SUB_LINE_SCALE = 0.7;
+/** Translation (sub) line size relative to the main line. pireel uses 0.7×, but
+ *  that reads far smaller for CJK than for Latin (denser glyphs at the same em
+ *  size), so lumen-cut uses 0.85×. The main line itself is always the user's
+ *  SubtitleStyle font size (presets never own size). The ASS export applies the
+ *  same ratio via \fs on the sub-line — keep CAPTION_SUB_LINE_SCALE in
+ *  src-tauri/src/data/caption_presets.rs in sync. */
+export const CAPTION_SUB_LINE_SCALE = 0.85;
 
 /** Whole-line preset look as CSS (color / backing pill / typeface / italic).
  *  Callers layer font size, weight and position from the user's SubtitleStyle;
