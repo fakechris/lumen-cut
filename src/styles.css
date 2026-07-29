@@ -6448,6 +6448,26 @@ pre.out {
   border-color: var(--accent);
 }
 
+.editor-view .style-preset-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.editor-view .caption-preset-group {
+  color: var(--text-tertiary);
+  display: block;
+  font-size: 10px;
+  margin-top: 10px;
+}
+
+.editor-view .caption-preset-note {
+  color: var(--text-tertiary);
+  display: block;
+  font-size: 10px;
+  line-height: 1.4;
+  margin-top: 8px;
+}
+
 .editor-view .style-preset-swatch {
   align-items: center;
   background: #111;

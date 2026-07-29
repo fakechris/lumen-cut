@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod audio_mix;
 pub mod broll;
+pub mod caption_presets;
 pub mod chapter;
 pub mod cues;
 pub mod doc;

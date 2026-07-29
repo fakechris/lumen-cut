@@ -8947,9 +8947,13 @@ pub async fn style_set(
             || style.margin_v > 2_000
             || !ass_color(&style.primary_colour)
             || !ass_color(&style.outline_colour)
+            || style
+                .caption_preset
+                .as_deref()
+                .is_some_and(|id| crate::data::caption_presets::caption_preset(id).is_none())
         {
             return Err(AppError::Schema(
-                "subtitle style contains an invalid font, colour, alignment, effect, or margin"
+                "subtitle style contains an invalid font, colour, alignment, effect, preset, or margin"
                     .into(),
             ));
         }
