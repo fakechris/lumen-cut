@@ -1,6 +1,15 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type CSSProperties } from "react";
 import type { Lang } from "../../i18n";
 import type { SubtitleStyle } from "../../types";
+import type { CaptionPreset } from "../../vendor/pireel/caption-presets";
+import {
+  CAPTION_PRESET_GROUPS,
+  captionPresetById,
+  captionPresetLineCss,
+  captionPresetName,
+  captionPresetWordCss,
+  captionPresetsForMode,
+} from "./captionPresets";
 
 const SAVED_STYLE_LIBRARY_KEY = "lumen-cut.savedSubtitleStyles.v1";
 
@@ -222,6 +231,7 @@ export function StyleWorkspace({
   const [libraryName, setLibraryName] = useState("");
   const [libraryFeedback, setLibraryFeedback] = useState<string | null>(null);
   const dirty = JSON.stringify(draft) !== JSON.stringify(savedStyle);
+  const activePreset = captionPresetById(draft.captionPreset);
 
   useEffect(() => {
     setDraft(style);
@@ -315,24 +325,45 @@ export function StyleWorkspace({
     setSaved(false);
   };
 
+  // A selected caption preset takes over color/typeface/backing; size, bold,
+  // outline and position stay on the manual controls (presets govern look only).
+  const presetLine = activePreset ? captionPresetLineCss(activePreset) : null;
+  const previewTextStyle: CSSProperties = presetLine && activePreset
+    ? {
+      ...presetLine,
+      fontFamily: presetLine.fontFamily ?? draft.fontname,
+      fontSize: `${Math.max(18, draft.fontsize * 0.55)}px`,
+      fontStyle: draft.italic || activePreset.italic ? "italic" : "normal",
+      fontWeight: draft.bold ? 700 : 400,
+      ...(activePreset.bg
+        ? {}
+        : {
+          WebkitTextStroke: `${Math.max(0, draft.outline * 0.55)}px ${assToHex(draft.outlineColour)}`,
+          textShadow: draft.shadow > 0
+            ? `${draft.shadow}px ${draft.shadow}px ${assToHex(draft.outlineColour)}`
+            : "none",
+        }),
+    }
+    : {
+      color: assToHex(draft.primaryColour),
+      fontFamily: draft.fontname,
+      fontSize: `${Math.max(18, draft.fontsize * 0.55)}px`,
+      fontStyle: draft.italic ? "italic" : "normal",
+      fontWeight: draft.bold ? 700 : 400,
+      textDecoration: `${draft.underline ? "underline " : ""}${draft.strikeOut ? "line-through" : ""}`.trim() || "none",
+      WebkitTextStroke: `${Math.max(0, draft.outline * 0.55)}px ${assToHex(draft.outlineColour)}`,
+      textShadow: draft.shadow > 0
+        ? `${draft.shadow}px ${draft.shadow}px ${assToHex(draft.outlineColour)}`
+        : "none",
+    };
+
   return (
     <div className="style-workspace">
       <section className="style-preview">
         <div className="preview-frame">
           <div
             className="subtitle-preview-text"
-            style={{
-              color: assToHex(draft.primaryColour),
-              fontFamily: draft.fontname,
-              fontSize: `${Math.max(18, draft.fontsize * 0.55)}px`,
-              fontStyle: draft.italic ? "italic" : "normal",
-              fontWeight: draft.bold ? 700 : 400,
-              textDecoration: `${draft.underline ? "underline " : ""}${draft.strikeOut ? "line-through" : ""}`.trim() || "none",
-              WebkitTextStroke: `${Math.max(0, draft.outline * 0.55)}px ${assToHex(draft.outlineColour)}`,
-              textShadow: draft.shadow > 0
-                ? `${draft.shadow}px ${draft.shadow}px ${assToHex(draft.outlineColour)}`
-                : "none",
-            }}
+            style={previewTextStyle}
           >
             {lang === "zh" ? "让每一句话都清楚、好看。" : "Make every line clear and considered."}
           </div>
@@ -443,6 +474,52 @@ export function StyleWorkspace({
               );
             })}
           </div>
+        </div>
+
+        <div className="style-presets style-preset-gallery">
+          <span>{lang === "zh" ? "字幕预设" : "Caption presets"}</span>
+          <div className="style-preset-grid" role="list">
+            <button
+              aria-pressed={!activePreset}
+              className={`style-preset-card${activePreset ? "" : " active"}`}
+              onClick={() => update("captionPreset", null)}
+              role="listitem"
+              type="button"
+            >
+              <span className="style-preset-swatch">
+                <span style={{ color: "#ffffff", fontSize: 15, textShadow: "0 1px 3px rgba(0,0,0,0.8)" }}>
+                  Aa 字幕
+                </span>
+              </span>
+              <strong>{lang === "zh" ? "无" : "None"}</strong>
+              <small>{lang === "zh" ? "保持当前样式" : "Keep the current style"}</small>
+            </button>
+          </div>
+          {CAPTION_PRESET_GROUPS.map((group) => (
+            <Fragment key={group.mode}>
+              <span className="caption-preset-group">
+                {lang === "zh" ? group.zh : group.en}
+              </span>
+              <div className="style-preset-grid" role="list">
+                {captionPresetsForMode(group.mode).map((preset) => (
+                  <CaptionPresetCard
+                    key={preset.id}
+                    active={draft.captionPreset === preset.id}
+                    lang={lang}
+                    onPick={(id) => update("captionPreset", id)}
+                    preset={preset}
+                  />
+                ))}
+              </div>
+            </Fragment>
+          ))}
+          {activePreset && (
+            <small className="caption-preset-note">
+              {lang === "zh"
+                ? "预设决定颜色、字体与底衬；字号、加粗和位置仍用下方设置。"
+                : "The preset sets colors, typeface and backing; size, bold and position still come from the controls below."}
+            </small>
+          )}
         </div>
 
         <div className="control-row two-column">
@@ -597,5 +674,50 @@ export function StyleWorkspace({
         </div>
       </section>
     </div>
+  );
+}
+
+/** One pireel caption-preset card: the swatch shows the preset's frozen form —
+ *  emphasis presets highlight the middle sample word (recolor/underline/box),
+ *  line presets lay the sample flat. */
+function CaptionPresetCard({ active, lang, onPick, preset }: {
+  active: boolean;
+  lang: Lang;
+  onPick: (id: string) => void;
+  preset: CaptionPreset;
+}) {
+  const sample = lang === "zh" ? ["示例", "字幕", "效果"] : ["Sample", "caption", "look"];
+  const line = captionPresetLineCss(preset);
+  return (
+    <button
+      aria-pressed={active}
+      className={`style-preset-card${active ? " active" : ""}`}
+      onClick={() => onPick(preset.id)}
+      role="listitem"
+      type="button"
+    >
+      <span className="style-preset-swatch">
+        <span
+          style={{
+            ...line,
+            fontSize: 15,
+            ...(preset.bg ? {} : { textShadow: "0 1px 3px rgba(0,0,0,0.8)" }),
+          }}
+        >
+          {sample.map((word, i) => (
+            <span
+              key={word}
+              style={preset.mode === "emphasis" && i === 1
+                ? captionPresetWordCss(preset)
+                : undefined}
+            >
+              {word}
+              {i < sample.length - 1 && lang !== "zh" ? " " : ""}
+            </span>
+          ))}
+        </span>
+      </span>
+      <strong>{captionPresetName(preset, lang)}</strong>
+    </button>
   );
 }

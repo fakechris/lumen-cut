@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type MutableRefObject,
 } from "react";
 import {
@@ -27,7 +28,14 @@ import type {
   VideoExportSettings,
 } from "../../types";
 import { audioGainAt, musicGainAt } from "./audioMix";
+import {
+  captionPresetById,
+  captionPresetLineCss,
+  captionPresetWordCss,
+} from "./captionPresets";
 import { titleOpacityAt } from "./titleAnimation";
+import { latinJoin } from "../../vendor/pireel/caption-fx";
+import type { CaptionPreset } from "../../vendor/pireel/caption-presets";
 
 interface Props {
   audioMix: AudioMix;
@@ -162,6 +170,45 @@ export function EditorMediaPreview({
     () => titles.find((title) => title.start <= currentTime && currentTime < title.end),
     [currentTime, titles],
   );
+  const captionPreset = captionPresetById(subtitleStyle?.captionPreset);
+  const activeSentence = useMemo(() => {
+    if (!captionPreset || !activeCue) return undefined;
+    for (const paragraph of doc.paragraphs) {
+      const hit = paragraph.sentences.find((sentence) => sentence.id === activeCue.id);
+      if (hit) return hit;
+    }
+    return undefined;
+  }, [activeCue, captionPreset, doc]);
+  // Emphasis presets highlight the spoken word using the transcript's ASR word
+  // timing. That timing only exists for the source-language line, so a
+  // translation-only cue (or any cue whose text no longer matches the source
+  // sentence) degrades to the whole-line preset look.
+  const captionWords = useMemo(() => {
+    if (!captionPreset || captionPreset.mode !== "emphasis" || !activeCue || !activeSentence) {
+      return null;
+    }
+    const source = activeSentence.text.trim();
+    if (activeCue.text === source) {
+      return { words: activeSentence.words, translation: null as string | null };
+    }
+    if (activeCue.text.startsWith(`${source}\n`)) {
+      return {
+        words: activeSentence.words,
+        translation: activeCue.text.slice(source.length + 1),
+      };
+    }
+    return null;
+  }, [activeCue, activeSentence, captionPreset]);
+  // currentTime advances with the video's timeupdate events (~4Hz), so the
+  // highlight steps word-to-word rather than sweeping — good enough for a preview.
+  const activeWordIndex = useMemo(() => {
+    if (!captionWords) return -1;
+    let index = -1;
+    captionWords.words.forEach((word, i) => {
+      if (currentTime >= word.start) index = i;
+    });
+    return index;
+  }, [captionWords, currentTime]);
   const canvasDimensions = useMemo(
     () => resolveCanvasDimensions(exportSettings, sourceDimensions),
     [exportSettings, sourceDimensions],
@@ -530,22 +577,53 @@ export function EditorMediaPreview({
                     )
                     : undefined}
                 >
-                  <span
-                    style={subtitleStyle ? {
-                      color: assToHex(subtitleStyle.primaryColour),
-                      fontFamily: subtitleStyle.fontname,
-                      fontSize: `clamp(12px, ${(subtitleStyle.fontsize / canvasDimensions.width) * 100}cqw, ${subtitleStyle.fontsize}px)`,
-                      fontStyle: subtitleStyle.italic ? "italic" : "normal",
-                      fontWeight: subtitleStyle.bold ? 700 : 400,
-                      textDecoration: `${subtitleStyle.underline ? "underline " : ""}${subtitleStyle.strikeOut ? "line-through" : ""}`.trim() || "none",
-                      WebkitTextStroke: `${(Math.max(0, subtitleStyle.outline) / canvasDimensions.width) * 100}cqw ${assToHex(subtitleStyle.outlineColour)}`,
-                      textShadow: subtitleStyle.shadow > 0
-                        ? `${(subtitleStyle.shadow / canvasDimensions.width) * 100}cqw ${(subtitleStyle.shadow / canvasDimensions.width) * 100}cqw ${assToHex(subtitleStyle.outlineColour)}`
-                        : undefined,
-                    } : undefined}
-                  >
-                    {activeCue.text}
-                  </span>
+                  {subtitleStyle && captionPreset ? (
+                    <span style={presetSpanStyle(captionPreset, subtitleStyle, canvasDimensions.width)}>
+                      {captionWords ? (
+                        <>
+                          {captionWords.words.map((word, i) => (
+                            <span
+                              key={word.id}
+                              style={i === activeWordIndex
+                                ? captionPresetWordCss(captionPreset)
+                                : undefined}
+                            >
+                              {word.text}
+                              {i < captionWords.words.length - 1
+                                && latinJoin(word.text, captionWords.words[i + 1].text)
+                                ? " "
+                                : ""}
+                            </span>
+                          ))}
+                          {captionWords.translation && (
+                            <>
+                              <br />
+                              {captionWords.translation}
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        activeCue.text
+                      )}
+                    </span>
+                  ) : (
+                    <span
+                      style={subtitleStyle ? {
+                        color: assToHex(subtitleStyle.primaryColour),
+                        fontFamily: subtitleStyle.fontname,
+                        fontSize: `clamp(12px, ${(subtitleStyle.fontsize / canvasDimensions.width) * 100}cqw, ${subtitleStyle.fontsize}px)`,
+                        fontStyle: subtitleStyle.italic ? "italic" : "normal",
+                        fontWeight: subtitleStyle.bold ? 700 : 400,
+                        textDecoration: `${subtitleStyle.underline ? "underline " : ""}${subtitleStyle.strikeOut ? "line-through" : ""}`.trim() || "none",
+                        WebkitTextStroke: `${(Math.max(0, subtitleStyle.outline) / canvasDimensions.width) * 100}cqw ${assToHex(subtitleStyle.outlineColour)}`,
+                        textShadow: subtitleStyle.shadow > 0
+                          ? `${(subtitleStyle.shadow / canvasDimensions.width) * 100}cqw ${(subtitleStyle.shadow / canvasDimensions.width) * 100}cqw ${assToHex(subtitleStyle.outlineColour)}`
+                          : undefined,
+                      } : undefined}
+                    >
+                      {activeCue.text}
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -641,6 +719,32 @@ export function EditorMediaPreview({
 function assToHex(value: string) {
   const match = value.match(/&H[0-9A-Fa-f]{2}([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})/);
   return match ? `#${match[3]}${match[2]}${match[1]}` : "#ffffff";
+}
+
+/** Whole-line preset look for the preview span. Size/bold stay on the user's
+ *  SubtitleStyle (presets govern look only). Backed presets draw the pill and
+ *  drop outline/shadow; bare presets keep the user's outline + shadow. */
+function presetSpanStyle(
+  preset: CaptionPreset,
+  style: SubtitleStyle,
+  canvasWidth: number,
+): CSSProperties {
+  const look = captionPresetLineCss(preset);
+  return {
+    ...look,
+    fontFamily: look.fontFamily ?? style.fontname,
+    fontSize: `clamp(12px, ${(style.fontsize / canvasWidth) * 100}cqw, ${style.fontsize}px)`,
+    fontStyle: style.italic || preset.italic ? "italic" : "normal",
+    fontWeight: style.bold ? 700 : 400,
+    ...(preset.bg
+      ? {}
+      : {
+        WebkitTextStroke: `${(Math.max(0, style.outline) / canvasWidth) * 100}cqw ${assToHex(style.outlineColour)}`,
+        textShadow: style.shadow > 0
+          ? `${(style.shadow / canvasWidth) * 100}cqw ${(style.shadow / canvasWidth) * 100}cqw ${assToHex(style.outlineColour)}`
+          : undefined,
+      }),
+  };
 }
 
 function subtitlePosition(style: SubtitleStyle, canvasWidth: number, canvasHeight: number) {

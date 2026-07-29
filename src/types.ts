@@ -357,6 +357,11 @@ export interface SubtitleStyle {
   marginL: number;
   marginR: number;
   marginV: number;
+  /**
+   * pireel caption preset id (src/vendor/pireel/caption-presets.ts).
+   * Absent/null = no preset, the fields above render as-is (the default).
+   */
+  captionPreset?: string | null;
 }
 
 export interface ModelConfig {
