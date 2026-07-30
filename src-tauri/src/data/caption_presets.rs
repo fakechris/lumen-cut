@@ -492,7 +492,7 @@ pub fn preset_caption_lines(
     let real_timing =
         window.is_some() && without_whitespace(&join_words(words)) == without_whitespace(source);
     let main_body = match (&karaoke_colors, window) {
-        (Some(_), Some((start, end))) if real_timing => {
+        (Some(_), Some((_start, _end))) if real_timing => {
             // Real ASR word timing; cut-away words collapse to a 1cs blip.
             let mut out = String::new();
             for (i, w) in words.iter().enumerate() {
