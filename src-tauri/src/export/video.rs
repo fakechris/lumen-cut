@@ -1194,6 +1194,12 @@ fn encoder_args(
             encoder.into(),
             "-pix_fmt".into(),
             "yuv420p".into(),
+            // Allow VideoToolbox's software fallback: without it ffmpeg fails
+            // outright (-12903) when the hardware session cannot be created —
+            // virtualized machines (CI) or a busy hardware encoder. Hardware
+            // is still preferred whenever it is available.
+            "-allow_sw".into(),
+            "1".into(),
         ];
         // Match-source + known bitrate: constrain rate instead of high fixed q.
         // Re-encoding with a (usually less efficient) encoder at the source
@@ -2083,6 +2089,30 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
         assert!(!final_render
             .windows(2)
             .any(|pair| pair == ["-realtime", "1"]));
+    }
+
+    #[test]
+    fn videotoolbox_allows_software_fallback_but_software_encoders_do_not() {
+        for encoder in ["h264_videotoolbox", "hevc_videotoolbox"] {
+            for speed in [
+                ExportEncodingSpeed::MatchSource,
+                ExportEncodingSpeed::Fast,
+                ExportEncodingSpeed::Quality,
+            ] {
+                let args = encoder_args(encoder, RenderPurpose::Final, speed, None);
+                assert!(
+                    args.windows(2).any(|pair| pair == ["-allow_sw", "1"]),
+                    "{encoder} {speed:?} must allow the software fallback"
+                );
+            }
+        }
+        let software = encoder_args(
+            "libx264",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::Fast,
+            None,
+        );
+        assert!(!software.windows(2).any(|pair| pair == ["-allow_sw", "1"]));
     }
 
     #[test]
