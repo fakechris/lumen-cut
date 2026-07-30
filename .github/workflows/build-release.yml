@@ -81,6 +81,11 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
+            # Export notarization credentials only when fully present; tauri
+            # attempts notarization whenever these vars exist, even if empty.
+            echo "APPLE_ID=$APPLE_ID" >> "$GITHUB_ENV"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD" >> "$GITHUB_ENV"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID" >> "$GITHUB_ENV"
           fi
 
       - name: Import Apple Developer ID certificate
@@ -145,10 +150,6 @@ jobs:
 
       - name: Build desktop release (signed and notarized when credentials available)
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: pnpm release:local
 
       - name: Verify signed and notarized tag artifacts
