@@ -89,6 +89,12 @@ import {
 } from "../api";
 import type { CutSummary, EditHistoryStatus } from "../api";
 import {
+  captionExportPrepare,
+  CaptionRenderCancelled,
+  renderCaptionFrames,
+  type CaptionRenderProgress,
+} from "../captions/captionExport";
+import {
   AlertIcon,
   CheckIcon,
   PlayIcon,
@@ -716,6 +722,10 @@ export function TranscriptView({
   const [transcriptionFailure, setTranscriptionFailure] = useState<string | null>(null);
   const [confirmRetranscription, setConfirmRetranscription] = useState(false);
   const [videoExportJob, setVideoExportJob] = useState<VideoExportJobStatus | null>(null);
+  // Frontend caption-render phase of a burn-in export (runs before the
+  // ffmpeg job exists; cancelled via the ref, not video_export_cancel).
+  const [captionRenderProgress, setCaptionRenderProgress] = useState<CaptionRenderProgress | null>(null);
+  const captionRenderCancel = useRef(false);
   const [videoExportSettings, setVideoExportSettings] = useState<VideoExportSettings>(
     DEFAULT_VIDEO_EXPORT_SETTINGS,
   );
@@ -1753,6 +1763,7 @@ export function TranscriptView({
     );
   const isVideoExporting = videoExportJob !== null
     && ["running", "cancelling"].includes(videoExportJob.state);
+  const isCaptionRendering = captionRenderProgress !== null;
   const failedTasks = taskState?.kinds.reduce((sum, task) => sum + task.failed, 0) ?? 0;
   const stoppedTasks = taskState?.kinds.filter(
     (task) => task.state === "paused" || task.state === "failed",
@@ -2730,13 +2741,40 @@ export function TranscriptView({
       setFeedback(null);
       const saved = await exportSettingsSet(pid, videoExportSettings);
       setVideoExportSettings(saved);
+      // Burn-in goes through the WYSIWYG caption overlay: render every
+      // caption state with the monitor's own renderer and hand the frames to
+      // Rust before the ffmpeg job starts. (No-op for soft/no captions.)
+      if (saved.subtitleMode === "burn") {
+        captionRenderCancel.current = false;
+        const spec = await captionExportPrepare(pid);
+        if (spec) {
+          setCaptionRenderProgress({ current: 0, total: spec.cues.length });
+          await renderCaptionFrames(pid, spec, {
+            onProgress: setCaptionRenderProgress,
+            shouldCancel: () => captionRenderCancel.current,
+          });
+        }
+      }
       setVideoExportJob(await videoExportStart(pid, saved));
     } catch (error) {
-      setFeedback({ tone: "error", text: friendlyError(error, lang) });
+      setFeedback({
+        tone: error instanceof CaptionRenderCancelled ? "info" : "error",
+        text: error instanceof CaptionRenderCancelled
+          ? (lang === "zh" ? "已取消字幕渲染，导出未开始。" : "Caption rendering cancelled; the export did not start.")
+          : friendlyError(error, lang),
+      });
+    } finally {
+      setCaptionRenderProgress(null);
     }
   };
 
   const cancelVideoExport = async () => {
+    // Still in the frontend caption-render phase: just flag the cancel; the
+    // render loop aborts the Rust frame session itself.
+    if (captionRenderProgress) {
+      captionRenderCancel.current = true;
+      return;
+    }
     try {
       setVideoExportJob(await videoExportCancel(pid));
     } catch (error) {
@@ -3807,7 +3845,7 @@ export function TranscriptView({
               </label>
             )}
           </section>
-          <fieldset className="video-export-settings" disabled={isVideoExporting || operation !== null}>
+          <fieldset className="video-export-settings" disabled={isVideoExporting || isCaptionRendering || operation !== null}>
               <legend>{lang === "zh" ? "视频交付规格" : "Video delivery settings"}</legend>
               <div className="video-export-settings-grid">
                 <label>
@@ -4083,10 +4121,10 @@ export function TranscriptView({
             </button>
             <button
               className="export-action"
-              disabled={operation !== null || !videoExportAllowed || isVideoExporting}
+              disabled={operation !== null || !videoExportAllowed || isVideoExporting || isCaptionRendering}
               onClick={runVideoExport}
             >
-              {isVideoExporting ? <span className="spinner" /> : <PlayIcon />}
+              {isVideoExporting || isCaptionRendering ? <span className="spinner" /> : <PlayIcon />}
               <span>
                 <strong>{c.exportVideo}</strong>
                 <small>
@@ -4118,6 +4156,37 @@ export function TranscriptView({
               </span>
             </button>
           </div>
+          {captionRenderProgress && (
+            <div className="video-export-progress" role="status" aria-live="polite">
+              <div>
+                <strong>
+                  {lang === "zh" ? "正在渲染字幕层（与预览一致）" : "Rendering caption frames (pixel-match of the monitor)"}
+                </strong>
+                <span>
+                  {captionRenderProgress.total > 0
+                    ? Math.round((captionRenderProgress.current / captionRenderProgress.total) * 100)
+                    : 0}%
+                </span>
+              </div>
+              <progress
+                aria-label={lang === "zh" ? "字幕渲染进度" : "Caption render progress"}
+                max={captionRenderProgress.total || 1}
+                value={captionRenderProgress.current}
+              />
+              <small>
+                {lang === "zh"
+                  ? `字幕状态 ${captionRenderProgress.current} / ${captionRenderProgress.total} · 完成后开始合成视频`
+                  : `Caption state ${captionRenderProgress.current} / ${captionRenderProgress.total} · video encode follows`}
+              </small>
+              <button
+                className="button-quiet"
+                onClick={() => void cancelVideoExport()}
+                type="button"
+              >
+                {lang === "zh" ? "取消" : "Cancel"}
+              </button>
+            </div>
+          )}
           {videoExportJob && isVideoExporting && (
             <div className="video-export-progress" role="status" aria-live="polite">
               <div>

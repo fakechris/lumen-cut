@@ -49,6 +49,7 @@ pub fn run() {
         .manage(commands::TranscriptionState::default())
         .manage(commands::SpeakerAnalysisState::default())
         .manage(commands::VideoExportState::default())
+        .manage(export::caption_frames::CaptionFramesState::default())
         .manage(commands::SetupJobState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
@@ -164,6 +165,10 @@ pub fn run() {
             commands::run_doctor,
             commands::performance_status,
             commands::export_video,
+            commands::caption_export_prepare,
+            commands::caption_frames_push,
+            commands::caption_frames_seal,
+            commands::caption_frames_abort,
             commands::video_export_start,
             commands::video_export_status,
             commands::video_export_cancel,

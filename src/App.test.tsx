@@ -669,6 +669,10 @@ beforeEach(() => {
       case "video_export_start":
         videoExportHasExistingJob = true;
         return videoExportStatusState;
+      // jsdom has no canvas — return no spec so the burn-in caption-render
+      // phase is skipped and the export starts directly.
+      case "caption_export_prepare":
+        return null;
       case "video_export_status":
         if (!videoExportHasExistingJob) throw new Error("no video export job");
         return videoExportStatusState;
@@ -2515,14 +2519,10 @@ test("subtitle presets are applied before saving the project style", async () =>
   fireEvent.click(await screen.findByRole("button", { name: /Interview.*打开项目/ }));
   fireEvent.click(await screen.findByRole("button", { name: "样式" }));
   fireEvent.click(screen.getByText("创作者黄字").closest("button")!);
-  const previewSubtitle = document.querySelector<HTMLElement>(".program-subtitle span");
-  const previewPosition = document.querySelector<HTMLElement>(".program-subtitle");
-  expect(previewSubtitle).toHaveStyle({
-    fontWeight: "700",
-  });
-  expect(previewSubtitle?.style.fontSize).toContain("cqw");
-  expect(previewSubtitle?.style.fontSize).not.toContain("vw");
-  expect(previewPosition?.style.bottom).toContain("%");
+  // The program monitor's caption layer is the shared canvas renderer now —
+  // the retired DOM caption layer must be gone.
+  expect(document.querySelector(".program-stage canvas.program-caption-canvas")).toBeInTheDocument();
+  expect(document.querySelector(".program-subtitle")).not.toBeInTheDocument();
   expect(document.querySelector(".program-stage")).toBeInTheDocument();
   expect(screen.getByText(/有未保存修改/)).toBeVisible();
 
@@ -2530,16 +2530,12 @@ test("subtitle presets are applied before saving the project style", async () =>
   fireEvent.click(screen.getByRole("button", { name: "样式" }));
   expect(screen.getByText("创作者黄字")).toBeVisible();
   expect(screen.getByText(/有未保存修改/)).toBeVisible();
-  expect(document.querySelector<HTMLElement>(".program-subtitle span")).toHaveStyle({
-    fontWeight: "700",
-  });
+  expect(document.querySelector(".program-stage canvas.program-caption-canvas")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "设置" }));
   fireEvent.click(screen.getByRole("button", { name: "编辑" }));
   expect(screen.getByText(/有未保存修改/)).toBeVisible();
-  expect(document.querySelector<HTMLElement>(".program-subtitle span")).toHaveStyle({
-    fontWeight: "700",
-  });
+  expect(document.querySelector(".program-stage canvas.program-caption-canvas")).toBeInTheDocument();
 
   fireEvent.change(screen.getByRole("spinbutton", { name: "左侧安全边距" }), {
     target: { value: "72" },
@@ -2602,9 +2598,7 @@ test("unsaved subtitle style previews survive an application restart", async () 
   fireEvent.click(await screen.findByRole("button", { name: "样式" }));
 
   expect(await screen.findByText(/有未保存修改/)).toBeVisible();
-  expect(document.querySelector<HTMLElement>(".program-subtitle span")).toHaveStyle({
-    fontWeight: "700",
-  });
+  expect(document.querySelector(".program-stage canvas.program-caption-canvas")).toBeInTheDocument();
 });
 
 test("named subtitle styles can be reused across projects without changing existing projects", async () => {

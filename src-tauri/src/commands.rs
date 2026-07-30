@@ -7881,6 +7881,119 @@ pub struct VideoExportState {
     jobs: Arc<Mutex<HashMap<String, VideoExportJob>>>,
 }
 
+// ---------------------------------------------------------------------------
+// WYSIWYG caption burn-in (frontend-rendered PNG overlay; see
+// export/caption_frames.rs). The CLI/MCP export path has no webview and keeps
+// burning ASS captions — these commands are the app-only counterpart.
+// ---------------------------------------------------------------------------
+
+/// Build the caption render spec for the project's current export settings
+/// and open a frame-upload session. Returns None when there is nothing to
+/// burn (subtitle mode is not Burn, or no visible cues).
+#[tauri::command]
+pub async fn caption_export_prepare(
+    pid: String,
+    state: tauri::State<'_, crate::export::caption_frames::CaptionFramesState>,
+) -> AppResult<Option<crate::export::caption_frames::CaptionRenderSpec>> {
+    let dir = resolve_project_dir(&pid, None)?;
+    let media_path = run_blocking("load caption export media", {
+        let dir = dir.clone();
+        move || Ok(Doc::load(&dir)?.media.path.clone())
+    })
+    .await?;
+    let media_info = crate::media::probe(&media_path).await?;
+    let source_dimensions = media_info.width.zip(media_info.height);
+    let _mutation = lock_project_mutation(&dir).await;
+    let prepare_dir = dir.clone();
+    let spec = run_blocking("caption export prepare", move || {
+        let doc = Doc::load(&prepare_dir)?;
+        let settings = crate::data::export_settings::load(&prepare_dir)?;
+        settings.validate()?;
+        if settings.subtitle_mode != crate::data::export_settings::ExportSubtitleMode::Burn {
+            return Ok(None);
+        }
+        let cuts = load_project_cuts(&prepare_dir)?;
+        let style = crate::data::substyle::SubStyle::load(&prepare_dir)?;
+        let hidden = crate::data::subtitle::load_hidden_checked(&prepare_dir)?;
+        let caption_doc = crate::data::export_settings::project_caption_doc_for_settings(
+            &doc, &settings, &hidden,
+        )?;
+        let (canvas_width, canvas_height) = settings.subtitle_canvas_dimensions(source_dimensions);
+        crate::export::caption_frames::build_render_spec(
+            &caption_doc,
+            &cuts.cuts,
+            &style,
+            canvas_width,
+            canvas_height,
+        )
+    })
+    .await?;
+    match &spec {
+        Some(spec) => {
+            tracing::info!(
+                pipeline = "caption-frames",
+                cues = spec.cues.len(),
+                hash = %spec.hash,
+                canvas = %format!("{}x{}", spec.width, spec.height),
+                "caption export prepare: render spec ready"
+            );
+            crate::export::caption_frames::caption_frames_begin_impl(&dir, &spec.hash, &state)
+                .await?;
+        }
+        None => {
+            tracing::info!(
+                pipeline = "caption-frames",
+                "caption export prepare: nothing to burn"
+            );
+            crate::export::caption_frames::caption_frames_clear_impl(&dir, &state).await;
+        }
+    }
+    Ok(spec)
+}
+
+/// Raw IPC body `[u16 name-len][name][png]` — top-level Uint8Array from the
+/// frontend arrives as InvokeBody::Raw, skipping the JSON round-trip.
+#[tauri::command]
+pub async fn caption_frames_push(
+    pid: String,
+    request: tauri::ipc::Request<'_>,
+    state: tauri::State<'_, crate::export::caption_frames::CaptionFramesState>,
+) -> AppResult<usize> {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
+        return Err(AppError::Schema("expected raw caption frame bytes".into()));
+    };
+    let body = body.clone();
+    let dir = resolve_project_dir(&pid, None)?;
+    let state = state.inner().clone();
+    run_blocking("caption frame write", move || {
+        crate::export::caption_frames::caption_frames_push_impl(&dir, &state, &body)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn caption_frames_seal(
+    pid: String,
+    manifest: String,
+    state: tauri::State<'_, crate::export::caption_frames::CaptionFramesState>,
+) -> AppResult<()> {
+    let dir = resolve_project_dir(&pid, None)?;
+    let state = state.inner().clone();
+    run_blocking("caption manifest seal", move || {
+        crate::export::caption_frames::caption_frames_seal_impl(&dir, &state, &manifest)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn caption_frames_abort(
+    pid: String,
+    state: tauri::State<'_, crate::export::caption_frames::CaptionFramesState>,
+) -> AppResult<()> {
+    let dir = resolve_project_dir(&pid, None)?;
+    crate::export::caption_frames::caption_frames_abort_impl(&dir, &state).await
+}
+
 fn video_export_status_path(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
     let _ = resolve_project_dir(pid, root.clone())?;
     Ok(resolve_project_root(root)
@@ -7974,7 +8087,18 @@ async fn export_video_impl(
     let prepare_dir = dir.clone();
     let prepare_stem = export_stem.clone();
     let prepare_started = std::time::Instant::now();
-    let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings, framings) = {
+    let (
+        doc,
+        cuts,
+        ass,
+        soft_subtitle,
+        include_ass,
+        caption_overlay,
+        broll,
+        audio_mix,
+        settings,
+        framings,
+    ) = {
         // Hold the project mutation lock only while taking an export snapshot.
         // Encoding may take minutes and must not stall transcript editing.
         let _mutation = lock_project_mutation(&dir).await;
@@ -8001,18 +8125,55 @@ async fn export_video_impl(
             };
             let (canvas_width, canvas_height) =
                 settings.subtitle_canvas_dimensions(source_dimensions);
+            let mut caption_overlay: Option<std::path::PathBuf> = None;
             let include_ass = match settings.subtitle_mode {
                 crate::data::export_settings::ExportSubtitleMode::Burn => {
-                    crate::export::write_ass_with_style_and_titles(
+                    // WYSIWYG path: the frontend pre-rendered caption frames
+                    // for this exact snapshot (hash match) → burn the PNG
+                    // overlay instead of ASS captions. Without a sealed
+                    // manifest (CLI/MCP has no webview, or the snapshot moved)
+                    // fall back to the ASS burn.
+                    let hash = crate::export::caption_frames::caption_content_hash(
                         &caption_doc,
                         &cuts.cuts,
                         &style,
-                        &titles,
-                        &ass,
                         canvas_width,
                         canvas_height,
                     )?;
-                    true
+                    caption_overlay =
+                        crate::export::caption_frames::sealed_overlay_plan(&prepare_dir, &hash)?;
+                    if caption_overlay.is_some() {
+                        tracing::info!(
+                            pipeline = "video-export",
+                            "burning WYSIWYG canvas-rendered caption overlay"
+                        );
+                        // Titles still burn via ASS, on top of the overlay.
+                        if !titles.is_empty() {
+                            crate::export::write_ass_titles_only_with_style(
+                                &doc,
+                                &cuts.cuts,
+                                &style,
+                                &titles,
+                                &ass,
+                                canvas_width,
+                                canvas_height,
+                            )?;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        crate::export::write_ass_with_style_and_titles(
+                            &caption_doc,
+                            &cuts.cuts,
+                            &style,
+                            &titles,
+                            &ass,
+                            canvas_width,
+                            canvas_height,
+                        )?;
+                        true
+                    }
                 }
                 crate::data::export_settings::ExportSubtitleMode::Soft
                 | crate::data::export_settings::ExportSubtitleMode::None
@@ -8051,6 +8212,7 @@ async fn export_video_impl(
                 ass,
                 soft_subtitle,
                 include_ass,
+                caption_overlay,
                 broll,
                 audio_mix,
                 settings,
@@ -8065,7 +8227,7 @@ async fn export_video_impl(
         &cuts.cuts,
         &broll,
         &audio_mix,
-        include_ass,
+        include_ass || caption_overlay.is_some(),
         &framings,
     );
     tracing::info!(
@@ -8096,9 +8258,14 @@ async fn export_video_impl(
             soft_subtitle,
             include_ass,
             framings,
+            caption_overlay,
         },
     )
     .await;
+    // The caption frame set is single-use: remove it whether the render
+    // succeeded, failed or was cancelled (the next export re-renders or
+    // reuses the frontend's in-memory cache).
+    crate::export::caption_frames::cleanup_frames(&dir).await;
     if let Err(error) = render {
         let _ = tokio::fs::remove_file(&in_progress).await;
         return Err(error);

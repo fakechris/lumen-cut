@@ -48,6 +48,10 @@ pub struct VideoRenderOptions {
     pub include_ass: bool,
     /// Per-shot framing entries (empty = every shot rendered `full`).
     pub framings: Vec<ShotFraming>,
+    /// WYSIWYG caption overlay: ffconcat timeline of frontend-rendered PNG
+    /// caption states (app exports). Burns the exact monitor picture instead
+    /// of ASS captions; titles still burn via ASS on top.
+    pub caption_overlay: Option<PathBuf>,
 }
 
 /// How the final video will be produced.
@@ -151,6 +155,8 @@ pub struct VideoFilter {
     pub audio_map: Option<String>,
     pub broll_inputs: Vec<PathBuf>,
     pub music_inputs: Vec<PathBuf>,
+    /// ffconcat caption-state timeline to add as an ffmpeg input (overlay).
+    pub caption_concat: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -188,9 +194,11 @@ pub fn build_video_filter_with_broll_audio(
         audio_mix,
         &[],
         VideoCanvas::default(),
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // One cohesive filter-graph snapshot; grouping would only rename the bag.
 fn build_video_filter_inner(
     doc: &Doc,
     cuts: &[Cut],
@@ -199,6 +207,7 @@ fn build_video_filter_inner(
     audio_mix: &AudioMix,
     framings: &[ShotFraming],
     canvas: VideoCanvas,
+    caption_overlay: Option<&Path>,
 ) -> AppResult<VideoFilter> {
     let mut graph = String::new();
     let kept = super::project::kept_intervals(doc, cuts);
@@ -545,6 +554,16 @@ fn build_video_filter_inner(
         }
         audio_map = Some("[aout]".into());
     }
+    // WYSIWYG captions: the frontend-rendered PNG states ride a concat
+    // input; resampled to 60 fps so karaoke steps land within 17 ms of their
+    // word boundary at any delivery rate. Overlaid below titles/ASS.
+    if let Some(_concat) = caption_overlay {
+        let caption_input = 1 + broll_inputs.len() + music_inputs.len();
+        graph.push_str(&format!(
+            "[{caption_input}:v]format=rgba,fps=60,setsar=1[cap];             [{current}][cap]overlay=0:0:format=auto:eof_action=pass[vcap];"
+        ));
+        current = "vcap".to_string();
+    }
     if let Some(ass) = ass {
         graph.push_str(&format!(
             "[{current}]ass=filename='{}'[vout]",
@@ -559,6 +578,7 @@ fn build_video_filter_inner(
         audio_map,
         broll_inputs,
         music_inputs,
+        caption_concat: caption_overlay.map(Path::to_path_buf),
     })
 }
 
@@ -707,6 +727,7 @@ pub async fn render_video_with_broll_progress(
             soft_subtitle: None,
             include_ass: true,
             framings: Vec::new(),
+            caption_overlay: None,
         },
     )
     .await
@@ -730,6 +751,7 @@ pub async fn render_video_with_broll_options(
         soft_subtitle,
         include_ass,
         framings,
+        caption_overlay,
     } = options;
     let settings = settings.unwrap_or_else(|| VideoExportSettings {
         encoding_speed: match mode.as_deref() {
@@ -761,7 +783,8 @@ pub async fn render_video_with_broll_options(
         cuts,
         placements,
         &audio_mix,
-        include_ass,
+        // A caption overlay burns into the picture just like ASS does.
+        include_ass || caption_overlay.is_some(),
         &framings,
     );
     if path == ExportRenderPath::StreamCopy && purpose == RenderPurpose::Final {
@@ -806,6 +829,7 @@ pub async fn render_video_with_broll_options(
             output_dimensions,
             fit: settings.canvas_fit,
         },
+        caption_overlay.as_deref(),
     )?;
     let filter_ms = started.elapsed().as_millis() as u64;
     let mut args = vec![
@@ -836,8 +860,23 @@ pub async fn render_video_with_broll_options(
             input.display().to_string(),
         ]);
     }
+    // WYSIWYG caption states: one concat input right after music so the
+    // filter graph's caption input index (1 + broll + music) lines up.
+    if let Some(concat) = &filter.caption_concat {
+        args.extend([
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            concat.display().to_string(),
+        ]);
+    }
     let soft_subtitle_input = soft_subtitle.as_ref().map(|path| {
-        let index = 1 + filter.broll_inputs.len() + filter.music_inputs.len();
+        let index = 1
+            + filter.broll_inputs.len()
+            + filter.music_inputs.len()
+            + usize::from(filter.caption_concat.is_some());
         args.extend(["-i".into(), path.display().to_string()]);
         index
     });
@@ -891,7 +930,7 @@ pub async fn render_video_with_broll_options(
         speed = ?settings.encoding_speed,
         source_bitrate,
         filter_prepare_ms = filter_ms,
-        reason = %reencode_reason(&settings, cuts, placements, &audio_mix, include_ass, &framings),
+        reason = %reencode_reason(&settings, cuts, placements, &audio_mix, include_ass || caption_overlay.is_some(), &framings),
         "video export re-encode starting"
     );
     if let Some(callback) = &on_progress {
@@ -1095,6 +1134,7 @@ pub async fn render_broll_snapshot(
             frame_size,
             ..Default::default()
         },
+        None,
     )?;
 
     let mut args = vec![
@@ -1680,6 +1720,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 frame_size: Some((1280, 720)),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1702,6 +1743,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 output_dimensions: Some((1920, 1080)),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1746,6 +1788,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 output_dimensions: Some((1080, 1920)),
                 fit: ExportCanvasFit::Cover,
             },
+            None,
         )
         .unwrap();
 
@@ -1831,6 +1874,7 @@ afade=t=in:st=0:d=0.500000,afade=t=out:st=3.000000:d=1.000000[music0]"
                 output_dimensions: Some((1920, 1080)),
                 fit: ExportCanvasFit::Contain,
             },
+            None,
         )
         .unwrap();
 
@@ -1868,6 +1912,7 @@ crop=w=1572:h=884:x=(iw-ow)/2:y=(ih-oh)/2,scale=w=1920:h=1080[v1];"
                 output_dimensions: Some((1080, 1920)),
                 fit: ExportCanvasFit::Cover,
             },
+            None,
         )
         .unwrap();
 
@@ -1893,6 +1938,7 @@ scale=w=366:h=652,pad=1080:1920:692:1230:color=black[vbase];"
                 frame_size: Some((1920, 1080)),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1909,6 +1955,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &AudioMix::default(),
             &entries,
             VideoCanvas::default(),
+            None,
         )
         .is_err());
     }
@@ -1979,6 +2026,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &output,
             &[],
             VideoRenderOptions {
+                caption_overlay: None,
                 purpose: RenderPurpose::Final,
                 mode: None,
                 on_progress: None,
@@ -2013,6 +2061,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &AudioMix::default(),
             &entries,
             VideoCanvas::default(),
+            None,
         )
         .unwrap();
         assert!(plan
@@ -2394,6 +2443,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &soft_output,
             &[],
             VideoRenderOptions {
+                caption_overlay: None,
                 purpose: RenderPurpose::Final,
                 mode: None,
                 on_progress: None,
@@ -2451,6 +2501,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &remux_output,
             &[],
             VideoRenderOptions {
+                caption_overlay: None,
                 purpose: RenderPurpose::Final,
                 mode: None,
                 on_progress: None,
@@ -2522,6 +2573,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &music_output,
             &[],
             VideoRenderOptions {
+                caption_overlay: None,
                 purpose: RenderPurpose::Final,
                 mode: None,
                 on_progress: None,
@@ -2576,6 +2628,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &portrait_output,
             &[],
             VideoRenderOptions {
+                caption_overlay: None,
                 purpose: RenderPurpose::Final,
                 mode: None,
                 on_progress: None,
@@ -2616,6 +2669,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
                 &hevc_output,
                 &[],
                 VideoRenderOptions {
+                    caption_overlay: None,
                     purpose: RenderPurpose::Final,
                     mode: None,
                     on_progress: None,
@@ -2671,6 +2725,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
             &master_output,
             &[],
             VideoRenderOptions {
+                caption_overlay: None,
                 purpose: RenderPurpose::Final,
                 mode: None,
                 on_progress: None,

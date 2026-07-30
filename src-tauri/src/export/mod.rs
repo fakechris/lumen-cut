@@ -1,4 +1,5 @@
 pub mod ass;
+pub mod caption_frames;
 pub mod fcp;
 pub mod markdown;
 pub mod naming;
