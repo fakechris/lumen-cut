@@ -28,16 +28,9 @@ import type {
   VideoExportSettings,
 } from "../../types";
 import { audioGainAt, musicGainAt } from "./audioMix";
-import {
-  CAPTION_SUB_LINE_SCALE,
-  captionPresetById,
-  captionPresetLineSpanCss,
-  captionPresetWordCss,
-} from "./captionPresets";
+import { CaptionCanvasOverlay } from "./CaptionCanvasOverlay";
 import { framingAtTime, shotTransformCss } from "./shotFraming";
 import { titleOpacityAt } from "./titleAnimation";
-import { latinJoin, wordsFromText, type FxWord } from "../../vendor/pireel/caption-fx";
-import type { CaptionPreset } from "../../vendor/pireel/caption-presets";
 
 interface Props {
   audioMix: AudioMix;
@@ -174,73 +167,6 @@ export function EditorMediaPreview({
     () => titles.find((title) => title.start <= currentTime && currentTime < title.end),
     [currentTime, titles],
   );
-  const captionPreset = captionPresetById(subtitleStyle?.captionPreset);
-  const activeSentence = useMemo(() => {
-    if (!captionPreset || !activeCue) return undefined;
-    for (const paragraph of doc.paragraphs) {
-      const hit = paragraph.sentences.find((sentence) => sentence.id === activeCue.id);
-      if (hit) return hit;
-    }
-    return undefined;
-  }, [activeCue, captionPreset, doc]);
-  // Emphasis presets highlight the spoken word. The source line uses the
-  // transcript's real ASR word timing; translation text has no word timing, so
-  // it is APPROXIMATED — the cue window is split linearly across its tokens
-  // (wordsFromText/segmentTokens: ICU word boundaries, CJK words, Latin on
-  // spaces). The same approximation is applied on the ASS export side. Empty
-  // text or a zero-length window falls back to the whole-line look.
-  const captionLines = useMemo(() => {
-    if (!captionPreset || captionPreset.mode !== "emphasis" || !activeCue) return null;
-    const approximate = (text: string) =>
-      wordsFromText(text, activeCue.start, activeCue.end);
-    const real = (words: Doc["paragraphs"][number]["sentences"][number]["words"]): FxWord[] =>
-      words.map((word) => ({ text: word.text, start: word.start, end: word.end }));
-    const source = activeSentence?.text.trim();
-    if (activeSentence && source === activeCue.text) {
-      return { main: real(activeSentence.words), sub: null as FxWord[] | null };
-    }
-    if (activeSentence && source && activeCue.text.startsWith(`${source}\n`)) {
-      const translation = activeCue.text.slice(source.length + 1);
-      const sub = approximate(translation);
-      return { main: real(activeSentence.words), sub: sub.length ? sub : null };
-    }
-    // Translation-only cue (or the source sentence is unavailable): approximate
-    // over the whole cue text.
-    const main = approximate(activeCue.text);
-    return main.length ? { main, sub: null } : null;
-  }, [activeCue, activeSentence, captionPreset]);
-  // currentTime advances with the video's timeupdate events (~4Hz), so the
-  // highlight steps word-to-word rather than sweeping — good enough for a preview.
-  const activeMainIndex = useMemo(() => {
-    if (!captionLines) return -1;
-    let index = -1;
-    captionLines.main.forEach((word, i) => {
-      if (currentTime >= word.start) index = i;
-    });
-    return index;
-  }, [captionLines, currentTime]);
-  const activeSubIndex = useMemo(() => {
-    if (!captionLines?.sub) return -1;
-    let index = -1;
-    captionLines.sub.forEach((word, i) => {
-      if (currentTime >= word.start) index = i;
-    });
-    return index;
-  }, [captionLines, currentTime]);
-  // Hoisted so JSX closures keep the non-null narrowing.
-  const captionSub = captionLines?.sub ?? null;
-  // Bilingual cues are "source\ntranslation" — the export burns the two lines
-  // as two Dialogue events, and the preview mirrors that with two line spans
-  // (each gets its own backing pill and font size).
-  const captionSplit = useMemo(() => {
-    if (!captionPreset || !activeCue) return null;
-    const newline = activeCue.text.indexOf("\n");
-    if (newline < 0) return { main: activeCue.text, sub: null as string | null };
-    return {
-      main: activeCue.text.slice(0, newline),
-      sub: activeCue.text.slice(newline + 1),
-    };
-  }, [activeCue, captionPreset]);
   const canvasDimensions = useMemo(
     () => resolveCanvasDimensions(exportSettings, sourceDimensions),
     [exportSettings, sourceDimensions],
@@ -605,75 +531,16 @@ export function EditorMediaPreview({
                   {activeTitle.text}
                 </div>
               )}
-              {activeCue && (
-                <div
-                  className="program-subtitle"
-                  aria-live="off"
-                  style={subtitleStyle
-                    ? subtitlePosition(
-                      subtitleStyle,
-                      canvasDimensions.width,
-                      canvasDimensions.height,
-                    )
-                    : undefined}
-                >
-                  {subtitleStyle && captionPreset && captionSplit ? (
-                    // One span per line, mirroring the export's two Dialogue
-                    // events: each line carries its own backing pill (a shared
-                    // span with box-decoration-break does not — Chromium draws
-                    // one box, WKWebView drops it), and the sub-line gets the
-                    // 0.85 scale the export applies via \fs.
-                    <div
-                      className="program-caption-stack"
-                      style={{
-                        alignItems: "center",
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: `${(Math.max(2, Math.round(subtitleStyle.fontsize * CAPTION_SUB_LINE_SCALE * 0.1)) / canvasDimensions.width) * 100}cqw`,
-                      }}
-                    >
-                      <span style={captionPresetLineSpanCss(captionPreset, subtitleStyle, canvasDimensions.width)}>
-                        {captionLines
-                          ? presetWordSpans(captionPreset, captionLines.main, activeMainIndex)
-                          : captionSplit.main}
-                      </span>
-                      {(captionSub || captionSplit.sub) && (
-                        <span
-                          style={{
-                            ...captionPresetLineSpanCss(
-                              captionPreset,
-                              subtitleStyle,
-                              canvasDimensions.width,
-                              CAPTION_SUB_LINE_SCALE,
-                            ),
-                            whiteSpace: "pre-line",
-                          }}
-                        >
-                          {captionSub
-                            ? presetWordSpans(captionPreset, captionSub, activeSubIndex)
-                            : captionSplit.sub}
-                        </span>
-                      )}
-                    </div>
-                  ) : (
-                    <span
-                      style={subtitleStyle ? {
-                        color: assToHex(subtitleStyle.primaryColour),
-                        fontFamily: subtitleStyle.fontname,
-                        fontSize: `clamp(12px, ${(subtitleStyle.fontsize / canvasDimensions.width) * 100}cqw, ${subtitleStyle.fontsize}px)`,
-                        fontStyle: subtitleStyle.italic ? "italic" : "normal",
-                        fontWeight: subtitleStyle.bold ? 700 : 400,
-                        textDecoration: `${subtitleStyle.underline ? "underline " : ""}${subtitleStyle.strikeOut ? "line-through" : ""}`.trim() || "none",
-                        WebkitTextStroke: `${(Math.max(0, subtitleStyle.outline) / canvasDimensions.width) * 100}cqw ${assToHex(subtitleStyle.outlineColour)}`,
-                        textShadow: subtitleStyle.shadow > 0
-                          ? `${(subtitleStyle.shadow / canvasDimensions.width) * 100}cqw ${(subtitleStyle.shadow / canvasDimensions.width) * 100}cqw ${assToHex(subtitleStyle.outlineColour)}`
-                          : undefined,
-                      } : undefined}
-                    >
-                      {activeCue.text}
-                    </span>
-                  )}
-                </div>
+              {/* Caption layer: the shared Canvas2D renderer (also used by the
+                  burn-in export), so the monitor IS the exported picture. */}
+              {subtitleStyle && (
+                <CaptionCanvasOverlay
+                  canvasSize={canvasDimensions}
+                  currentTime={currentTime}
+                  doc={doc}
+                  rows={rows}
+                  subtitleStyle={subtitleStyle}
+                />
               )}
             </div>
           )
@@ -763,39 +630,6 @@ export function EditorMediaPreview({
       </footer>
     </section>
   );
-}
-
-function assToHex(value: string) {
-  const match = value.match(/&H[0-9A-Fa-f]{2}([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})/);
-  return match ? `#${match[3]}${match[2]}${match[1]}` : "#ffffff";
-}
-
-/** Word spans for an emphasis-preset line: the word at activeIndex gets the
- *  preset's accent/deco treatment, Latin boundaries keep a real space. */
-function presetWordSpans(preset: CaptionPreset, words: FxWord[], activeIndex: number) {
-  return words.map((word, i) => (
-    <span
-      key={i}
-      style={i === activeIndex ? captionPresetWordCss(preset) : undefined}
-    >
-      {word.text}
-      {i < words.length - 1 && latinJoin(word.text, words[i + 1].text) ? " " : ""}
-    </span>
-  ));
-}
-
-function subtitlePosition(style: SubtitleStyle, canvasWidth: number, canvasHeight: number) {
-  const vertical = Math.ceil(style.alignment / 3);
-  const horizontal = (style.alignment - 1) % 3;
-  const offset = `${(Math.max(0, style.marginV) / canvasHeight) * 100}%`;
-  return {
-    alignItems: vertical === 2 ? "center" : undefined,
-    bottom: vertical === 1 ? offset : vertical === 2 ? "0" : "auto",
-    justifyContent: horizontal === 0 ? "flex-start" : horizontal === 2 ? "flex-end" : "center",
-    left: `${(Math.max(0, style.marginL) / canvasWidth) * 100}%`,
-    right: `${(Math.max(0, style.marginR) / canvasWidth) * 100}%`,
-    top: vertical === 3 ? offset : vertical === 2 ? "0" : "auto",
-  };
 }
 
 function resolveCanvasDimensions(
