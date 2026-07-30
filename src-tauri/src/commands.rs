@@ -3191,6 +3191,60 @@ pub async fn cut_restore(pid: String, cut_id: String, root: Option<PathBuf>) -> 
     .await
 }
 
+/// Restore previously removed transcript words (the inverse of
+/// [`cut_words`]): every cut overlapping the selected words' source range is
+/// removed or split so the words return to the timeline. Returns the seconds
+/// given back (0 = nothing to restore).
+#[tauri::command]
+pub async fn cuts_restore(
+    pid: String,
+    word_ids: Vec<String>,
+    root: Option<PathBuf>,
+) -> AppResult<f64> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("restore removed words", move || {
+        crate::data::edit_history::record(
+            &dir,
+            if word_ids.len() == 1 {
+                "Restore word"
+            } else {
+                "Restore words"
+            },
+            || {
+                let doc = Doc::load(&dir)?;
+                let wanted: HashSet<&str> = word_ids.iter().map(String::as_str).collect();
+                let mut start = f64::INFINITY;
+                let mut end = f64::NEG_INFINITY;
+                for word in doc.all_words() {
+                    if wanted.contains(word.id.as_str()) {
+                        start = start.min(word.start);
+                        end = end.max(word.end);
+                    }
+                }
+                if !start.is_finite() {
+                    return Err(AppError::Schema(
+                        "none of the selected words are in the transcript".into(),
+                    ));
+                }
+                let cuts_path = dir.join("cuts.json");
+                let mut cuts: ClipCuts = if cuts_path.exists() {
+                    serde_json::from_str(&std::fs::read_to_string(&cuts_path)?)?
+                } else {
+                    ClipCuts::new()
+                };
+                let restored = cuts.restore_range(&doc, start, end);
+                if restored > 0.0 {
+                    crate::data::storage::write_json(&cuts_path, &cuts)?;
+                }
+                Ok(restored)
+            },
+            |restored| *restored > 0.0,
+        )
+    })
+    .await
+}
+
 #[derive(Debug, Serialize)]
 pub struct CutSummary {
     pub id: String,
@@ -5269,6 +5323,105 @@ pub async fn title_remove(pid: String, id: String, root: Option<PathBuf>) -> App
     .await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShotFramingInput {
+    /// Kept-segment bounds in source-timeline seconds.
+    pub start: f64,
+    pub end: f64,
+    pub treatment: crate::data::framing::ShotTreatment,
+    #[serde(default)]
+    pub size: Option<f64>,
+}
+
+#[tauri::command]
+pub async fn framing_list(
+    pid: String,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<crate::data::framing::ShotFraming>> {
+    let dir = resolve_project_dir(&pid, root)?;
+    run_blocking("framing list", move || {
+        Doc::load(&dir)?;
+        crate::data::framing::load(&dir)
+    })
+    .await
+}
+
+/// Set the framing for the kept segment `[start, end)`: every entry
+/// overlapping the segment is replaced. `full` clears the segment's framing.
+#[tauri::command]
+pub async fn framing_set(
+    pid: String,
+    input: ShotFramingInput,
+    root: Option<PathBuf>,
+) -> AppResult<Vec<crate::data::framing::ShotFraming>> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("framing set", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Set shot framing",
+            || {
+                let doc = Doc::load(&dir)?;
+                let mut framings = crate::data::framing::load(&dir)?;
+                framings.retain(|framing| framing.end <= input.start || framing.start >= input.end);
+                if input.treatment != crate::data::framing::ShotTreatment::Full {
+                    let framing = crate::data::framing::ShotFraming {
+                        id: format!("framing-{}", uuid::Uuid::new_v4().simple()),
+                        start: input.start,
+                        end: input.end,
+                        treatment: input.treatment,
+                        size: input.size,
+                    };
+                    framing.validate()?;
+                    if doc.media.duration_seconds > 0.0
+                        && framing.end > doc.media.duration_seconds + 0.05
+                    {
+                        return Err(AppError::Schema(format!(
+                            "framing end {:.2}s exceeds media duration {:.2}s",
+                            framing.end, doc.media.duration_seconds
+                        )));
+                    }
+                    framings.push(framing);
+                    framings.sort_by(|left, right| {
+                        left.start
+                            .partial_cmp(&right.start)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                crate::data::framing::save(&dir, &framings)?;
+                Ok(framings)
+            },
+            |_| true,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn framing_remove(pid: String, id: String, root: Option<PathBuf>) -> AppResult<bool> {
+    let dir = resolve_project_dir(&pid, root)?;
+    let _mutation = lock_project_mutation(&dir).await;
+    run_blocking("framing remove", move || {
+        crate::data::edit_history::record(
+            &dir,
+            "Remove shot framing",
+            || {
+                let mut framings = crate::data::framing::load(&dir)?;
+                let before = framings.len();
+                framings.retain(|framing| framing.id != id);
+                if framings.len() == before {
+                    return Ok(false);
+                }
+                crate::data::framing::save(&dir, &framings)?;
+                Ok(true)
+            },
+            |changed| *changed,
+        )
+    })
+    .await
+}
+
 fn load_project_cuts(dir: &std::path::Path) -> AppResult<ClipCuts> {
     let cuts_path = dir.join("cuts.json");
     if cuts_path.exists() {
@@ -5486,6 +5639,7 @@ async fn export_preflight_impl(
         titles_result,
         audio_mix_result,
         style_result,
+        framing_result,
     ) = run_blocking("export preflight snapshot", move || {
         let doc = Doc::load(&snapshot_dir)?;
         let cuts = load_project_cuts(&snapshot_dir);
@@ -5494,7 +5648,8 @@ async fn export_preflight_impl(
         let titles = crate::data::title::load(&snapshot_dir);
         let audio_mix = crate::data::audio_mix::load(&snapshot_dir);
         let style = crate::data::substyle::SubStyle::load(&snapshot_dir);
-        Ok((doc, cuts, broll, hidden, titles, audio_mix, style))
+        let framing = crate::data::framing::load(&snapshot_dir);
+        Ok((doc, cuts, broll, hidden, titles, audio_mix, style, framing))
     })
     .await?;
 
@@ -5531,6 +5686,18 @@ async fn export_preflight_impl(
                 "titles",
                 "blocker",
                 format!("titles cannot be read: {error}"),
+            );
+            Vec::new()
+        }
+    };
+    let framings = match framing_result {
+        Ok(framings) => framings,
+        Err(error) => {
+            push_export_preflight_item(
+                &mut items,
+                "timeline-data",
+                "blocker",
+                format!("shot framing cannot be read: {error}"),
             );
             Vec::new()
         }
@@ -5873,6 +6040,7 @@ async fn export_preflight_impl(
         &broll,
         &audio_mix_for_path,
         include_ass_for_path,
+        &framings,
     );
     let render_path_label = match render_path {
         crate::export::video::ExportRenderPath::StreamCopy => "remux",
@@ -5884,6 +6052,7 @@ async fn export_preflight_impl(
         &broll,
         &audio_mix_for_path,
         include_ass_for_path,
+        &framings,
     );
     items.push(ExportPreflightItem {
         code: "render-path".into(),
@@ -7805,7 +7974,7 @@ async fn export_video_impl(
     let prepare_dir = dir.clone();
     let prepare_stem = export_stem.clone();
     let prepare_started = std::time::Instant::now();
-    let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings) = {
+    let (doc, cuts, ass, soft_subtitle, include_ass, broll, audio_mix, settings, framings) = {
         // Hold the project mutation lock only while taking an export snapshot.
         // Encoding may take minutes and must not stall transcript editing.
         let _mutation = lock_project_mutation(&dir).await;
@@ -7875,6 +8044,7 @@ async fn export_video_impl(
                     .map(|(start, end)| end - start)
                     .sum(),
             )?;
+            let framings = crate::data::framing::load(&prepare_dir)?;
             Ok((
                 doc,
                 cuts,
@@ -7884,6 +8054,7 @@ async fn export_video_impl(
                 broll,
                 audio_mix,
                 settings,
+                framings,
             ))
         })
         .await?
@@ -7895,6 +8066,7 @@ async fn export_video_impl(
         &broll,
         &audio_mix,
         include_ass,
+        &framings,
     );
     tracing::info!(
         pipeline = "video-export",
@@ -7923,6 +8095,7 @@ async fn export_video_impl(
             settings: Some(settings),
             soft_subtitle,
             include_ass,
+            framings,
         },
     )
     .await;
@@ -8947,9 +9120,13 @@ pub async fn style_set(
             || style.margin_v > 2_000
             || !ass_color(&style.primary_colour)
             || !ass_color(&style.outline_colour)
+            || style
+                .caption_preset
+                .as_deref()
+                .is_some_and(|id| crate::data::caption_presets::caption_preset(id).is_none())
         {
             return Err(AppError::Schema(
-                "subtitle style contains an invalid font, colour, alignment, effect, or margin"
+                "subtitle style contains an invalid font, colour, alignment, effect, preset, or margin"
                     .into(),
             ));
         }
@@ -10462,6 +10639,117 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_words_splits_the_cut_and_undoes_as_one_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_index_project(
+            tmp.path(),
+            "p1",
+            "Interview",
+            "",
+            "one two three",
+            chrono::Utc::now(),
+        );
+        let project = tmp.path().join("p1");
+        let mut doc = Doc::load(&project).unwrap();
+        doc.paragraphs[0].sentences[0].words = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| crate::data::Word {
+                id: format!("w{index}"),
+                text: (*text).into(),
+                start: index as f64,
+                end: index as f64 + 1.0,
+            })
+            .collect();
+        doc.save(&project).unwrap();
+
+        assert_eq!(
+            cut_words(
+                "p1".into(),
+                vec!["w0".into(), "w1".into(), "w2".into()],
+                Some(tmp.path().to_path_buf()),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Restoring the middle word splits the cut into two word cuts.
+        let restored = cuts_restore(
+            "p1".into(),
+            vec!["w1".into()],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert!((restored - 1.0).abs() < 1e-9);
+        let remaining = cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].a_word, "w0");
+        assert_eq!(remaining[0].b_word, "w0");
+        assert_eq!(remaining[1].a_word, "w2");
+        assert_eq!(remaining[1].b_word, "w2");
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(history.undo_label.as_deref(), Some("Restore word"));
+
+        // One undo brings the original three-word cut back.
+        assert!(
+            edit_undo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            cut_list("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Redo returns to the split state, where w1 is no longer cut:
+        // restoring it is a no-op and adds no history entry.
+        assert!(
+            edit_redo("p1".into(), Some(tmp.path().to_path_buf()))
+                .await
+                .unwrap()
+                .changed
+        );
+        let restored = cuts_restore(
+            "p1".into(),
+            vec!["w1".into()],
+            Some(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored, 0.0);
+        let history = edit_history_status("p1".into(), Some(tmp.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(history.undo_label.as_deref(), Some("Restore word"));
+
+        // Unknown words are an error, matching `cut_words`.
+        assert!(cuts_restore(
+            "p1".into(),
+            vec!["missing".into()],
+            Some(tmp.path().to_path_buf())
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

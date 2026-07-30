@@ -104,7 +104,40 @@ fn to_ass_with_titles_impl(
     // stable so commas or renamed presets cannot disconnect cues from their style.
     let mut render_style = style.clone();
     render_style.name = "Default".into();
-    let _ = writeln!(out, "{}", render_style.ass_style_line());
+    // Caption preset (pireel port): overrides the look — colors / typeface /
+    // italic / backing box. Size, bold, alignment and margins stay user-owned.
+    let preset = style
+        .caption_preset
+        .as_deref()
+        .and_then(crate::data::caption_presets::caption_preset);
+    let mut border_style = 1;
+    if let Some(p) = preset {
+        if let Some(primary) = crate::data::caption_presets::css_color_to_ass(p.text) {
+            render_style.primary_colour = primary;
+        }
+        if let Some(fontname) = crate::data::caption_presets::preset_fontname(p) {
+            render_style.fontname = fontname.into();
+        }
+        render_style.italic |= p.italic;
+        // Per-word underline/highlight decorations have no per-word ASS
+        // equivalent — underline approximates to the whole-line flag, and the
+        // highlight box relies on the preset's full-line backing instead.
+        if p.deco == Some(crate::data::caption_presets::Deco::Underline) {
+            render_style.underline = true;
+        }
+        if let Some(box_color) =
+            p.bg.and_then(crate::data::caption_presets::css_color_to_ass)
+        {
+            // BorderStyle 3 = opaque box: OutlineColour becomes the backing and
+            // Outline its padding (~0.25em, mirroring the preset pill padding).
+            // Backed text gets no drop shadow (the preset rule for bare vs backed).
+            render_style.outline_colour = box_color;
+            render_style.outline = (render_style.fontsize / 4).max(4);
+            render_style.shadow = 0;
+            border_style = 3;
+        }
+    }
+    let _ = writeln!(out, "{}", render_style.ass_style_line_with(border_style));
     let _ = writeln!(out);
     let _ = writeln!(out, "[Events]");
     let _ = writeln!(
@@ -136,17 +169,66 @@ fn to_ass_with_titles_impl(
                 if ne <= ns {
                     continue;
                 }
-                let text = sent.text.trim().replace('\n', "\\N");
-                if text.is_empty() {
+                let trimmed = sent.text.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-                let _ = writeln!(
-                    out,
-                    "Dialogue: 0,{},{},Default,,0,0,0,,{}",
-                    fmt(ns),
-                    fmt(ne),
-                    text
-                );
+                // Preset captions become one Dialogue per line (main + optional
+                // translation sub-line): \k durations accumulate from the event
+                // start, so a shared event would karaoke the sub-line only after
+                // the main line finished, and a BorderStyle-3 backing boxes one
+                // event instead of hugging each line like the preview's pills.
+                let caption = preset.and_then(|p| {
+                    crate::data::caption_presets::preset_caption_lines(
+                        trimmed,
+                        &sent.words,
+                        p,
+                        render_style.fontsize,
+                        if border_style == 3 {
+                            render_style.outline
+                        } else {
+                            0
+                        },
+                        &|t| retime(t, &iv),
+                    )
+                });
+                match caption {
+                    Some(caption) => {
+                        // 0 in the event margin fields = take the style value;
+                        // the main line lifts above the sub-line block instead.
+                        let main_margin_v = if caption.main_margin_lift > 0 {
+                            render_style.margin_v + caption.main_margin_lift
+                        } else {
+                            0
+                        };
+                        let _ = writeln!(
+                            out,
+                            "Dialogue: 0,{},{},Default,,0,0,{},,{}",
+                            fmt(ns),
+                            fmt(ne),
+                            main_margin_v,
+                            caption.main
+                        );
+                        if let Some(sub) = caption.sub {
+                            let _ = writeln!(
+                                out,
+                                "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+                                fmt(ns),
+                                fmt(ne),
+                                sub
+                            );
+                        }
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+                            fmt(ns),
+                            fmt(ne),
+                            trimmed.replace('\n', "\\N")
+                        );
+                    }
+                }
             }
         }
     }
@@ -367,5 +449,76 @@ mod tests {
         assert!(output.contains(",-1,0,0,0,100,100,0,0,1,4,1,8,40,40,96,1"));
         assert!(output.contains("Dialogue: 0,"));
         assert!(!output.contains("Style: Creator, yellow"));
+    }
+
+    #[test]
+    fn emphasis_preset_karaokes_words_with_ass_k_tags() {
+        let style = SubStyle {
+            caption_preset: Some("em-yellow".into()),
+            ..Default::default()
+        };
+        let output = to_ass_with_style(&fixture(), &[], &style, 1920, 1080);
+        // Sung words switch to the emphasis colour, unsung stay body white.
+        assert!(output.contains("{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}Hi"));
+    }
+
+    #[test]
+    fn backing_preset_renders_as_opaque_box_without_shadow() {
+        let style = SubStyle {
+            caption_preset: Some("ln-black".into()),
+            ..Default::default()
+        };
+        let output = to_ass_with_style(&fixture(), &[], &style, 1920, 1080);
+        // rgba(0,0,0,0.85) → &H26000000 as box colour; BorderStyle 3, padding
+        // 52/4 = 13, no shadow. Line presets never karaoke.
+        assert!(output.contains("Style: Default,Arial,52,&H00FFFFFF,&H000000FF,&H26000000,&H00000000,0,0,0,0,100,100,0,0,3,13,0,2,40,40,80,1"));
+        assert!(!output.contains("{\\k"));
+    }
+
+    #[test]
+    fn preset_overrides_typeface_and_text_colour() {
+        let style = SubStyle {
+            caption_preset: Some("em-gold-serif".into()),
+            ..Default::default()
+        };
+        let output = to_ass_with_style(&fixture(), &[], &style, 1920, 1080);
+        // Serif preset exports as Songti SC — present on every macOS install,
+        // unlike Noto Serif SC which fontconfig silently fell back from.
+        assert!(output.contains("Style: Default,Songti SC,52,&H004C9DB8,"));
+    }
+
+    #[test]
+    fn bilingual_preset_cue_emits_two_dialogues_with_independent_karaoke() {
+        let mut doc = fixture();
+        doc.paragraphs[0].sentences[0].text = "Hi\n你好".into();
+        let style = SubStyle {
+            caption_preset: Some("em-yellow".into()),
+            ..Default::default()
+        };
+        let output = to_ass_with_style(&doc, &[], &style, 1920, 1080);
+        let dialogues: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("Dialogue: 0,"))
+            .collect();
+        assert_eq!(dialogues.len(), 2);
+        // Main line: real timing, MarginV lifted above the sub-line block
+        // (80 + 44×1.4 ≈ 62 = 142, no backing so no box padding).
+        assert!(dialogues[0].contains(",0,0,142,,{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}Hi"));
+        // Sub-line: its own event with \fs and an independent \k sweep
+        // (approximated per CJK char over the [0,0.5) window → 25cs each).
+        assert!(
+            dialogues[1].contains(",0,0,0,,{\\1c&H004FE3FF\\2c&H00FFFFFF\\fs44}{\\k25}你{\\k25}好")
+        );
+    }
+
+    #[test]
+    fn unknown_preset_id_keeps_the_plain_style() {
+        let style = SubStyle {
+            caption_preset: Some("bogus".into()),
+            ..Default::default()
+        };
+        let output = to_ass_with_style(&fixture(), &[], &style, 1920, 1080);
+        assert!(output.contains("Style: Default,Arial,52,&H00FFFFFF"));
+        assert!(!output.contains("{\\k"));
     }
 }

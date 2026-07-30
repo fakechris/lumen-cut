@@ -27,6 +27,10 @@ pub struct SubStyle {
     pub margin_l: u32,
     pub margin_r: u32,
     pub margin_v: u32,
+    /// pireel caption preset id (see `crate::data::caption_presets`). `None` =
+    /// no preset — the fields above render as-is (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_preset: Option<String>,
 }
 
 impl Default for SubStyle {
@@ -47,6 +51,7 @@ impl Default for SubStyle {
             margin_l: 40,
             margin_r: 40,
             margin_v: 80,
+            caption_preset: None,
         }
     }
 }
@@ -54,12 +59,18 @@ impl Default for SubStyle {
 impl SubStyle {
     /// Render the ASS `[V4+ Styles]` `Style:` line.
     pub fn ass_style_line(&self) -> String {
+        self.ass_style_line_with(1)
+    }
+
+    /// `border_style` 1 = outline + drop shadow (default); 3 = opaque box
+    /// (OutlineColour becomes the box backing, used by caption presets with `bg`).
+    pub fn ass_style_line_with(&self, border_style: u32) -> String {
         let b = if self.bold { -1 } else { 0 };
         let i = if self.italic { -1 } else { 0 };
         let u = if self.underline { -1 } else { 0 };
         let so = if self.strike_out { -1 } else { 0 };
         format!(
-            "Style: {name},{font},{size},{pri},&H000000FF,{ol},&H00000000,{b},{i},{u},{so},100,100,0,0,1,{outline},{shadow},{align},{ml},{mr},{mv},1",
+            "Style: {name},{font},{size},{pri},&H000000FF,{ol},&H00000000,{b},{i},{u},{so},100,100,0,0,{bs},{outline},{shadow},{align},{ml},{mr},{mv},1",
             name = self.name,
             font = self.fontname,
             size = self.fontsize,
@@ -69,6 +80,7 @@ impl SubStyle {
             i = i,
             u = u,
             so = so,
+            bs = border_style,
             outline = self.outline,
             shadow = self.shadow,
             align = self.alignment,
@@ -124,6 +136,25 @@ mod tests {
         let back: SubStyle = serde_json::from_str(&json).unwrap();
         assert_eq!(back.fontsize, 52);
         assert!(json.contains("\"fontsize\""));
+    }
+
+    #[test]
+    fn caption_preset_defaults_to_none_and_round_trips() {
+        // Legacy style.json files predate the field and must keep loading.
+        let legacy: SubStyle =
+            serde_json::from_str(&serde_json::to_string(&SubStyle::default()).unwrap()).unwrap();
+        assert_eq!(legacy.caption_preset, None);
+        assert!(!serde_json::to_string(&SubStyle::default())
+            .unwrap()
+            .contains("captionPreset"));
+        let styled = SubStyle {
+            caption_preset: Some("em-yellow".into()),
+            ..SubStyle::default()
+        };
+        let json = serde_json::to_string(&styled).unwrap();
+        assert!(json.contains("\"captionPreset\":\"em-yellow\""));
+        let back: SubStyle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.caption_preset.as_deref(), Some("em-yellow"));
     }
 
     #[test]

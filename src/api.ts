@@ -28,6 +28,8 @@ import type {
   ReportSummary,
   Settings,
   SetupJobStatus,
+  ShotFraming,
+  ShotFramingInput,
   SpeakerEvidence,
   SpeakerAnalysisJobStatus,
   SpeakerInfo,
@@ -587,6 +589,21 @@ export async function titleRemove(pid: string, id: string): Promise<boolean> {
   return invoke("title_remove", { pid, id, root: null });
 }
 
+export async function framingList(pid: string): Promise<ShotFraming[]> {
+  return invoke("framing_list", { pid, root: null });
+}
+
+export async function framingSet(
+  pid: string,
+  input: ShotFramingInput,
+): Promise<ShotFraming[]> {
+  return invoke("framing_set", { pid, input, root: null });
+}
+
+export async function framingRemove(pid: string, id: string): Promise<boolean> {
+  return invoke("framing_remove", { pid, id, root: null });
+}
+
 export async function audioMixGet(pid: string): Promise<AudioMix> {
   return invoke("audio_mix_get", { pid, root: null });
 }
@@ -688,6 +705,14 @@ export async function cutManualMany(pid: string, cueIds: string[]): Promise<numb
 
 export async function cutRestore(pid: string, cutId: string): Promise<boolean> {
   return invoke("cut_restore", { pid, cutId, root: null });
+}
+
+/**
+ * Restore previously removed transcript words (inverse of cutWords):
+ * overlapping cuts are removed or split. Returns the seconds given back.
+ */
+export async function cutsRestore(pid: string, wordIds: string[]): Promise<number> {
+  return invoke("cuts_restore", { pid, wordIds, root: null });
 }
 
 export async function cutList(pid: string): Promise<CutSummary[]> {

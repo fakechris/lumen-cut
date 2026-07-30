@@ -98,6 +98,107 @@ impl ClipCuts {
         before != self.cuts.len()
     }
 
+    /// Restore the source-timeline range `[start, end)`: every cut covering
+    /// part of the range is removed or trimmed so the range becomes kept
+    /// again. Returns the seconds given back to the timeline (0 = no-op).
+    ///
+    /// Word-anchored cuts split at word boundaries: covered words that fall
+    /// fully inside the range are un-cut, and the survivors keep their cut
+    /// as up to two trimmed clones of the original. Silence cuts encode only
+    /// a removed *duration* anchored at the right flanking word, so a
+    /// partial restore shortens that duration instead.
+    pub fn restore_range(&mut self, doc: &Doc, start: f64, end: f64) -> f64 {
+        const EPS: f64 = 1e-3;
+        if end <= start + EPS {
+            return 0.0;
+        }
+        let words = doc.all_words();
+        let mut pieces: Vec<(f64, f64)> = Vec::new();
+        let mut next: Vec<Cut> = Vec::with_capacity(self.cuts.len());
+        for cut in self.cuts.drain(..) {
+            let Some((cut_start, cut_end)) = cut.resolved_interval(doc) else {
+                next.push(cut);
+                continue;
+            };
+            let overlap = (cut_end.min(end) - cut_start.max(start)).max(0.0);
+            if overlap <= EPS {
+                next.push(cut);
+                continue;
+            }
+            if cut.kind == CutKind::Silence {
+                pieces.push((cut_start.max(start), cut_end.min(end)));
+                let remaining = cut.duration - overlap;
+                if remaining > EPS {
+                    let mut trimmed = cut;
+                    trimmed.duration = remaining;
+                    next.push(trimmed);
+                }
+                continue;
+            }
+            // Word-anchored cut: un-cut the covered words inside the range,
+            // keep the survivors as contiguous trimmed runs.
+            let lo = words.iter().position(|word| word.id == cut.a_word);
+            let hi = words.iter().position(|word| word.id == cut.b_word);
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                next.push(cut);
+                continue;
+            };
+            let (lo, hi) = (lo.min(hi), lo.max(hi));
+            let survivors: Vec<usize> = (lo..=hi)
+                .filter(|&index| {
+                    let word = words[index];
+                    word.start < start - EPS || word.end > end + EPS
+                })
+                .collect();
+            if survivors.len() == hi - lo + 1 {
+                // The range clips word interiors but no whole word — keep the
+                // cut untouched rather than guessing at sub-word timing.
+                next.push(cut);
+                continue;
+            }
+            pieces.push((cut_start.max(start), cut_end.min(end)));
+            let mut run_start: Option<usize> = None;
+            let mut previous: Option<usize> = None;
+            let mut part = 0usize;
+            for index in survivors.into_iter().chain(std::iter::once(usize::MAX)) {
+                let contiguous = previous.is_some_and(|prev| index == prev + 1);
+                if !contiguous {
+                    if let (Some(first), Some(last)) = (run_start, previous) {
+                        part += 1;
+                        next.push(Cut {
+                            id: format!("{}~{part}", cut.id),
+                            note: cut.note.clone(),
+                            a_word: words[first].id.clone(),
+                            b_word: words[last].id.clone(),
+                            kind: cut.kind,
+                            duration: (words[last].end - words[first].start).max(0.0),
+                        });
+                    }
+                    run_start = (index != usize::MAX).then_some(index);
+                }
+                previous = (index != usize::MAX).then_some(index);
+            }
+        }
+        self.cuts = next;
+        // Seconds restored, unioned so overlapping cuts do not double-count.
+        pieces.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut restored = 0.0;
+        let mut cursor: Option<(f64, f64)> = None;
+        for (piece_start, piece_end) in pieces {
+            match cursor.as_mut() {
+                Some((_, last_end)) if piece_start <= *last_end => {
+                    restored += (piece_end - *last_end).max(0.0);
+                    *last_end = last_end.max(piece_end);
+                }
+                _ => {
+                    restored += piece_end - piece_start;
+                    cursor = Some((piece_start, piece_end));
+                }
+            }
+        }
+        restored
+    }
+
     /// Total seconds removed, used as a `>40%` WARN gate.
     pub fn total_duration(&self) -> f64 {
         self.cuts.iter().map(|c| c.duration).sum()
@@ -245,6 +346,130 @@ mod tests {
         });
         assert!(c.restore("c1"));
         assert!(!c.restore("c1"));
+    }
+
+    fn word_cut(id: &str, a: &str, b: &str, a_start: f64, b_end: f64) -> Cut {
+        Cut {
+            id: id.into(),
+            note: Some("removed".into()),
+            a_word: a.into(),
+            b_word: b.into(),
+            kind: CutKind::Manual,
+            duration: b_end - a_start,
+        }
+    }
+
+    #[test]
+    fn restore_range_removes_fully_covered_cut() {
+        let doc = fixture();
+        let mut cuts = ClipCuts {
+            cuts: vec![word_cut("c1", "w1", "w2", 1.0, 4.0)],
+        };
+        let restored = cuts.restore_range(&doc, 0.5, 4.5);
+        assert!((restored - 3.0).abs() < 1e-9);
+        assert!(cuts.cuts.is_empty());
+        assert_eq!(kept_spans(&doc, &cuts.cuts).len(), 1);
+    }
+
+    #[test]
+    fn restore_range_splits_cut_around_restored_word() {
+        let doc = fixture(); // w1: 1..2, w2: 3..4, w3: 4..4.5
+        let mut cuts = ClipCuts {
+            cuts: vec![word_cut("c1", "w1", "w3", 1.0, 4.5)],
+        };
+        let restored = cuts.restore_range(&doc, 3.0, 4.0); // exactly w2
+        assert!((restored - 1.0).abs() < 1e-9);
+        assert_eq!(cuts.cuts.len(), 2);
+        assert_eq!(cuts.cuts[0].a_word, "w1");
+        assert_eq!(cuts.cuts[0].b_word, "w1");
+        assert!((cuts.cuts[0].duration - 1.0).abs() < 1e-9);
+        assert_eq!(cuts.cuts[1].a_word, "w3");
+        assert_eq!(cuts.cuts[1].b_word, "w3");
+        assert_eq!(cuts.cuts[1].kind, CutKind::Manual);
+        assert_eq!(cuts.cuts[1].note.as_deref(), Some("removed"));
+        // The restored word is kept again; its neighbours are still cut.
+        let kept = kept_spans(&doc, &cuts.cuts);
+        assert!(kept.iter().any(|span| span.start <= 3.0 && span.end >= 4.0));
+    }
+
+    #[test]
+    fn restore_range_trims_cut_edges() {
+        let doc = fixture();
+        let mut cuts = ClipCuts {
+            cuts: vec![word_cut("c1", "w1", "w3", 1.0, 4.5)],
+        };
+        let restored = cuts.restore_range(&doc, 0.0, 2.5); // restores w1 only
+                                                           // The cut interval is continuous, so the pause up to 2.5 returns too.
+        assert!((restored - 1.5).abs() < 1e-9);
+        assert_eq!(cuts.cuts.len(), 1);
+        assert_eq!(cuts.cuts[0].a_word, "w2");
+        assert_eq!(cuts.cuts[0].b_word, "w3");
+        assert!((cuts.cuts[0].duration - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn restore_range_spans_multiple_cuts() {
+        let doc = fixture();
+        let mut cuts = ClipCuts {
+            cuts: vec![
+                word_cut("c1", "w0", "w1", 0.0, 2.0),
+                word_cut("c2", "w3", "w4", 4.0, 5.0),
+            ],
+        };
+        let restored = cuts.restore_range(&doc, 1.0, 4.5);
+        // Restores w1 (1s) from c1 and w3 (0.5s) from c2; w2 was never cut.
+        assert!((restored - 1.5).abs() < 1e-9);
+        assert_eq!(cuts.cuts.len(), 2);
+        assert_eq!(cuts.cuts[0].a_word, "w0");
+        assert_eq!(cuts.cuts[0].b_word, "w0");
+        assert_eq!(cuts.cuts[1].a_word, "w4");
+        assert_eq!(cuts.cuts[1].b_word, "w4");
+    }
+
+    #[test]
+    fn restore_range_without_overlap_is_noop() {
+        let doc = fixture();
+        let mut cuts = ClipCuts {
+            cuts: vec![word_cut("c1", "w0", "w1", 0.0, 2.0)],
+        };
+        let before = cuts.cuts.clone();
+        assert_eq!(cuts.restore_range(&doc, 2.0, 3.0), 0.0); // the pause
+        assert_eq!(cuts.cuts, before);
+    }
+
+    #[test]
+    fn restore_range_inside_a_word_keeps_cut_untouched() {
+        let doc = fixture();
+        let mut cuts = ClipCuts {
+            cuts: vec![word_cut("c1", "w0", "w0", 0.0, 1.0)],
+        };
+        let before = cuts.cuts.clone();
+        assert_eq!(cuts.restore_range(&doc, 0.25, 0.75), 0.0);
+        assert_eq!(cuts.cuts, before);
+    }
+
+    #[test]
+    fn restore_range_shortens_silence_cut_duration() {
+        let doc = fixture(); // gap between w1 (ends 2.0) and w2 (starts 3.0)
+        let mut cuts = ClipCuts {
+            cuts: vec![Cut {
+                id: "c1".into(),
+                note: None,
+                a_word: "w1".into(),
+                b_word: "w2".into(),
+                kind: CutKind::Silence,
+                duration: 0.7,
+            }],
+        };
+        // Resolved window is (2.3, 3.0); restoring 2.5..4.0 eats 0.5s of it.
+        let restored = cuts.restore_range(&doc, 2.5, 4.0);
+        assert!((restored - 0.5).abs() < 1e-9);
+        assert_eq!(cuts.cuts.len(), 1);
+        assert!((cuts.cuts[0].duration - 0.2).abs() < 1e-9);
+        // Restoring the rest removes the cut entirely.
+        let restored = cuts.restore_range(&doc, 0.0, 3.0);
+        assert!((restored - 0.2).abs() < 1e-9);
+        assert!(cuts.cuts.is_empty());
     }
 
     #[test]

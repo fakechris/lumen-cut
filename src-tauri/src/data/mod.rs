@@ -3,12 +3,14 @@
 pub mod activity;
 pub mod audio_mix;
 pub mod broll;
+pub mod caption_presets;
 pub mod chapter;
 pub mod cues;
 pub mod doc;
 pub mod edit;
 pub mod edit_history;
 pub mod export_settings;
+pub mod framing;
 pub mod modelconfig;
 pub mod rebind;
 pub mod reindex;

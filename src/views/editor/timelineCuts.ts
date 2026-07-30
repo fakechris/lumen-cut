@@ -36,8 +36,28 @@ export function resolveTimelineCuts(doc: Doc, cuts: CutSummary[]): TimelineCutIn
   }, []);
 }
 
-export function nextPlayableTime(
-  sourceTime: number,
+/**
+ * Word ids covered by the merged cut intervals — the words shown struck
+ * through in the transcript. Silence cuts remove only the gap between their
+ * flanking words, so they strike through nothing.
+ */
+export function cutWordIdsForDoc(doc: Doc, cuts: CutSummary[]): Set<string> {
+  const intervals = resolveTimelineCuts(doc, cuts);
+  const removed = new Set<string>();
+  if (intervals.length === 0) return removed;
+  for (const paragraph of doc.paragraphs) {
+    for (const sentence of paragraph.sentences) {
+      for (const word of sentence.words) {
+        if (intervals.some((cut) => word.start < cut.end && word.end > cut.start)) {
+          removed.add(word.id);
+        }
+      }
+    }
+  }
+  return removed;
+}
+
+export function nextPlayableTime(  sourceTime: number,
   cuts: TimelineCutInterval[],
 ): number {
   const interval = cuts.find(

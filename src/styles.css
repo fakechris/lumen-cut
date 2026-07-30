@@ -6051,9 +6051,18 @@ pre.out {
   width: 100%;
 }
 
-.program-stage > video {
+.program-stage > video,
+.program-shot > video {
   inset: 0;
   position: absolute;
+}
+
+/* Per-shot framing: the transform runs after object-fit (canvasFit), so the
+   composition matches the export's canvas-fit → framing pipeline. */
+.program-shot {
+  inset: 0;
+  position: absolute;
+  transition: transform 240ms ease;
 }
 
 .program-broll {
@@ -6189,7 +6198,11 @@ pre.out {
   z-index: 4;
 }
 
-.program-subtitle span {
+/* Direct child only: emphasis-preset captions nest per-word spans inside the
+   caption span — a bare descendant selector would leak this font-size/padding
+   onto every word (giant words, double padding, unresponsive to the user's
+   font-size setting). */
+.program-subtitle > span {
   background: transparent;
   box-decoration-break: clone;
   color: #f6f3ea;
@@ -6412,10 +6425,17 @@ pre.out {
   color: var(--accent);
 }
 
-.editor-view .transcript-word.is-cut,
+.editor-view .transcript-word.is-cut {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
 .editor-view .transcript-word:disabled {
   cursor: default;
   opacity: 0.45;
+}
+
+.editor-view .transcript-word.is-cut:disabled {
   text-decoration: line-through;
 }
 
@@ -6446,6 +6466,26 @@ pre.out {
 
 .editor-view .style-preset-card:hover {
   border-color: var(--accent);
+}
+
+.editor-view .style-preset-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.editor-view .caption-preset-group {
+  color: var(--text-tertiary);
+  display: block;
+  font-size: 10px;
+  margin-top: 10px;
+}
+
+.editor-view .caption-preset-note {
+  color: var(--text-tertiary);
+  display: block;
+  font-size: 10px;
+  line-height: 1.4;
+  margin-top: 8px;
 }
 
 .editor-view .style-preset-swatch {
@@ -7576,7 +7616,40 @@ pre.out {
   position: absolute;
 }
 
-.timeline-contact-sheet,
+.timeline-shot-segment {
+  background: transparent;
+  border: 1px solid transparent;
+  bottom: 2px;
+  cursor: pointer;
+  padding: 0;
+  position: absolute;
+  top: 2px;
+  z-index: 2;
+}
+
+.timeline-shot-segment:hover,
+.timeline-shot-segment:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.timeline-shot-segment.selected {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: var(--accent);
+}
+
+.timeline-shot-segment.framed {
+  border-bottom: 2px solid var(--accent);
+}
+
+.timeline-shot-framing-dot {
+  background: var(--accent);
+  border-radius: 50%;
+  height: 5px;
+  position: absolute;
+  right: 3px;
+  top: 3px;
+  width: 5px;
+}.timeline-contact-sheet,
 .timeline-waveform {
   height: 100%;
   inset: 0;
@@ -7878,6 +7951,93 @@ pre.out {
   position: absolute;
   width: 390px;
   z-index: 21;
+}
+
+.timeline-framing-popover {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  bottom: 34px;
+  box-shadow: var(--shadow-lg);
+  display: grid;
+  gap: 10px;
+  left: 290px;
+  min-width: 300px;
+  padding: 12px;
+  position: absolute;
+  width: 330px;
+  z-index: 21;
+}
+
+.timeline-framing-popover > header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.timeline-framing-popover > header button {
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.timeline-framing-popover > small {
+  color: var(--text-tertiary);
+}
+
+.framing-treatments {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.framing-treatments > button {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: grid;
+  gap: 4px;
+  justify-items: center;
+  padding: 8px 4px 6px;
+}
+
+.framing-treatments > button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+
+.framing-treatments > button.selected {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border-color: var(--accent);
+}
+
+.framing-treatments > button > span {
+  font-size: 11px;
+}
+
+.framing-icon {
+  height: 18px;
+  overflow: hidden;
+  width: 28px;
+}
+
+.framing-icon-canvas {
+  fill: none;
+  stroke: var(--text-tertiary);
+  stroke-width: 1;
+}
+
+.framing-icon-content {
+  fill: color-mix(in srgb, var(--accent) 70%, white);
+}
+
+.framing-size {
+  display: grid;
+  gap: 4px;
+}
+
+.framing-size > span {
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .timeline-audio-processing {
@@ -8646,6 +8806,13 @@ pre.out {
     max-width: calc(100vw - 32px);
     min-width: 0;
     width: 390px;
+  }
+
+  .timeline-framing-popover {
+    left: 8px;
+    max-width: calc(100vw - 32px);
+    min-width: 0;
+    width: 330px;
   }
 
   .editor-view {

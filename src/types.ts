@@ -357,6 +357,11 @@ export interface SubtitleStyle {
   marginL: number;
   marginR: number;
   marginV: number;
+  /**
+   * pireel caption preset id (src/vendor/pireel/caption-presets.ts).
+   * Absent/null = no preset, the fields above render as-is (the default).
+   */
+  captionPreset?: string | null;
 }
 
 export interface ModelConfig {
@@ -568,6 +573,31 @@ export interface TitleClip {
 }
 
 export type TitleClipInput = Omit<TitleClip, "id">;
+
+export type ShotTreatment =
+  | "full"
+  | "punch-in"
+  | "corner-br"
+  | "corner-tl"
+  | "split-l"
+  | "split-r";
+
+/** Per-shot framing for one kept media segment (source-timeline seconds). */
+export interface ShotFraming {
+  id: string;
+  start: number;
+  end: number;
+  treatment: ShotTreatment;
+  /** Unitless 0–100 size; absent = the treatment's default. */
+  size?: number | null;
+}
+
+export interface ShotFramingInput {
+  start: number;
+  end: number;
+  treatment: ShotTreatment;
+  size?: number | null;
+}
 
 export interface AudioMix {
   volume: number;

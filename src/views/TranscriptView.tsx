@@ -31,6 +31,7 @@ import {
   cutSpeechCleanup,
   cutWords,
   cutRestore,
+  cutsRestore,
   editHistoryStatus,
   editRedo,
   editUndo,
@@ -70,6 +71,8 @@ import {
   taskResume,
   taskPause,
   taskStatus,
+  framingList,
+  framingSet,
   titleAdd,
   titleList,
   titleRemove,
@@ -107,6 +110,8 @@ import type {
   SubtitleRow,
   SubtitleStyle,
   ReportSummary,
+  ShotFraming,
+  ShotFramingInput,
   SpeakerEvidence,
   SpeakerAnalysisJobStatus,
   SpeakerReidentifyProposal,
@@ -143,6 +148,7 @@ import {
 } from "./editor/ChapterWorkspace";
 import { DEFAULT_AUDIO_MIX } from "./editor/audioMix";
 import {
+  cutWordIdsForDoc,
   editedTimelineDuration,
   nextPlayableTime,
   resolveTimelineCuts,
@@ -732,6 +738,7 @@ export function TranscriptView({
   const [brollPreviewJob, setBrollPreviewJob] = useState<BrollPreviewJobStatus | null>(null);
   const [brollPreviewPaths, setBrollPreviewPaths] = useState<string[]>([]);
   const [titles, setTitles] = useState<TitleClip[]>([]);
+  const [framings, setFramings] = useState<ShotFraming[]>([]);
   const [audioMix, setAudioMix] = useState<AudioMix>(DEFAULT_AUDIO_MIX);
   const workbenchPlayerRef = useRef<HTMLMediaElement | null>(null);
   const [workbenchTime, setWorkbenchTime] = useState(0);
@@ -961,6 +968,18 @@ export function TranscriptView({
         : "source");
   const exportCaptionLanguage = videoExportSettings.subtitleLanguage
     || preferredTranslationLanguage(translationLanguages);
+  // Shared by the export tab's 字幕内容 select and the style workspace's copy:
+  // one persisted setting (videoExportSettings → export-settings.json).
+  const applyCaptionStyle = (captionStyle: VideoExportSettings["captionStyle"]) => {
+    const language = exportCaptionLanguage
+      || preferredTranslationLanguage(translationLanguages);
+    setVideoExportSettings((current) => ({
+      ...current,
+      captionStyle,
+      bilingualSubtitles: captionStyle === "bilingual",
+      subtitleLanguage: captionStyle === "source" ? null : (language || current.subtitleLanguage),
+    }));
+  };
   const timelineCutIntervals = useMemo(
     () => doc ? resolveTimelineCuts(doc, cuts) : [],
     [cuts, doc],
@@ -990,22 +1009,7 @@ export function TranscriptView({
         if (next) nextCues[sentence.id] = next.id;
       });
     }
-    const removed = new Set<string>();
-    if (doc) {
-      const allWords = doc.paragraphs.flatMap((p) =>
-        p.sentences.flatMap((s) => s.words),
-      );
-      for (const cut of cuts) {
-        const a = allWords.find((w) => w.id === cut.a_word);
-        const b = allWords.find((w) => w.id === cut.b_word);
-        if (!a || !b) continue;
-        const lo = Math.min(a.start, b.start);
-        const hi = Math.max(a.end, b.end);
-        for (const word of allWords) {
-          if (word.start < hi && word.end > lo) removed.add(word.id);
-        }
-      }
-    }
+    const removed = doc ? cutWordIdsForDoc(doc, cuts) : new Set<string>();
     return { wordsByCue: words, nextCueById: nextCues, cutWordIds: removed };
   }, [cuts, doc, doc?.paragraphs]);
 
@@ -1088,6 +1092,7 @@ export function TranscriptView({
       nextEvidence,
       nextBroll,
       nextTitles,
+      nextFramings,
       nextEditHistory,
       nextAudioMix,
       nextExportSettings,
@@ -1107,6 +1112,7 @@ export function TranscriptView({
         return { suggestions: [], accepted: [], errors: [friendlyError(error, lang)] };
       }),
       titleList(projectId).catch(() => []),
+      framingList(projectId).catch(() => []),
       editHistoryStatus(projectId).catch(() => EMPTY_EDIT_HISTORY),
       audioMixGet(projectId).catch(() => DEFAULT_AUDIO_MIX),
       exportSettingsGet(projectId).catch(() => DEFAULT_VIDEO_EXPORT_SETTINGS),
@@ -1129,6 +1135,7 @@ export function TranscriptView({
     setSpeakerEvidenceState(nextEvidence);
     setBrollOverview(nextBroll);
     setTitles(nextTitles);
+    setFramings(nextFramings);
     setEditHistory(nextEditHistory);
     setAudioMix(nextAudioMix);
     setVideoExportSettings(normalizeVideoExportSettings(
@@ -1174,6 +1181,7 @@ export function TranscriptView({
     setSpeakerAnalysisJob(null);
     setBrollOverview({ suggestions: [], accepted: [], errors: [] });
     setTitles([]);
+    setFramings([]);
     setAudioMix(DEFAULT_AUDIO_MIX);
     setEditHistory(EMPTY_EDIT_HISTORY);
     setBrollPreviewJob(null);
@@ -2263,6 +2271,17 @@ export function TranscriptView({
     setTitles(await titleList(pid));
   };
 
+  const setShotFraming = async (input: ShotFramingInput) => {
+    await performRecoverable("shot-framing", async () => {
+      setFramings(await framingSet(pid, input));
+      await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh" ? "取景已保存。" : "Saved the shot framing.",
+      });
+    });
+  };
+
   const refreshEditHistory = async () => {
     invalidateDeliveryCheck();
     try {
@@ -2546,6 +2565,25 @@ export function TranscriptView({
           : added > 0
             ? "Removed selected word(s) from the edit. Undoable."
             : "Those words are already cut or could not be removed.",
+      });
+    });
+  };
+
+  const restoreWords = async (wordIds: string[]) => {
+    if (wordIds.length === 0) return;
+    await perform("restore-words", async () => {
+      const restored = await cutsRestore(pid, wordIds);
+      setCuts(await cutList(pid));
+      if (restored > 0) await refreshEditHistory();
+      setFeedback({
+        tone: "success",
+        text: lang === "zh"
+          ? restored > 0
+            ? `已把选中的词恢复到成片（可撤销）。`
+            : "这些词已经在成片中。"
+          : restored > 0
+            ? "Restored the selected word(s) to the edit. Undoable."
+            : "Those words are already in the edit.",
       });
     });
   };
@@ -2844,6 +2882,7 @@ export function TranscriptView({
             currentTime={workbenchTime}
             doc={doc}
             expanded={previewExpanded}
+            framings={framings}
             lang={lang}
             programDuration={programDuration}
             programTime={programTime}
@@ -3312,8 +3351,8 @@ export function TranscriptView({
               <h2>{lang === "zh" ? "编辑提示" : "Editing tip"}</h2>
               <p>
                 {lang === "zh"
-                  ? "点词去掉画面；改文字后按 ⌘↵ 保存。批量操作可一次撤销。"
-                  : "Click a word to cut its media; press ⌘↵ to save text edits. Batch cuts undo as one step."}
+                  ? "点词去掉画面，点划线词恢复；改文字后按 ⌘↵ 保存。批量操作可一次撤销。"
+                  : "Click a word to cut its media, or a struck-through word to restore it; press ⌘↵ to save text edits. Batch cuts undo as one step."}
               </p>
             </section>
           </aside>
@@ -3333,6 +3372,7 @@ export function TranscriptView({
             onMerge={mergeSubtitleLines}
             onRemoveWords={removeWords}
             onReplace={replaceSubtitles}
+            onRestoreWords={restoreWords}
             onSave={saveSubtitle}
             onSaveMany={saveSubtitles}
             onSeek={seekWorkbench}
@@ -3411,9 +3451,14 @@ export function TranscriptView({
       {activeTab === "style" && savedSubtitleStyle && subtitleStyle && (
         <StyleWorkspace
           busy={operation === "style"}
+          captionLanguage={exportCaptionLanguage}
+          captionStyle={exportCaptionStyle}
           lang={lang}
           savedStyle={savedSubtitleStyle}
+          sourceLanguage={doc.meta.language || null}
           style={subtitleStyle}
+          translationsAvailable={translationLanguages.length > 0}
+          onCaptionStyleChange={applyCaptionStyle}
           onPreview={setSubtitleStyle}
           onReset={resetStylePreview}
           onSave={saveStyle}
@@ -3879,17 +3924,9 @@ export function TranscriptView({
                   <select
                     disabled={videoExportSettings.subtitleMode === "none"}
                     value={exportCaptionStyle}
-                    onChange={(event) => {
-                      const captionStyle = event.target.value as VideoExportSettings["captionStyle"];
-                      const language = exportCaptionLanguage
-                        || preferredTranslationLanguage(translationLanguages);
-                      setVideoExportSettings((current) => ({
-                        ...current,
-                        captionStyle,
-                        bilingualSubtitles: captionStyle === "bilingual",
-                        subtitleLanguage: captionStyle === "source" ? null : (language || current.subtitleLanguage),
-                      }));
-                    }}
+                    onChange={(event) => applyCaptionStyle(
+                      event.target.value as VideoExportSettings["captionStyle"],
+                    )}
                   >
                     <option value="bilingual">
                       {lang === "zh"
@@ -4159,6 +4196,7 @@ export function TranscriptView({
         currentTime={workbenchTime}
         cuts={cuts}
         doc={doc}
+        framings={framings}
         history={editHistory}
         isPlaying={workbenchPlaying}
         lang={lang}
@@ -4171,6 +4209,7 @@ export function TranscriptView({
         onRedo={redoEditorEdit}
         onRemoveCues={removeTimelineCues}
         onSeek={seekWorkbench}
+        onSetFraming={setShotFraming}
         onSplit={splitSubtitleLine}
         onUpdateCueTiming={updateSubtitleTiming}
         onTogglePlayback={toggleWorkbenchPlayback}
