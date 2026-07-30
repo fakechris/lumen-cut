@@ -253,11 +253,15 @@ pub fn caption_preset(id: &str) -> Option<&'static CaptionPreset> {
     CAPTION_PRESETS.iter().find(|p| p.id == id)
 }
 
-/// ASS fontname for a preset font (libass resolves against system fonts).
+/// ASS fontname for a preset font. These must resolve under libass/fontconfig
+/// at export time, so they name fonts every macOS install ships (the app is
+/// Mac-only): serif matches the preview's Songti SC exactly; mono takes Menlo
+/// because the preview's bundled IBM Plex Mono ships only as woff2, which
+/// freetype/fontconfig cannot load.
 pub fn preset_fontname(preset: &CaptionPreset) -> Option<&'static str> {
     match preset.font {
-        Some(PresetFont::Serif) => Some("Noto Serif SC"),
-        Some(PresetFont::Mono) => Some("IBM Plex Mono"),
+        Some(PresetFont::Serif) => Some("Songti SC"),
+        Some(PresetFont::Mono) => Some("Menlo"),
         None => None,
     }
 }
@@ -414,7 +418,27 @@ fn approx_karaoke(text: &str, start: f64, end: f64) -> Option<String> {
     Some(out)
 }
 
-/// Build the Dialogue text for a caption-preset sentence.
+/// One cue rendered under a caption preset: the main line plus an optional
+/// translation sub-line, each meant to become its OWN Dialogue event.
+///
+/// Two events are required, not cosmetic:
+///   - `\k` durations accumulate from the event start, so a translation line
+///     inside the same event would only start its sweep after the main line's
+///     karaoke finished (observed: the sub-line never highlighted on burn-in);
+///   - a BorderStyle-3 backing is one box per event, so two events reproduce
+///     the preview's per-line pills (box-decoration-break: clone).
+pub struct PresetCaption {
+    /// Main-line Dialogue text (with karaoke/colour overrides when applicable).
+    pub main: String,
+    /// Translation-line Dialogue text (`\fs`-scaled, karaoke when applicable).
+    pub sub: Option<String>,
+    /// Pixels the main event's MarginV must be raised so it sits above the
+    /// sub-line block (sub font height + backing padding + a small gap);
+    /// 0 when there is no sub-line.
+    pub main_margin_lift: u32,
+}
+
+/// Build the Dialogue texts for a caption-preset sentence (see PresetCaption).
 ///
 /// Emphasis presets with an emphasis colour get `\k` karaoke tags: the inline
 /// `\1c` (sung = emphasis colour) / `\2c` (unsung = body colour) overrides make
@@ -425,59 +449,97 @@ fn approx_karaoke(text: &str, start: f64, end: f64) -> Option<String> {
 ///     → APPROXIMATION: the cue window is allocated linearly across the text's
 ///     tokens (approx_tokens/approx_karaoke) — translations have no real word
 ///     timing of their own. The preview applies the same approximation.
-/// Bilingual cues ("source\ntranslation") karaoke both lines, and the
-/// translation gets a `\fs` override at CAPTION_SUB_LINE_SCALE so the export
-/// matches the preview's sub-line ratio.
+/// Bilingual cues ("source\ntranslation") produce both lines; the translation
+/// gets a `\fs` override at CAPTION_SUB_LINE_SCALE so the export matches the
+/// preview's sub-line ratio. `box_padding` is the BorderStyle-3 outline width
+/// when the preset has a backing, 0 otherwise (feeds main_margin_lift).
 ///
-/// Returns `None` when nothing can be timed (empty text, no words, zero-length
-/// window): the caller falls back to the plain whole-line style.
-pub fn preset_dialogue_text(
+/// Returns `None` only when there is no visible text; karaoke degrades to the
+/// plain line whenever timing is unavailable (no words / zero-length window).
+pub fn preset_caption_lines(
     text: &str,
     words: &[Word],
     preset: &CaptionPreset,
     font_size: u32,
+    box_padding: u32,
     retime: &dyn Fn(f64) -> f64,
-) -> Option<String> {
-    let emphasis = preset
+) -> Option<PresetCaption> {
+    // Karaoke needs the emphasis colours; everything else still renders (plain
+    // text), matching the preview's whole-line fallback.
+    let karaoke_colors = preset
         .emphasis
-        .filter(|_| preset.mode == CaptionMode::Emphasis)?;
-    let primary = css_color_to_ass(emphasis)?;
-    let secondary = css_color_to_ass(preset.text)?;
+        .filter(|_| preset.mode == CaptionMode::Emphasis)
+        .and_then(|e| Some((css_color_to_ass(e)?, css_color_to_ass(preset.text)?)));
     // Bilingual cues are "source\ntranslation"; words only cover the source line.
     let (source, translation) = match text.split_once('\n') {
         Some((source, rest)) => (source, Some(rest)),
         None => (text, None),
     };
-    if source.is_empty() || words.is_empty() {
+    if source.is_empty() {
         return None;
     }
     // Karaoke window: the cue's retimed span (the same bounds ass.rs puts on
-    // the Dialogue event).
-    let start = retime(words.first()?.start);
-    let end = retime(words.last()?.end);
-    let main = if without_whitespace(&join_words(words)) == without_whitespace(source) {
-        // Real ASR word timing; cut-away words collapse to a 1cs blip.
-        let mut out = String::new();
-        for (i, w) in words.iter().enumerate() {
-            let cs = ((retime(w.end) - retime(w.start)) * 100.0).round().max(1.0) as u32;
-            out.push_str(&format!("{{\\k{cs}}}{}", w.text));
-            if i + 1 < words.len() && latin_join(&w.text, &words[i + 1].text) {
-                out.push(' ');
-            }
+    // the Dialogue event). None without words — karaoke then degrades to plain.
+    let window = match (words.first(), words.last()) {
+        (Some(first), Some(last)) => {
+            let start = retime(first.start);
+            let end = retime(last.end);
+            (end > start).then_some((start, end))
         }
-        out
-    } else {
-        // Approximation: translation-only cue, or text the word stream cannot
-        // reproduce — linear token timing over the cue window.
-        approx_karaoke(source, start, end)?
+        _ => None,
     };
-    let mut out = format!("{{\\1c{primary}\\2c{secondary}}}{main}");
-    if let Some(rest) = translation {
-        let sub_size = (font_size as f64 * CAPTION_SUB_LINE_SCALE).round().max(1.0) as u32;
-        let sub = approx_karaoke(rest, start, end)?;
-        out.push_str(&format!("\\N{{\\fs{sub_size}}}{sub}"));
-    }
-    Some(out)
+    let real_timing =
+        window.is_some() && without_whitespace(&join_words(words)) == without_whitespace(source);
+    let main_body = match (&karaoke_colors, window) {
+        (Some(_), Some((start, end))) if real_timing => {
+            // Real ASR word timing; cut-away words collapse to a 1cs blip.
+            let mut out = String::new();
+            for (i, w) in words.iter().enumerate() {
+                let cs = ((retime(w.end) - retime(w.start)) * 100.0).round().max(1.0) as u32;
+                out.push_str(&format!("{{\\k{cs}}}{}", w.text));
+                if i + 1 < words.len() && latin_join(&w.text, &words[i + 1].text) {
+                    out.push(' ');
+                }
+            }
+            out
+        }
+        (Some(_), Some((start, end))) => {
+            // Approximation: translation-only cue, or text the word stream
+            // cannot reproduce — linear token timing over the cue window.
+            approx_karaoke(source, start, end).unwrap_or_else(|| source.replace('\n', "\\N"))
+        }
+        _ => source.replace('\n', "\\N"),
+    };
+    let main = match &karaoke_colors {
+        Some((primary, secondary)) => format!("{{\\1c{primary}\\2c{secondary}}}{main_body}"),
+        None => main_body,
+    };
+    let sub_size = (font_size as f64 * CAPTION_SUB_LINE_SCALE).round().max(1.0) as u32;
+    let sub = translation.map(|rest| {
+        let body = match (&karaoke_colors, window) {
+            (Some(_), Some((start, end))) => {
+                approx_karaoke(rest, start, end).unwrap_or_else(|| rest.replace('\n', "\\N"))
+            }
+            _ => rest.replace('\n', "\\N"),
+        };
+        match &karaoke_colors {
+            Some((primary, secondary)) => {
+                format!("{{\\1c{primary}\\2c{secondary}\\fs{sub_size}}}{body}")
+            }
+            None => format!("{{\\fs{sub_size}}}{body}"),
+        }
+    });
+    // Sub block ≈ 1.4× the sub font size (line box + a small gap) plus the
+    // backing box's vertical padding on both sides.
+    let main_margin_lift = sub
+        .as_ref()
+        .map(|_| (sub_size as f64 * 1.4).round() as u32 + box_padding * 2)
+        .unwrap_or(0);
+    Some(PresetCaption {
+        main,
+        sub,
+        main_margin_lift,
+    })
 }
 
 #[cfg(test)]
@@ -535,24 +597,35 @@ mod tests {
     fn karaoke_tags_follow_word_timing() {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("Hello", 1.0, 1.4), word("world", 1.4, 2.0)];
-        let text = preset_dialogue_text("Hello world", &words, preset, 52, &|t| t).unwrap();
+        let caption = preset_caption_lines("Hello world", &words, preset, 52, 0, &|t| t).unwrap();
         assert_eq!(
-            text,
+            caption.main,
             "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k40}Hello {\\k60}world"
         );
+        assert_eq!(caption.sub, None);
+        assert_eq!(caption.main_margin_lift, 0);
     }
 
     #[test]
-    fn bilingual_cue_karaokes_both_lines_and_scales_the_sub_line() {
+    fn bilingual_cue_splits_into_two_independently_karaoked_lines() {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("你好", 0.0, 0.5), word("世界", 0.5, 1.0)];
-        let text = preset_dialogue_text("你好世界\nhello", &words, preset, 52, &|t| t).unwrap();
-        // Main line: real ASR timing. Sub-line: approximated (single token over
-        // the whole [0,1) window) and shrunk to 52 × 0.85 ≈ 44 via \fs.
+        let caption =
+            preset_caption_lines("你好世界\nhello", &words, preset, 52, 13, &|t| t).unwrap();
+        // Main line: real ASR timing, no \N — the sub-line is its own event so
+        // its \k sweep starts at the cue start instead of after the main line.
         assert_eq!(
-            text,
-            "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}你好{\\k50}世界\\N{\\fs44}{\\k100}hello"
+            caption.main,
+            "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}你好{\\k50}世界"
         );
+        // Sub-line: approximated (single token over the whole [0,1) window),
+        // shrunk to 52 × 0.85 ≈ 44 via \fs, with its own colour overrides.
+        assert_eq!(
+            caption.sub.as_deref(),
+            Some("{\\1c&H004FE3FF\\2c&H00FFFFFF\\fs44}{\\k100}hello")
+        );
+        // Lift = 44 × 1.4 ≈ 62 + 2 × 13 box padding = 88.
+        assert_eq!(caption.main_margin_lift, 88);
     }
 
     #[test]
@@ -576,27 +649,33 @@ mod tests {
         // The words describe the source language, not this translation text:
         // timing falls back to linear allocation over the cue window [0,1).
         let words = [word("你好", 0.0, 1.0)];
-        let text = preset_dialogue_text("hello there", &words, preset, 52, &|t| t).unwrap();
+        let caption = preset_caption_lines("hello there", &words, preset, 52, 0, &|t| t).unwrap();
         assert_eq!(
-            text,
+            caption.main,
             "{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}hello {\\k50}there"
         );
-        // Line presets never karaoke.
+        // Line presets never karaoke, but a bilingual cue still splits so the
+        // sub-line keeps its \fs ratio.
         let line = caption_preset("ln-clean").unwrap();
-        assert!(preset_dialogue_text("你好", &words, line, 52, &|t| t).is_none());
+        let plain = preset_caption_lines("你好世界\nhello", &words, line, 52, 0, &|t| t).unwrap();
+        assert_eq!(plain.main, "你好世界");
+        assert_eq!(plain.sub.as_deref(), Some("{\\fs44}hello"));
     }
 
     #[test]
-    fn untimeable_text_falls_back_to_plain_line() {
+    fn untimeable_text_degrades_to_plain_lines() {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("你好", 0.0, 1.0)];
-        // Empty translation line: nothing to allocate → no dialogue text.
-        assert!(preset_dialogue_text("你好世界\n  ", &words, preset, 52, &|t| t).is_none());
-        // No words at all: no window to allocate over.
-        assert!(preset_dialogue_text("hello", &[], preset, 52, &|t| t).is_none());
-        // Zero-length window.
+        // No words at all: no window to allocate over → plain main line (the
+        // preset colours still apply; only the karaoke is dropped).
+        let caption = preset_caption_lines("hello", &[], preset, 52, 0, &|t| t).unwrap();
+        assert_eq!(caption.main, "{\\1c&H004FE3FF\\2c&H00FFFFFF}hello");
+        // Zero-length window: same degradation.
         let frozen = [word("你好", 1.0, 1.0)];
-        assert!(preset_dialogue_text("hello", &frozen, preset, 52, &|t| t).is_none());
+        let caption = preset_caption_lines("hello", &frozen, preset, 52, 0, &|t| t).unwrap();
+        assert_eq!(caption.main, "{\\1c&H004FE3FF\\2c&H00FFFFFF}hello");
+        // Nothing visible at all → None (caller skips the cue).
+        assert!(preset_caption_lines("", &words, preset, 52, 0, &|t| t).is_none());
     }
 
     #[test]
@@ -604,7 +683,7 @@ mod tests {
         let preset = caption_preset("em-yellow").unwrap();
         let words = [word("ab", 0.0, 1.0), word("cd", 1.0, 2.0)];
         // Simulate a cut that removes the second word's span entirely.
-        let text = preset_dialogue_text("abcd", &words, preset, 52, &|t| {
+        let caption = preset_caption_lines("abcd", &words, preset, 52, 0, &|t| {
             if t >= 1.0 {
                 1.0
             } else {
@@ -612,6 +691,6 @@ mod tests {
             }
         })
         .unwrap();
-        assert!(text.contains("{\\k100}ab {\\k1}cd"));
+        assert!(caption.main.contains("{\\k100}ab {\\k1}cd"));
     }
 }

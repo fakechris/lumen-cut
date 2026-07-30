@@ -94,7 +94,8 @@ describe("captionPresetLineCss (preset → CSS)", () => {
     expect(captionPresetFontFamily(getCaptionPreset("ln-navy"))).toContain("Songti SC");
     expect(captionPresetFontFamily(getCaptionPreset("ln-red"))).toContain("IBM Plex Mono");
     expect(captionPresetFontFamily(getCaptionPreset("ln-clean"))).toBeUndefined();
-    expect(captionPresetAssFont(getCaptionPreset("em-gold-serif"))).toBe("Noto Serif SC");
+    expect(captionPresetAssFont(getCaptionPreset("em-gold-serif"))).toBe("Songti SC");
+    expect(captionPresetAssFont(getCaptionPreset("ln-red"))).toBe("Menlo");
     expect(captionPresetAssFont(getCaptionPreset("ln-clean"))).toBeUndefined();
   });
 });

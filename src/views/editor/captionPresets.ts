@@ -66,10 +66,14 @@ export function captionPresetFontFamily(preset: CaptionPreset): string | undefin
   return undefined;
 }
 
-/** ASS fontname for export (libass resolves against system fonts). */
+/** ASS fontname for export. Must resolve under libass/fontconfig, so these
+ *  are fonts every macOS install ships: serif matches the preview (Songti SC);
+ *  mono is Menlo — the preview's bundled IBM Plex Mono is woff2-only, which
+ *  freetype/fontconfig cannot load. Keep in sync with preset_fontname in
+ *  src-tauri/src/data/caption_presets.rs. */
 export function captionPresetAssFont(preset: CaptionPreset): string | undefined {
-  if (preset.font === "serif") return "Noto Serif SC";
-  if (preset.font === "mono") return "IBM Plex Mono";
+  if (preset.font === "serif") return "Songti SC";
+  if (preset.font === "mono") return "Menlo";
   return undefined;
 }
 

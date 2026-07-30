@@ -173,27 +173,62 @@ fn to_ass_with_titles_impl(
                 if trimmed.is_empty() {
                     continue;
                 }
-                // Emphasis presets karaoke the source line word-by-word (\k);
-                // anything the word stream cannot reproduce (e.g. a
-                // translation-only cue) falls back to the plain line.
-                let text = preset
-                    .and_then(|p| {
-                        crate::data::caption_presets::preset_dialogue_text(
-                            trimmed,
-                            &sent.words,
-                            p,
-                            render_style.fontsize,
-                            &|t| retime(t, &iv),
-                        )
-                    })
-                    .unwrap_or_else(|| trimmed.replace('\n', "\\N"));
-                let _ = writeln!(
-                    out,
-                    "Dialogue: 0,{},{},Default,,0,0,0,,{}",
-                    fmt(ns),
-                    fmt(ne),
-                    text
-                );
+                // Preset captions become one Dialogue per line (main + optional
+                // translation sub-line): \k durations accumulate from the event
+                // start, so a shared event would karaoke the sub-line only after
+                // the main line finished, and a BorderStyle-3 backing boxes one
+                // event instead of hugging each line like the preview's pills.
+                let caption = preset.and_then(|p| {
+                    crate::data::caption_presets::preset_caption_lines(
+                        trimmed,
+                        &sent.words,
+                        p,
+                        render_style.fontsize,
+                        if border_style == 3 {
+                            render_style.outline
+                        } else {
+                            0
+                        },
+                        &|t| retime(t, &iv),
+                    )
+                });
+                match caption {
+                    Some(caption) => {
+                        // 0 in the event margin fields = take the style value;
+                        // the main line lifts above the sub-line block instead.
+                        let main_margin_v = if caption.main_margin_lift > 0 {
+                            render_style.margin_v + caption.main_margin_lift
+                        } else {
+                            0
+                        };
+                        let _ = writeln!(
+                            out,
+                            "Dialogue: 0,{},{},Default,,0,0,{},,{}",
+                            fmt(ns),
+                            fmt(ne),
+                            main_margin_v,
+                            caption.main
+                        );
+                        if let Some(sub) = caption.sub {
+                            let _ = writeln!(
+                                out,
+                                "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+                                fmt(ns),
+                                fmt(ne),
+                                sub
+                            );
+                        }
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+                            fmt(ns),
+                            fmt(ne),
+                            trimmed.replace('\n', "\\N")
+                        );
+                    }
+                }
             }
         }
     }
@@ -447,7 +482,33 @@ mod tests {
             ..Default::default()
         };
         let output = to_ass_with_style(&fixture(), &[], &style, 1920, 1080);
-        assert!(output.contains("Style: Default,Noto Serif SC,52,&H004C9DB8,"));
+        // Serif preset exports as Songti SC — present on every macOS install,
+        // unlike Noto Serif SC which fontconfig silently fell back from.
+        assert!(output.contains("Style: Default,Songti SC,52,&H004C9DB8,"));
+    }
+
+    #[test]
+    fn bilingual_preset_cue_emits_two_dialogues_with_independent_karaoke() {
+        let mut doc = fixture();
+        doc.paragraphs[0].sentences[0].text = "Hi\n你好".into();
+        let style = SubStyle {
+            caption_preset: Some("em-yellow".into()),
+            ..Default::default()
+        };
+        let output = to_ass_with_style(&doc, &[], &style, 1920, 1080);
+        let dialogues: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("Dialogue: 0,"))
+            .collect();
+        assert_eq!(dialogues.len(), 2);
+        // Main line: real timing, MarginV lifted above the sub-line block
+        // (80 + 44×1.4 ≈ 62 = 142, no backing so no box padding).
+        assert!(dialogues[0].contains(",0,0,142,,{\\1c&H004FE3FF\\2c&H00FFFFFF}{\\k50}Hi"));
+        // Sub-line: its own event with \fs and an independent \k sweep
+        // (approximated per CJK char over the [0,0.5) window → 25cs each).
+        assert!(
+            dialogues[1].contains(",0,0,0,,{\\1c&H004FE3FF\\2c&H00FFFFFF\\fs44}{\\k25}你{\\k25}好")
+        );
     }
 
     #[test]
