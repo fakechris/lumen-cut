@@ -449,6 +449,7 @@ pub struct PresetCaption {
 ///     → APPROXIMATION: the cue window is allocated linearly across the text's
 ///     tokens (approx_tokens/approx_karaoke) — translations have no real word
 ///     timing of their own. The preview applies the same approximation.
+///
 /// Bilingual cues ("source\ntranslation") produce both lines; the translation
 /// gets a `\fs` override at CAPTION_SUB_LINE_SCALE so the export matches the
 /// preview's sub-line ratio. `box_padding` is the BorderStyle-3 outline width
