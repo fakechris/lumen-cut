@@ -1913,6 +1913,35 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
         .is_err());
     }
 
+    /// Whether a VideoToolbox encoder actually works in this environment by
+    /// running a one-frame encode with the exact arg shape the render would
+    /// use. Virtualized CI runners accept `-allow_sw 1` at session creation
+    /// but then fail on encoder properties (-12900), so session creation
+    /// alone is not a reliable probe.
+    async fn videotoolbox_usable(encoder_args: &[String]) -> bool {
+        let mut args = vec![
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-nostdin".to_string(),
+            "-y".to_string(),
+            "-f".to_string(),
+            "lavfi".to_string(),
+            "-i".to_string(),
+            "color=c=blue:s=64x64:d=0.1".to_string(),
+        ];
+        args.extend(encoder_args.iter().cloned());
+        args.extend([
+            "-frames:v".to_string(),
+            "1".to_string(),
+            "-f".to_string(),
+            "null".to_string(),
+            "-".to_string(),
+        ]);
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::proc::run("ffmpeg", &arg_refs).await.is_ok()
+    }
+
     #[tokio::test]
     async fn real_export_with_shot_framing_renders_the_framed_canvas() {
         let temp = tempfile::tempdir().unwrap();
@@ -1922,6 +1951,27 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
         media_doc.media.path = source;
         media_doc.media.duration_seconds = 0.6;
         let output = temp.path().join("framed.mp4");
+        let mut settings = VideoExportSettings {
+            encoding_speed: ExportEncodingSpeed::Fast,
+            resolution: crate::data::export_settings::ExportResolution::Hd720,
+            ..Default::default()
+        };
+        // The framing assertions are encoder-agnostic. Where VideoToolbox
+        // does not actually work (virtualized CI), fall back to libx264 —
+        // Quality selects it on every platform.
+        if let Ok(encoder) = encoder_for_settings(&settings) {
+            if encoder.contains("videotoolbox") {
+                let probe_args = encoder_args(
+                    &encoder,
+                    RenderPurpose::Final,
+                    settings.encoding_speed,
+                    None,
+                );
+                if !videotoolbox_usable(&probe_args).await {
+                    settings.encoding_speed = ExportEncodingSpeed::Quality;
+                }
+            }
+        }
         render_video_with_broll_options(
             &media_doc,
             &[],
@@ -1933,11 +1983,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
                 mode: None,
                 on_progress: None,
                 audio_mix: AudioMix::default(),
-                settings: Some(VideoExportSettings {
-                    encoding_speed: ExportEncodingSpeed::Fast,
-                    resolution: crate::data::export_settings::ExportResolution::Hd720,
-                    ..Default::default()
-                }),
+                settings: Some(settings),
                 soft_subtitle: None,
                 include_ass: false,
                 framings: vec![ShotFraming {
