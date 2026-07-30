@@ -2957,6 +2957,7 @@ export function EditorTimelineDock({
               </header>
               <dl>
                 <div><dt>Space</dt><dd>{lang === "zh" ? "播放 / 暂停" : "Play / pause"}</dd></div>
+                <div><dt>F</dt><dd>{lang === "zh" ? "全屏监看" : "Fullscreen monitor"}</dd></div>
                 <div><dt>← / →</dt><dd>{lang === "zh" ? "前后移动 1 秒；按住 ⇧ 移动 0.1 秒" : "Move 1s; hold ⇧ for 0.1s"}</dd></div>
                 <div><dt>S</dt><dd>{lang === "zh" ? "在播放头附近的词间拆分" : "Split near the playhead"}</dd></div>
                 <div><dt>Delete</dt><dd>{lang === "zh" ? "移除所选字幕区间或标题" : "Remove selected cue range or title"}</dd></div>

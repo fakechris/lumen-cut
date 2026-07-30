@@ -6034,6 +6034,12 @@ pre.out {
   position: relative;
 }
 
+.workbench-preview-frame:fullscreen {
+  /* Black bars around the aspect-locked stage when the monitor fills the screen. */
+  background: #000;
+  margin: 0;
+}
+
 .workbench-preview-frame video {
   display: block;
   height: 100%;

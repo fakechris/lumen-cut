@@ -133,6 +133,7 @@ export function EditorMediaPreview({
   const [titleStageDrag, setTitleStageDrag] = useState<TitleStageDrag | null>(null);
   const [sourceDimensions, setSourceDimensions] = useState({ width: 1920, height: 1080 });
   const [stageSize, setStageSize] = useState<{ width: number; height: number } | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const musicAssetKey = JSON.stringify(
     audioMix.music.map((track) => [track.id, track.path]),
   );
@@ -300,6 +301,42 @@ export function EditorMediaPreview({
     }
   }, [activeCue, audioMix, musicSources, playerRef, programDuration, programTime]);
 
+  // Fullscreen the preview frame (video + caption canvas + framing layer move
+  // together); the stage ResizeObserver and the caption overlay's own observer
+  // recompute size/DPR on the transition. ESC exits natively.
+  const toggleFullscreen = () => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => undefined);
+    } else {
+      void frame.requestFullscreen().catch(() => undefined);
+    }
+  };
+
+  useEffect(() => {
+    const sync = () => setIsFullscreen(document.fullscreenElement === frameRef.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key !== "f" && event.key !== "F") return;
+      const target = event.target instanceof Element ? event.target : null;
+      const isInteractive = target?.matches(
+        "button, a[href], input, textarea, select, summary, [contenteditable='true'], [role='button']",
+      );
+      if (isInteractive) return;
+      event.preventDefault();
+      toggleFullscreen();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   useLayoutEffect(() => {
     if (isAudio) return;
     const frame = frameRef.current;
@@ -333,6 +370,23 @@ export function EditorMediaPreview({
         </div>
         <div className="preview-header-actions">
           <span>{clock(programTime)} / {clock(programDuration)}</span>
+          <button
+            aria-label={isFullscreen
+              ? lang === "zh" ? "退出全屏监看" : "Exit fullscreen monitor"
+              : lang === "zh" ? "全屏监看" : "Fullscreen monitor"}
+            aria-pressed={isFullscreen}
+            onClick={(event) => {
+              // Keep focus off the button so the F shortcut stays usable.
+              event.currentTarget.blur();
+              toggleFullscreen();
+            }}
+            title={isFullscreen
+              ? lang === "zh" ? "退出全屏(F 或 Esc)" : "Exit fullscreen (F or Esc)"
+              : lang === "zh" ? "全屏监看(F)" : "Fullscreen monitor (F)"}
+            type="button"
+          >
+            ⛶
+          </button>
           <button
             aria-label={expanded
               ? lang === "zh" ? "退出放大监看" : "Exit expanded monitor"
