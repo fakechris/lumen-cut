@@ -14,15 +14,37 @@ import {
 import {
   CAPTION_PRESET_GROUPS,
   CAPTION_SUB_LINE_SCALE,
+  assColourToHex,
   captionPresetAssFont,
+  captionPresetBoxPaddingPx,
   captionPresetById,
   captionPresetFontFamily,
   captionPresetLineCss,
+  captionPresetLineSpanCss,
   captionPresetName,
   captionPresetSubLineCss,
   captionPresetWordCss,
   captionPresetsForMode,
 } from "./captionPresets";
+import type { SubtitleStyle } from "../../types";
+
+const BASE_STYLE: SubtitleStyle = {
+  name: "Default",
+  fontname: "Arial",
+  fontsize: 52,
+  primaryColour: "&H00FFFFFF",
+  outlineColour: "&H00000000",
+  bold: false,
+  italic: false,
+  underline: false,
+  strikeOut: false,
+  alignment: 2,
+  outline: 2,
+  shadow: 2,
+  marginL: 40,
+  marginR: 40,
+  marginV: 80,
+};
 
 describe("pireel caption preset table", () => {
   it("ports all 18 presets in two modes", () => {
@@ -107,6 +129,56 @@ describe("captionPresetSubLineCss (translation line)", () => {
     expect(captionPresetSubLineCss().fontSize).toBe(`${CAPTION_SUB_LINE_SCALE}em`);
     // No color/font of its own: the sub-line inherits the preset's look.
     expect(captionPresetSubLineCss().color).toBeUndefined();
+  });
+});
+
+describe("captionPresetLineSpanCss (preview line ↔ export Dialogue parity)", () => {
+  it("gives every line its own backing pill (per-event box in the export)", () => {
+    const preset = getCaptionPreset("em-purple-black");
+    const main = captionPresetLineSpanCss(preset, BASE_STYLE, 1920);
+    const sub = captionPresetLineSpanCss(preset, BASE_STYLE, 1920, CAPTION_SUB_LINE_SCALE);
+    expect(main.background).toBe("rgba(0,0,0,0.72)");
+    expect(sub.background).toBe("rgba(0,0,0,0.72)");
+  });
+
+  it("sizes the pill padding like the ASS BorderStyle-3 box (outline = fontsize/4)", () => {
+    expect(captionPresetBoxPaddingPx(52)).toBe(13);
+    expect(captionPresetBoxPaddingPx(12)).toBe(4); // min 4
+    // Same absolute padding on both lines, scaled with the stage via cqw.
+    const preset = getCaptionPreset("ln-black");
+    const main = captionPresetLineSpanCss(preset, BASE_STYLE, 1920);
+    const sub = captionPresetLineSpanCss(preset, BASE_STYLE, 1920, CAPTION_SUB_LINE_SCALE);
+    expect(main.padding).toBe(`${(13 / 1920) * 100}cqw`);
+    expect(sub.padding).toBe(main.padding);
+  });
+
+  it("scales the sub-line font exactly like the export's \\fs override", () => {
+    const preset = getCaptionPreset("em-purple-black");
+    const main = captionPresetLineSpanCss(preset, BASE_STYLE, 1920);
+    const sub = captionPresetLineSpanCss(preset, BASE_STYLE, 1920, CAPTION_SUB_LINE_SCALE);
+    expect(main.fontSize).toBe(`clamp(12px, ${(52 / 1920) * 100}cqw, 52px)`);
+    expect(sub.fontSize).toBe(`clamp(12px, ${(44 / 1920) * 100}cqw, 44px)`);
+  });
+
+  it("keeps the user's typeface/bold and drops shadow only for backed presets", () => {
+    const backed = captionPresetLineSpanCss(
+      getCaptionPreset("ln-black"),
+      { ...BASE_STYLE, bold: true },
+      1920,
+    );
+    expect(backed.fontFamily).toBe("Arial"); // preset has no font → user's
+    expect(backed.fontWeight).toBe(700); // bold is the user's toggle
+    expect(backed.WebkitTextStroke).toBeUndefined();
+    const bare = captionPresetLineSpanCss(getCaptionPreset("ln-clean"), BASE_STYLE, 1920);
+    expect(bare.background).toBeUndefined();
+    expect(bare.WebkitTextStroke).toContain("#000000");
+    expect(bare.textShadow).toBeDefined();
+  });
+
+  it("converts ASS colours to CSS hex", () => {
+    expect(assColourToHex("&H00FFFFFF")).toBe("#FFFFFF");
+    expect(assColourToHex("&H004FE3FF")).toBe("#FFE34F");
+    expect(assColourToHex("bogus")).toBe("#ffffff");
   });
 });
 

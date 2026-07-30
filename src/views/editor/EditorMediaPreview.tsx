@@ -5,7 +5,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
   type MutableRefObject,
 } from "react";
 import {
@@ -30,9 +29,9 @@ import type {
 } from "../../types";
 import { audioGainAt, musicGainAt } from "./audioMix";
 import {
+  CAPTION_SUB_LINE_SCALE,
   captionPresetById,
-  captionPresetLineCss,
-  captionPresetSubLineCss,
+  captionPresetLineSpanCss,
   captionPresetWordCss,
 } from "./captionPresets";
 import { framingAtTime, shotTransformCss } from "./shotFraming";
@@ -230,6 +229,18 @@ export function EditorMediaPreview({
   }, [captionLines, currentTime]);
   // Hoisted so JSX closures keep the non-null narrowing.
   const captionSub = captionLines?.sub ?? null;
+  // Bilingual cues are "source\ntranslation" — the export burns the two lines
+  // as two Dialogue events, and the preview mirrors that with two line spans
+  // (each gets its own backing pill and font size).
+  const captionSplit = useMemo(() => {
+    if (!captionPreset || !activeCue) return null;
+    const newline = activeCue.text.indexOf("\n");
+    if (newline < 0) return { main: activeCue.text, sub: null as string | null };
+    return {
+      main: activeCue.text.slice(0, newline),
+      sub: activeCue.text.slice(newline + 1),
+    };
+  }, [activeCue, captionPreset]);
   const canvasDimensions = useMemo(
     () => resolveCanvasDimensions(exportSettings, sourceDimensions),
     [exportSettings, sourceDimensions],
@@ -606,54 +617,44 @@ export function EditorMediaPreview({
                     )
                     : undefined}
                 >
-                  {subtitleStyle && captionPreset ? (
-                    <span style={presetSpanStyle(captionPreset, subtitleStyle, canvasDimensions.width)}>
-                      {captionLines ? (
-                        <>
-                          {captionLines.main.map((word, i) => (
-                            <span
-                              key={i}
-                              style={i === activeMainIndex
-                                ? captionPresetWordCss(captionPreset)
-                                : undefined}
-                            >
-                              {word.text}
-                              {i < captionLines.main.length - 1
-                                && latinJoin(word.text, captionLines.main[i + 1].text)
-                                ? " "
-                                : ""}
-                            </span>
-                          ))}
-                          {captionSub && (
-                            <>
-                              <br />
-                              {/* Sub-line: same preset look (inherited), scaled
-                                  down so it stays proportional to the user's
-                                  font size; emphasis follows the approximated
-                                  token timing (no real word times exist). */}
-                              <span style={captionPresetSubLineCss()}>
-                                {captionSub.map((word, i) => (
-                                  <span
-                                    key={i}
-                                    style={i === activeSubIndex
-                                      ? captionPresetWordCss(captionPreset)
-                                      : undefined}
-                                  >
-                                    {word.text}
-                                    {i < captionSub.length - 1
-                                      && latinJoin(word.text, captionSub[i + 1].text)
-                                      ? " "
-                                      : ""}
-                                  </span>
-                                ))}
-                              </span>
-                            </>
-                          )}
-                        </>
-                      ) : (
-                        activeCue.text
+                  {subtitleStyle && captionPreset && captionSplit ? (
+                    // One span per line, mirroring the export's two Dialogue
+                    // events: each line carries its own backing pill (a shared
+                    // span with box-decoration-break does not — Chromium draws
+                    // one box, WKWebView drops it), and the sub-line gets the
+                    // 0.85 scale the export applies via \fs.
+                    <div
+                      className="program-caption-stack"
+                      style={{
+                        alignItems: "center",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: `${(Math.max(2, Math.round(subtitleStyle.fontsize * CAPTION_SUB_LINE_SCALE * 0.1)) / canvasDimensions.width) * 100}cqw`,
+                      }}
+                    >
+                      <span style={captionPresetLineSpanCss(captionPreset, subtitleStyle, canvasDimensions.width)}>
+                        {captionLines
+                          ? presetWordSpans(captionPreset, captionLines.main, activeMainIndex)
+                          : captionSplit.main}
+                      </span>
+                      {(captionSub || captionSplit.sub) && (
+                        <span
+                          style={{
+                            ...captionPresetLineSpanCss(
+                              captionPreset,
+                              subtitleStyle,
+                              canvasDimensions.width,
+                              CAPTION_SUB_LINE_SCALE,
+                            ),
+                            whiteSpace: "pre-line",
+                          }}
+                        >
+                          {captionSub
+                            ? presetWordSpans(captionPreset, captionSub, activeSubIndex)
+                            : captionSplit.sub}
+                        </span>
                       )}
-                    </span>
+                    </div>
                   ) : (
                     <span
                       style={subtitleStyle ? {
@@ -769,30 +770,18 @@ function assToHex(value: string) {
   return match ? `#${match[3]}${match[2]}${match[1]}` : "#ffffff";
 }
 
-/** Whole-line preset look for the preview span. Size/bold stay on the user's
- *  SubtitleStyle (presets govern look only). Backed presets draw the pill and
- *  drop outline/shadow; bare presets keep the user's outline + shadow. */
-function presetSpanStyle(
-  preset: CaptionPreset,
-  style: SubtitleStyle,
-  canvasWidth: number,
-): CSSProperties {
-  const look = captionPresetLineCss(preset);
-  return {
-    ...look,
-    fontFamily: look.fontFamily ?? style.fontname,
-    fontSize: `clamp(12px, ${(style.fontsize / canvasWidth) * 100}cqw, ${style.fontsize}px)`,
-    fontStyle: style.italic || preset.italic ? "italic" : "normal",
-    fontWeight: style.bold ? 700 : 400,
-    ...(preset.bg
-      ? {}
-      : {
-        WebkitTextStroke: `${(Math.max(0, style.outline) / canvasWidth) * 100}cqw ${assToHex(style.outlineColour)}`,
-        textShadow: style.shadow > 0
-          ? `${(style.shadow / canvasWidth) * 100}cqw ${(style.shadow / canvasWidth) * 100}cqw ${assToHex(style.outlineColour)}`
-          : undefined,
-      }),
-  };
+/** Word spans for an emphasis-preset line: the word at activeIndex gets the
+ *  preset's accent/deco treatment, Latin boundaries keep a real space. */
+function presetWordSpans(preset: CaptionPreset, words: FxWord[], activeIndex: number) {
+  return words.map((word, i) => (
+    <span
+      key={i}
+      style={i === activeIndex ? captionPresetWordCss(preset) : undefined}
+    >
+      {word.text}
+      {i < words.length - 1 && latinJoin(word.text, words[i + 1].text) ? " " : ""}
+    </span>
+  ));
 }
 
 function subtitlePosition(style: SubtitleStyle, canvasWidth: number, canvasHeight: number) {

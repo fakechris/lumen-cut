@@ -8,6 +8,7 @@
  */
 import type { CSSProperties } from "react";
 import type { Lang } from "../../i18n";
+import type { SubtitleStyle } from "../../types";
 import {
   CAPTION_PRESETS,
   type CaptionMode,
@@ -85,6 +86,20 @@ export function captionPresetAssFont(preset: CaptionPreset): string | undefined 
  *  src-tauri/src/data/caption_presets.rs in sync. */
 export const CAPTION_SUB_LINE_SCALE = 0.85;
 
+/** ASS `&HAABBGGRR` → CSS `#rrggbb` (alpha dropped; the preview treats ASS
+ *  outline/shadow colours as opaque, as before). */
+export function assColourToHex(value: string): string {
+  const match = value.match(/&H[0-9A-Fa-f]{2}([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})/);
+  return match ? `#${match[3]}${match[2]}${match[1]}` : "#ffffff";
+}
+
+/** ASS BorderStyle-3 backing padding in px: the export sets the style's
+ *  outline width to fontsize/4 (min 4) for backed presets — the box padding.
+ *  (Mirrors ass.rs; used to size the preview pill padding.) */
+export function captionPresetBoxPaddingPx(fontsize: number): number {
+  return Math.max(4, Math.round(fontsize / 4));
+}
+
 /** Whole-line preset look as CSS (color / backing pill / typeface / italic).
  *  Callers layer font size, weight and position from the user's SubtitleStyle;
  *  bare presets (no bg) should also keep the user's outline + shadow. */
@@ -105,6 +120,49 @@ export function captionPresetLineCss(preset: CaptionPreset): CSSProperties {
         textShadow: "none",
       }
       : {}),
+  };
+}
+
+/**
+ * One caption LINE (main or translation) as it should render in the preview —
+ * the mirror of one Dialogue event in the export, which emits bilingual preset
+ * cues as two events (ass.rs). Each line gets:
+ *   - its own backing pill (the export's BorderStyle-3 box is per event, so a
+ *     single shared span with box-decoration-break never matched: Chromium
+ *     draws one box, WKWebView drops it entirely);
+ *   - pill padding equal to the ASS box padding (outline = fontsize/4, min 4,
+ *     the same absolute px value on both lines), expressed in cqw like the
+ *     font size so it scales with the stage;
+ *   - font size = user's SubtitleStyle size × fontScale (the translation line
+ *     passes CAPTION_SUB_LINE_SCALE, matching the export's \fs override).
+ * Bare presets keep the user's outline + shadow; backed presets drop them
+ * (pireel's bare-vs-backed rule, and the export zeroes the shadow).
+ */
+export function captionPresetLineSpanCss(
+  preset: CaptionPreset,
+  style: SubtitleStyle,
+  canvasWidth: number,
+  fontScale = 1,
+): CSSProperties {
+  const look = captionPresetLineCss(preset);
+  const fontSize = Math.max(1, Math.round(style.fontsize * fontScale));
+  return {
+    ...look,
+    fontFamily: look.fontFamily ?? style.fontname,
+    fontSize: `clamp(12px, ${(fontSize / canvasWidth) * 100}cqw, ${fontSize}px)`,
+    fontStyle: style.italic || preset.italic ? "italic" : "normal",
+    fontWeight: style.bold ? 700 : 400,
+    textAlign: "center",
+    ...(preset.bg
+      ? {
+        padding: `${(captionPresetBoxPaddingPx(style.fontsize) / canvasWidth) * 100}cqw`,
+      }
+      : {
+        WebkitTextStroke: `${(Math.max(0, style.outline) / canvasWidth) * 100}cqw ${assColourToHex(style.outlineColour)}`,
+        textShadow: style.shadow > 0
+          ? `${(style.shadow / canvasWidth) * 100}cqw ${(style.shadow / canvasWidth) * 100}cqw ${assColourToHex(style.outlineColour)}`
+          : undefined,
+      }),
   };
 }
 
