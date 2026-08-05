@@ -47,6 +47,15 @@ build and run on Windows 10/11 x64.
   opens the Store rather than running an interpreter.
 - The managed uv virtualenv uses `runtime\Scripts\python.exe`.
 
+### Python sidecars
+
+- `resource` is Unix-only, and both `main.py` files imported it at module
+  scope — they were simply unloadable on Windows. The import is now optional;
+  where it is absent the memory guardrail reads installed RAM through
+  `GlobalMemoryStatusEx` and the peak working set (the `ru_maxrss` analogue)
+  through psapi's `GetProcessMemoryInfo`, via ctypes rather than adding psutil
+  for two counters.
+
 ### Media
 
 - Microphone capture is resolved by `src-tauri/src/capture.rs`:
@@ -69,6 +78,11 @@ build and run on Windows 10/11 x64.
 - Reveal-in-file-manager uses `explorer.exe /select,` on Windows,
   `open -R` on macOS, `xdg-open` elsewhere. `explorer.exe` returns a non-zero
   exit code even on success, so its status is deliberately ignored.
+- FCPXML `file:` URLs follow RFC 8089. The old builder concatenated `file://`
+  with the raw path, which on Windows kept backslashes and percent-encoded the
+  drive-letter colon — editors read `C` as a host name. Output is now
+  `file:///C:/Media/clip.mp4`; Unix paths pass through byte-identical. This
+  matters because Resolve and Premiere read FCPXML on Windows.
 
 ### UI
 
@@ -108,29 +122,45 @@ build and run on Windows 10/11 x64.
 
 ## Verification
 
-Run on macOS 14 (Apple silicon) against this branch:
+### Passing on `windows-latest` CI
 
-- `pnpm test` — 163 passed.
-- `pnpm build` — TypeScript and Vite production build passed.
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` — clean.
-- `cargo test --all-targets` — 517 passed.
+`cargo check --target x86_64-pc-windows-msvc` cannot stand in from macOS:
+`ring` (via `rustls`) needs the MSVC toolchain headers to build its C
+sources, so cross-checking stops before reaching this crate. GitHub's
+`windows-latest` runner is the authoritative build, and it now passes every
+gate the macOS job runs:
 
-Windows verification is **pending** and must be run on a real Windows 10/11
-x64 machine. `cargo check --target x86_64-pc-windows-msvc` cannot stand in
-from macOS: `ring` (via `rustls`) needs the MSVC toolchain headers to build
-its C sources, so cross-checking stops before reaching this crate. GitHub's
-`windows-latest` runner is therefore the first authoritative build.
+- frontend tests (163) and production build
+- Python sidecar unittests (16)
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all-targets` — 517 passed
+- `tauri build --bundles nsis`, producing `lumen-cut_<version>_x64-setup.exe`,
+  the zipped CLI, and `SHA256SUMS.txt`
 
-Checklist for the Windows pass:
+macOS 14 on Apple silicon passes the same set, so the port did not cost the
+existing platform anything.
 
-1. `pnpm install --frozen-lockfile && pnpm test && pnpm build`
-2. `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
-3. `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`
-4. `cargo test --manifest-path src-tauri/Cargo.toml --all-targets`
-5. `pnpm build:desktop:windows`
-6. Install the NSIS output, then confirm end to end: import media, cloud
-   transcription, word-level cutting, caption preset rendering, subtitle
-   export, video export (verify which encoder was chosen in the logs),
-   microphone recording, reveal-in-Explorer, and the diagnostics panel.
+### Still needs real Windows hardware
+
+CI runs headless on a GPU-less VM, so these cannot be proven there:
+
+1. **Hardware encoder selection.** CI has no NVIDIA/Intel/AMD GPU, so the
+   probe always falls through to `libx264`. The nvenc/qsv/amf argument
+   builders are unit-tested but have never produced a real file. Check the
+   export logs on a machine with each vendor's GPU.
+2. **Microphone capture.** No DirectShow audio device exists on the runner,
+   so `dshow_devices()` has never parsed real `-list_devices` output. Verify
+   against a built-in mic, a USB interface and a Bluetooth headset, and with a
+   non-English device name (the moniker path exists for exactly that case).
+3. **Installer behaviour.** SmartScreen warnings, the per-user install
+   location, the WebView2 bootstrapper on a machine without WebView2, and
+   uninstall.
+4. **Job-object teardown under load.** Cancelling a long export should leave
+   no orphaned `ffmpeg.exe` in Task Manager.
+5. **Speaker diarization.** `pyannote.audio` + torch is CPU-portable in
+   principle but has never been installed or run on Windows.
+6. End-to-end pass: import media, cloud transcription, word-level cutting,
+   caption preset rendering, subtitle export, video export,
+   reveal-in-Explorer, diagnostics panel.
 
 Record failures here until they are resolved.
