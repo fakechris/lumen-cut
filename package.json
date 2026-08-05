@@ -13,6 +13,7 @@
     "build:desktop": "tauri build",
     "package:release": "./scripts/package-release.sh",
     "release:local": "pnpm build:desktop && pnpm package:release",
+    "build:desktop:windows": "tauri build --bundles nsis",
     "preview": "vite preview",
     "tauri": "tauri"
   },

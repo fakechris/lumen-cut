@@ -1176,17 +1176,112 @@ pub async fn render_broll_snapshot(
     Ok(())
 }
 
+/// Every encoder the export pipeline knows how to build arguments for.
+/// `LUMEN_CUT_VIDEO_ENCODER` is validated against this so a typo cannot make
+/// ffmpeg fail deep inside a long render.
+const KNOWN_ENCODERS: &[&str] = &[
+    "libx264",
+    "libx265",
+    "h264_videotoolbox",
+    "hevc_videotoolbox",
+    "h264_nvenc",
+    "hevc_nvenc",
+    "h264_qsv",
+    "hevc_qsv",
+    "h264_amf",
+    "hevc_amf",
+];
+
+/// Hardware H.264 encoders to try on Windows, best quality first: NVIDIA
+/// NVENC, then Intel Quick Sync, then AMD AMF.
+const WINDOWS_H264_HARDWARE: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf"];
+const WINDOWS_HEVC_HARDWARE: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf"];
+
+fn is_hardware_encoder(encoder: &str) -> bool {
+    encoder.ends_with("_nvenc") || encoder.ends_with("_qsv") || encoder.ends_with("_amf")
+}
+
+/// Whether `encoder` can actually open a session on this machine.
+///
+/// `ffmpeg -encoders` only reports what the build supports, which on Windows
+/// is a poor proxy: an ffmpeg build with NVENC compiled in still fails on a
+/// machine with no NVIDIA GPU. A throwaway one-frame encode is the only
+/// honest test. Results are cached, so this costs at most one ffmpeg run per
+/// candidate per process.
+fn hardware_encoder_available(encoder: &str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(known) = cache
+        .lock()
+        .expect("encoder probe cache poisoned")
+        .get(encoder)
+    {
+        return *known;
+    }
+    let available = crate::doctor::quiet_command("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=128x128:d=0.1",
+            "-c:v",
+            encoder,
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    cache
+        .lock()
+        .expect("encoder probe cache poisoned")
+        .insert(encoder.to_string(), available);
+    available
+}
+
+/// The fastest usable encoder for `codec`, or `None` to use the software one.
+fn hardware_encoder(codec: ExportVideoCodec) -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        // VideoToolbox is always present on a supported macOS host and falls
+        // back to software internally (`-allow_sw`), so it needs no probe.
+        return match codec {
+            ExportVideoCodec::H264 => Some("h264_videotoolbox"),
+            ExportVideoCodec::Hevc => Some("hevc_videotoolbox"),
+            ExportVideoCodec::Prores => None,
+        };
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    let candidates = match codec {
+        ExportVideoCodec::H264 => WINDOWS_H264_HARDWARE,
+        ExportVideoCodec::Hevc => WINDOWS_HEVC_HARDWARE,
+        ExportVideoCodec::Prores => return None,
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|encoder| hardware_encoder_available(encoder))
+}
+
 fn selected_encoder() -> String {
     if let Ok(configured) = std::env::var("LUMEN_CUT_VIDEO_ENCODER") {
-        if matches!(configured.as_str(), "libx264" | "h264_videotoolbox") {
+        if KNOWN_ENCODERS.contains(&configured.as_str()) {
             return configured;
         }
     }
-    if cfg!(target_os = "macos") {
-        "h264_videotoolbox".into()
-    } else {
-        "libx264".into()
-    }
+    hardware_encoder(ExportVideoCodec::H264)
+        .unwrap_or("libx264")
+        .into()
 }
 
 pub fn encoder_for_settings(settings: &VideoExportSettings) -> AppResult<String> {
@@ -1197,14 +1292,12 @@ pub fn encoder_for_settings(settings: &VideoExportSettings) -> AppResult<String>
             ExportEncodingSpeed::Quality => Ok("libx264".into()),
         },
         ExportVideoCodec::Hevc => match settings.encoding_speed {
-            ExportEncodingSpeed::MatchSource | ExportEncodingSpeed::Fast
-                if cfg!(target_os = "macos") =>
-            {
-                Ok("hevc_videotoolbox".into())
+            ExportEncodingSpeed::MatchSource | ExportEncodingSpeed::Fast => {
+                Ok(hardware_encoder(ExportVideoCodec::Hevc)
+                    .unwrap_or("libx265")
+                    .into())
             }
-            ExportEncodingSpeed::MatchSource
-            | ExportEncodingSpeed::Fast
-            | ExportEncodingSpeed::Quality => Ok("libx265".into()),
+            ExportEncodingSpeed::Quality => Ok("libx265".into()),
         },
         ExportVideoCodec::Prores => Ok("prores_ks".into()),
     }
@@ -1212,10 +1305,8 @@ pub fn encoder_for_settings(settings: &VideoExportSettings) -> AppResult<String>
 
 pub fn encoder_for_mode(mode: Option<&str>) -> AppResult<String> {
     match mode.unwrap_or("auto") {
-        "auto" | "match-source" => Ok(selected_encoder()),
+        "auto" | "match-source" | "fast" => Ok(selected_encoder()),
         "quality" => Ok("libx264".into()),
-        "fast" if cfg!(target_os = "macos") => Ok("h264_videotoolbox".into()),
-        "fast" => Ok("libx264".into()),
         other => Err(AppError::Schema(format!(
             "unknown video export mode: {other}"
         ))),
@@ -1282,6 +1373,91 @@ fn encoder_args(
                 "-prio_speed".into(),
                 "1".into(),
             ]);
+        }
+        args
+    } else if is_hardware_encoder(encoder) {
+        // NVENC / Quick Sync / AMF. Rate control differs per vendor, but all
+        // three accept the same explicit bitrate triple, so match-source
+        // exports share one path with the software and VideoToolbox encoders.
+        let mut args = vec![
+            "-c:v".into(),
+            encoder.into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ];
+        let use_bitrate = purpose == RenderPurpose::Final
+            && speed == ExportEncodingSpeed::MatchSource
+            && source_bitrate.is_some_and(|br| br >= 100_000);
+        // Quantizer on the H.264 0–51 scale, chosen to line up with the
+        // libx264 CRF values used for the same purpose/speed pair.
+        let quality = match (purpose, speed) {
+            (RenderPurpose::Preview, _) => 26,
+            (RenderPurpose::Final, ExportEncodingSpeed::Fast) => 23,
+            (RenderPurpose::Final, ExportEncodingSpeed::MatchSource) => 23,
+            (RenderPurpose::Final, ExportEncodingSpeed::Quality) => 21,
+        };
+        let fast = purpose == RenderPurpose::Preview || speed == ExportEncodingSpeed::Fast;
+        if encoder.ends_with("_nvenc") {
+            args.extend([
+                "-preset".into(),
+                if fast { "p1".into() } else { "p4".into() },
+            ]);
+        } else if encoder.ends_with("_qsv") {
+            args.extend([
+                "-preset".into(),
+                if fast {
+                    "veryfast".into()
+                } else {
+                    "medium".into()
+                },
+            ]);
+        } else {
+            args.extend([
+                "-quality".into(),
+                if fast {
+                    "speed".into()
+                } else {
+                    "balanced".into()
+                },
+            ]);
+        }
+        if use_bitrate {
+            // Same 1.5x headroom as every other encoder here.
+            let br = source_bitrate.unwrap().saturating_mul(3) / 2;
+            let maxrate = ((br as f64) * 1.25).round() as u64;
+            let bufsize = br.saturating_mul(2);
+            args.extend([
+                "-b:v".into(),
+                br.to_string(),
+                "-maxrate".into(),
+                maxrate.to_string(),
+                "-bufsize".into(),
+                bufsize.to_string(),
+            ]);
+        } else if encoder.ends_with("_nvenc") {
+            args.extend([
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                quality.to_string(),
+                // NVENC only honours -cq when the target bitrate is unset.
+                "-b:v".into(),
+                "0".into(),
+            ]);
+        } else if encoder.ends_with("_qsv") {
+            args.extend(["-global_quality".into(), quality.to_string()]);
+        } else {
+            args.extend([
+                "-rc".into(),
+                "cqp".into(),
+                "-qp_i".into(),
+                quality.to_string(),
+                "-qp_p".into(),
+                quality.to_string(),
+            ]);
+        }
+        if encoder.starts_with("hevc_") {
+            args.extend(["-tag:v".into(), "hvc1".into()]);
         }
         args
     } else if encoder == "libx264" || encoder == "libx265" {
@@ -2301,10 +2477,67 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
         let fast = encoder_for_mode(Some("fast")).unwrap();
         if cfg!(target_os = "macos") {
             assert_eq!(fast, "h264_videotoolbox");
+        } else if cfg!(windows) {
+            // Which hardware encoder wins depends on the GPU present, and a
+            // machine without one legitimately falls back to software.
+            assert!(
+                WINDOWS_H264_HARDWARE.contains(&fast.as_str()) || fast == "libx264",
+                "unexpected Windows encoder: {fast}"
+            );
         } else {
             assert_eq!(fast, "libx264");
         }
         assert!(encoder_for_mode(Some("mystery")).is_err());
+    }
+
+    #[test]
+    fn hardware_encoders_use_vendor_rate_control_not_crf() {
+        for (encoder, expected) in [
+            ("h264_nvenc", "-cq"),
+            ("h264_qsv", "-global_quality"),
+            ("h264_amf", "-qp_i"),
+        ] {
+            let args = encoder_args(
+                encoder,
+                RenderPurpose::Final,
+                ExportEncodingSpeed::Fast,
+                None,
+            );
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "{encoder} is missing {expected}: {args:?}"
+            );
+            // `-crf` is libx26x-only; passing it to a hardware encoder errors.
+            assert!(!args.iter().any(|arg| arg == "-crf"), "{encoder}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn hardware_encoders_honour_a_known_source_bitrate() {
+        let args = encoder_args(
+            "hevc_nvenc",
+            RenderPurpose::Final,
+            ExportEncodingSpeed::MatchSource,
+            Some(2_000_000),
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-b:v", "3000000"]));
+        // HEVC in MP4 needs the hvc1 tag to play in QuickTime and Windows.
+        assert!(args.windows(2).any(|pair| pair == ["-tag:v", "hvc1"]));
+    }
+
+    #[test]
+    fn encoder_override_rejects_names_the_arg_builder_cannot_handle() {
+        let previous = std::env::var_os("LUMEN_CUT_VIDEO_ENCODER");
+        std::env::set_var("LUMEN_CUT_VIDEO_ENCODER", "h264_totally_made_up");
+        let bogus = selected_encoder();
+        std::env::set_var("LUMEN_CUT_VIDEO_ENCODER", "libx264");
+        let valid = selected_encoder();
+        match previous {
+            Some(value) => std::env::set_var("LUMEN_CUT_VIDEO_ENCODER", value),
+            None => std::env::remove_var("LUMEN_CUT_VIDEO_ENCODER"),
+        }
+        assert_ne!(bogus, "h264_totally_made_up");
+        assert_eq!(valid, "libx264");
     }
 
     #[test]

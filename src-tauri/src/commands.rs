@@ -114,6 +114,11 @@ fn validate_transcription_preflight(
                 return Ok(());
             }
             let status = crate::asr::runtime_status();
+            if !status.local_engine_supported {
+                return Err(AppError::Schema(
+                    crate::asr::LOCAL_ENGINE_UNSUPPORTED_DETAIL.into(),
+                ));
+            }
             if !status.runtime_ready {
                 return Err(AppError::Schema(
                     "local transcription runtime is not installed; open Settings → Speech & models and install the transcription runtime"
@@ -123,9 +128,7 @@ fn validate_transcription_preflight(
             let model = model_override
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or(&config.asr_model);
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
+            let home = crate::paths::home_dir();
             if !crate::data::modelconfig::model_cached(&home, model) {
                 return Err(AppError::Schema(format!(
                     "transcription model {model} is not downloaded; open Settings → Speech & models and download it"
@@ -153,9 +156,7 @@ fn validate_speaker_preflight(model: &str) -> AppResult<()> {
                 .into(),
         ));
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::paths::home_dir();
     if !crate::data::modelconfig::diarize_model_cached(&home, model) {
         return Err(AppError::Schema(format!(
             "speaker model {model} is not downloaded; open Settings → Speech & models and download it"
@@ -184,23 +185,7 @@ fn validate_ai_provider_preflight(config: &crate::data::modelconfig::ModelConfig
 /// Tauri apps do not have a reliable working directory. Keep GUI projects in
 /// a user-owned, stable location unless the caller explicitly supplies one.
 fn resolve_project_root(root: Option<PathBuf>) -> PathBuf {
-    if let Some(root) = root {
-        return root;
-    }
-    if let Some(root) = std::env::var_os("LUMEN_CUT_PROJECTS_ROOT").filter(|v| !v.is_empty()) {
-        return PathBuf::from(root);
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library/Application Support/lumen-cut/Projects")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        home.join(".lumen-cut/projects")
-    }
+    root.unwrap_or_else(crate::paths::projects_root)
 }
 
 fn resolve_project_dir(pid: &str, root: Option<PathBuf>) -> AppResult<PathBuf> {
@@ -568,16 +553,7 @@ pub struct DesktopProjectOpenRequest {
 }
 
 fn desktop_pending_open_path() -> PathBuf {
-    crate::log_directory()
-        .parent()
-        .map(|parent| parent.to_path_buf())
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".lumen-cut")
-        })
-        .join("pending-open.json")
+    crate::paths::state_dir().join("pending-open.json")
 }
 
 /// Queue a project for the desktop app to open on next launch.
@@ -713,13 +689,11 @@ pub async fn project_reveal(pid: String, root: Option<PathBuf>) -> AppResult<Str
         }
         Err(error) => return Err(AppError::Io(error)),
     }
-    #[cfg(target_os = "macos")]
-    tokio::process::Command::new("open")
-        .args(["-R"])
-        .arg(dir.join("doc.json"))
-        .spawn()?;
-    #[cfg(not(target_os = "macos"))]
-    tokio::process::Command::new("open").arg(&dir).spawn()?;
+    // Select the project document so the reveal lands on the project rather
+    // than on whatever the file manager last showed.
+    let target = dir.join("doc.json");
+    let (program, args) = crate::paths::reveal_command(&target);
+    tokio::process::Command::new(program).args(args).spawn()?;
     Ok(dir.to_string_lossy().into_owned())
 }
 
@@ -3351,12 +3325,9 @@ pub async fn settings_export(
     {
         settings.asr_cloud_api_key = previous.asr_cloud_api_key;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     let persisted = settings.clone();
     let path = run_blocking("settings save", move || {
-        let path = write_settings_file(&home, &settings)?;
+        let path = write_settings_file(&settings)?;
         Ok(path.to_string_lossy().into_owned())
     })
     .await?;
@@ -3364,8 +3335,8 @@ pub async fn settings_export(
     Ok(path)
 }
 
-fn write_settings_file(home: &std::path::Path, settings: &SettingsPayload) -> AppResult<PathBuf> {
-    let dir = home.join(".lumen-cut");
+fn write_settings_file(settings: &SettingsPayload) -> AppResult<PathBuf> {
+    let dir = crate::paths::state_dir();
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
@@ -7077,9 +7048,7 @@ pub async fn timing_repair(pid: String, root: Option<PathBuf>) -> AppResult<Stri
 
 #[tauri::command]
 pub async fn model_list() -> Vec<String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::paths::home_dir();
     run_blocking("model cache list", move || {
         Ok(
             std::fs::read_dir(crate::data::modelconfig::hugging_face_cache_root(&home))
@@ -7295,10 +7264,7 @@ pub struct SetupJobState {
 }
 
 fn setup_status_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".lumen-cut/setup-job.json")
+    crate::paths::state_dir().join("setup-job.json")
 }
 
 fn save_setup_status(path: &std::path::Path, status: &SetupJobStatus) -> AppResult<()> {
@@ -7597,11 +7563,12 @@ pub async fn logs_list(pid: String, root: Option<PathBuf>) -> AppResult<Vec<(Str
 pub async fn logs_reveal() -> AppResult<String> {
     let dir = crate::log_directory();
     tokio::fs::create_dir_all(&dir).await?;
-    let status = tokio::process::Command::new("open")
-        .arg(&dir)
+    let (program, args) = crate::paths::reveal_command(&dir);
+    let status = tokio::process::Command::new(program)
+        .args(args)
         .status()
         .await?;
-    if !status.success() {
+    if crate::paths::REVEAL_REPORTS_EXIT_STATUS && !status.success() {
         return Err(AppError::Schema(format!(
             "could not reveal diagnostics folder ({status})"
         )));
@@ -7678,24 +7645,12 @@ pub async fn recording_start(
             tokio::fs::remove_file(&wav).await?;
         }
 
+        let input = crate::capture::microphone_input().await?;
         let mut command = tokio::process::Command::new("ffmpeg");
         command
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "avfoundation",
-                "-i",
-                ":0",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "pcm_s16le",
-            ])
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(&input)
+            .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
             .arg(&wav)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -11773,7 +11728,14 @@ mod tests {
     #[test]
     fn write_settings_file_emits_camel_case_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_settings_file(tmp.path(), &settings()).unwrap();
+        let previous = std::env::var_os(crate::paths::ENV_STATE_DIR);
+        std::env::set_var(crate::paths::ENV_STATE_DIR, tmp.path());
+        let written = write_settings_file(&settings());
+        match previous {
+            Some(value) => std::env::set_var(crate::paths::ENV_STATE_DIR, value),
+            None => std::env::remove_var(crate::paths::ENV_STATE_DIR),
+        }
+        let path = written.unwrap();
         let raw = std::fs::read_to_string(path).unwrap();
         assert!(raw.contains("\"llmEndpoint\""), "got: {raw}");
         assert!(raw.contains("\"llmApiKey\""), "got: {raw}");

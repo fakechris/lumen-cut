@@ -17,6 +17,7 @@ import {
 } from "../../api";
 import { PlayIcon } from "../../components/Icons";
 import type { Lang } from "../../i18n";
+import { shortcutLabel } from "../../platform";
 import type {
   BrollOverview,
   AudioMix,
@@ -2132,8 +2133,8 @@ export function EditorTimelineDock({
             disabled={busy || !history.canUndo}
             onClick={() => void onUndo()}
             title={history.undoLabel
-              ? `${lang === "zh" ? "撤销" : "Undo"}：${history.undoLabel} (⌘Z)`
-              : `${lang === "zh" ? "没有可撤销的编辑" : "Nothing to undo"} (⌘Z)`}
+              ? `${lang === "zh" ? "撤销" : "Undo"}：${history.undoLabel} (${shortcutLabel("Z")})`
+              : `${lang === "zh" ? "没有可撤销的编辑" : "Nothing to undo"} (${shortcutLabel("Z")})`}
           >↶</button>
           <button
             aria-label={lang === "zh" ? "重做" : "Redo"}
@@ -2141,8 +2142,8 @@ export function EditorTimelineDock({
             disabled={busy || !history.canRedo}
             onClick={() => void onRedo()}
             title={history.redoLabel
-              ? `${lang === "zh" ? "重做" : "Redo"}：${history.redoLabel} (⇧⌘Z)`
-              : `${lang === "zh" ? "没有可重做的编辑" : "Nothing to redo"} (⇧⌘Z)`}
+              ? `${lang === "zh" ? "重做" : "Redo"}：${history.redoLabel} (${shortcutLabel("Z", { shift: true })})`
+              : `${lang === "zh" ? "没有可重做的编辑" : "Nothing to redo"} (${shortcutLabel("Z", { shift: true })})`}
           >↷</button>
           <span className="timeline-toolbar-divider" />
           <button
@@ -2961,9 +2962,9 @@ export function EditorTimelineDock({
                 <div><dt>← / →</dt><dd>{lang === "zh" ? "前后移动 1 秒；按住 ⇧ 移动 0.1 秒" : "Move 1s; hold ⇧ for 0.1s"}</dd></div>
                 <div><dt>S</dt><dd>{lang === "zh" ? "在播放头附近的词间拆分" : "Split near the playhead"}</dd></div>
                 <div><dt>Delete</dt><dd>{lang === "zh" ? "移除所选字幕区间或标题" : "Remove selected cue range or title"}</dd></div>
-                <div><dt>⌘ Z / ⇧⌘ Z</dt><dd>{lang === "zh" ? "撤销 / 重做" : "Undo / redo"}</dd></div>
-                <div><dt>⌘ + / ⌘ −</dt><dd>{lang === "zh" ? "缩放时间线" : "Zoom timeline"}</dd></div>
-                <div><dt>⌘ ↵</dt><dd>{lang === "zh" ? "保存当前转写或翻译" : "Save the current transcript or translation"}</dd></div>
+                <div><dt>{`${shortcutLabel("Z")} / ${shortcutLabel("Z", { shift: true })}`}</dt><dd>{lang === "zh" ? "撤销 / 重做" : "Undo / redo"}</dd></div>
+                <div><dt>{`${shortcutLabel("+")} / ${shortcutLabel("−")}`}</dt><dd>{lang === "zh" ? "缩放时间线" : "Zoom timeline"}</dd></div>
+                <div><dt>{shortcutLabel("↵")}</dt><dd>{lang === "zh" ? "保存当前转写或翻译" : "Save the current transcript or translation"}</dd></div>
               </dl>
               <small>
                 {lang === "zh"

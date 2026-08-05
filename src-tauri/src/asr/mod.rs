@@ -7,7 +7,7 @@
 pub mod cloud;
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,9 @@ pub struct RuntimeStatus {
     pub selected_ready: bool,
     pub cloud_configured: bool,
     pub python_path: Option<String>,
+    /// Whether this platform can run the local (MLX) engine at all. False
+    /// means the install action would fail, not that a step is missing.
+    pub local_engine_supported: bool,
     pub runtime_ready: bool,
     pub runtime_detail: String,
     pub model_id: String,
@@ -148,34 +151,65 @@ fn resolve_model_arg(model_id: &str) -> String {
     }
 }
 
-pub fn managed_python(home: &Path) -> PathBuf {
-    home.join(".lumen-cut/runtime/bin/python3")
+/// Interpreter inside the app-managed uv virtualenv.
+///
+/// `home` is accepted for symmetry with the model-cache helpers, but the
+/// runtime lives under the platform state directory, so it is unused.
+pub fn managed_python(_home: &Path) -> PathBuf {
+    crate::paths::managed_python()
 }
 
+/// Well-known interpreter locations, most preferred first. The managed
+/// virtualenv always wins so an app-installed runtime is not shadowed by a
+/// global interpreter that happens to be on `PATH`.
 fn python_candidates(home: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("LUMEN_CUT_PYTHON").filter(|value| !value.is_empty()) {
         candidates.push(PathBuf::from(path));
     }
     candidates.push(managed_python(home));
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/python3.13"),
-        PathBuf::from("/opt/homebrew/bin/python3.12"),
-        PathBuf::from("/usr/local/bin/python3.13"),
-        PathBuf::from("/usr/local/bin/python3.12"),
-        PathBuf::from("python3"),
-    ]);
+    if cfg!(windows) {
+        // The official python.org installer's per-user location, then the
+        // names the installer and the `py` launcher put on PATH.
+        let programs = home.join("AppData").join("Local").join("Programs");
+        for version in ["Python313", "Python312"] {
+            candidates.push(programs.join("Python").join(version).join("python.exe"));
+        }
+        candidates.extend([PathBuf::from("python"), PathBuf::from("py")]);
+    } else {
+        candidates.extend([
+            PathBuf::from("/opt/homebrew/bin/python3.13"),
+            PathBuf::from("/opt/homebrew/bin/python3.12"),
+            PathBuf::from("/usr/local/bin/python3.13"),
+            PathBuf::from("/usr/local/bin/python3.12"),
+            PathBuf::from("python3"),
+        ]);
+    }
     candidates.dedup();
     candidates
 }
 
+/// Whether this platform can run the local (MLX) transcription engine.
+///
+/// `mlx-qwen3-asr` is built on Apple's MLX framework and has no Windows or
+/// Linux build. Rather than fail deep inside a job, the app reports the
+/// limitation up front and steers users to the OpenAI-compatible cloud
+/// engine, which is fully supported everywhere.
+pub fn local_engine_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// One-line explanation shown when [`local_engine_supported`] is false.
+pub const LOCAL_ENGINE_UNSUPPORTED_DETAIL: &str =
+    "local transcription needs Apple MLX, which only runs on macOS; choose the \
+     OpenAI-compatible engine in Settings → Speech & models";
+
 fn package_version(python: &Path) -> Option<String> {
-    let output = Command::new(python)
+    let output = crate::doctor::quiet_command(python)
         .args([
             "-c",
             "import importlib.metadata as m; import mlx_qwen3_asr; print(m.version('mlx-qwen3-asr'))",
         ])
-        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -185,12 +219,11 @@ fn package_version(python: &Path) -> Option<String> {
 }
 
 fn diarize_package_version(python: &Path) -> Option<String> {
-    let output = Command::new(python)
+    let output = crate::doctor::quiet_command(python)
         .args([
             "-c",
             "import importlib.metadata as m; import pyannote.audio, torch, torchaudio, huggingface_hub; print('|'.join([m.version('pyannote.audio'), m.version('torch'), m.version('torchaudio'), m.version('huggingface-hub')]))",
         ])
-        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -246,9 +279,7 @@ fn compatible_diarize_versions(
 }
 
 pub fn resolve_python() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::paths::home_dir();
     python_candidates(&home)
         .into_iter()
         .find(|candidate| package_version(candidate).is_some())
@@ -256,16 +287,19 @@ pub fn resolve_python() -> PathBuf {
 }
 
 pub fn runtime_status() -> RuntimeStatus {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::paths::home_dir();
     let config = crate::data::modelconfig::load();
     let candidates = python_candidates(&home);
-    let runtime = candidates
-        .iter()
-        .cloned()
-        .into_iter()
-        .find_map(|candidate| package_version(&candidate).map(|version| (candidate, version)));
+    // Probing for an MLX package on a platform MLX cannot be installed on is
+    // wasted process spawns, and reporting "not installed" would suggest the
+    // install button will fix it.
+    let runtime = local_engine_supported()
+        .then(|| {
+            candidates.iter().cloned().find_map(|candidate| {
+                package_version(&candidate).map(|version| (candidate, version))
+            })
+        })
+        .flatten();
     // A snapshot shared by another Lumen app (discovered via lumen-models)
     // counts as downloaded: transcription passes that directory to the
     // sidecar, so no per-app copy is ever fetched.
@@ -297,11 +331,16 @@ pub fn runtime_status() -> RuntimeStatus {
         python_path: runtime
             .as_ref()
             .map(|(path, _)| path.to_string_lossy().into_owned()),
+        local_engine_supported: local_engine_supported(),
         runtime_ready,
         runtime_detail: runtime
             .map(|(_, version)| format!("mlx-qwen3-asr {version}"))
             .unwrap_or_else(|| {
-                "mlx-qwen3-asr is not installed in a supported Python 3.10–3.13 runtime".into()
+                if local_engine_supported() {
+                    "mlx-qwen3-asr is not installed in a supported Python 3.10–3.13 runtime".into()
+                } else {
+                    LOCAL_ENGINE_UNSUPPORTED_DETAIL.into()
+                }
             }),
         model_id: config.asr_model,
         model_cached,
@@ -326,16 +365,29 @@ pub fn runtime_status() -> RuntimeStatus {
 }
 
 fn find_uv(home: &Path) -> Option<PathBuf> {
-    let candidates = [
-        home.join(".local/bin/uv"),
-        PathBuf::from("/opt/homebrew/bin/uv"),
-        PathBuf::from("/usr/local/bin/uv"),
-        PathBuf::from("uv"),
-    ];
+    let candidates = if cfg!(windows) {
+        // uv's own installer targets `%LOCALAPPDATA%\Programs\uv`; winget and
+        // pipx both put `uv.exe` on PATH.
+        vec![
+            home.join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("uv")
+                .join("uv.exe"),
+            home.join(".local").join("bin").join("uv.exe"),
+            PathBuf::from("uv"),
+        ]
+    } else {
+        vec![
+            home.join(".local/bin/uv"),
+            PathBuf::from("/opt/homebrew/bin/uv"),
+            PathBuf::from("/usr/local/bin/uv"),
+            PathBuf::from("uv"),
+        ]
+    };
     candidates.into_iter().find(|candidate| {
-        Command::new(candidate)
+        crate::doctor::quiet_command(candidate)
             .arg("--version")
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -345,8 +397,8 @@ fn find_uv(home: &Path) -> Option<PathBuf> {
 }
 
 async fn ensure_managed_runtime(home: &Path, uv: &Path) -> AppResult<PathBuf> {
-    let runtime_dir = home.join(".lumen-cut/runtime");
-    tokio::fs::create_dir_all(home.join(".lumen-cut")).await?;
+    let runtime_dir = crate::paths::managed_runtime_dir();
+    tokio::fs::create_dir_all(crate::paths::state_dir()).await?;
     let python = managed_python(home);
     if !python.is_file() {
         let runtime = runtime_dir.display().to_string();
@@ -517,9 +569,7 @@ pub async fn install_asr_runtime_with_progress(
         Some(5),
         "Checking the managed Python environment",
     );
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::paths::home_dir();
     let uv = find_uv(&home).ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_asr",
         message: "the `uv` installer was not found; install uv from https://docs.astral.sh/uv/ and try again"
@@ -569,9 +619,7 @@ pub async fn install_diarize_runtime_with_progress(
         Some(5),
         "Checking the managed Python environment",
     );
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::paths::home_dir();
     let uv = find_uv(&home).ok_or_else(|| AppError::Sidecar {
         sidecar: "lumen_cut_diarize",
         message: "the `uv` installer was not found; install uv from https://docs.astral.sh/uv/ and try again"
@@ -1058,13 +1106,17 @@ mod tests {
 
     #[test]
     fn snapshot_progress_sidecar_is_valid_python() {
-        let status = Command::new("python3")
+        let Some(python) = crate::doctor::python_command() else {
+            // Without an interpreter there is nothing to validate against;
+            // CI installs one, so this only skips on bare dev machines.
+            return;
+        };
+        let status = crate::doctor::quiet_command(python)
             .args([
                 "-c",
                 "import sys; compile(sys.argv[1], '<snapshot-progress>', 'exec')",
                 SNAPSHOT_DOWNLOAD_SCRIPT,
             ])
-            .stdin(Stdio::null())
             .status()
             .unwrap();
         assert!(status.success());

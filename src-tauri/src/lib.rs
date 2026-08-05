@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod asr;
 pub mod audit;
+pub mod capture;
 pub mod commands;
 pub mod data;
 pub mod diarize;
@@ -16,6 +17,7 @@ pub mod export;
 pub mod import;
 pub mod media;
 pub mod media_url;
+pub mod paths;
 pub mod performance;
 pub mod pipeline;
 pub mod proc;
@@ -28,16 +30,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Persistent diagnostics for GUI launches, which otherwise have no terminal.
 /// Keep this outside project folders so exports and repositories never pick it up.
 pub fn log_directory() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".lumen-cut/logs")
+    paths::log_dir()
 }
 
 /// Tauri runtime entry point.
 pub fn run() {
-    // Apps launched from Finder inherit a minimal PATH that omits Homebrew and
-    // user tools. Normalize it before any ffmpeg/Python health check or job.
+    // Apps launched from Finder or Explorer inherit a minimal PATH that omits
+    // Homebrew, winget shims and user tools. Normalize it before any
+    // ffmpeg/Python health check or job.
     doctor::configure_process_path();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

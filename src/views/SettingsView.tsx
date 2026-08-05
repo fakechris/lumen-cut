@@ -782,7 +782,16 @@ export function SettingsView({ lang }: Props) {
             <div>
               <span className={asr?.runtimeReady ? "status-dot ready" : "status-dot"} />
               <strong>{c.runtime}</strong>
-              <small>{asr?.runtimeReady ? `${c.installed} · ${asr.runtimeDetail}` : c.missing}</small>
+              {/* When the platform has no local engine, the backend's reason
+                  is the only useful text — "missing" would imply it can be
+                  installed. */}
+              <small>
+                {asr?.runtimeReady
+                  ? `${c.installed} · ${asr.runtimeDetail}`
+                  : asr && !asr.localEngineSupported
+                    ? asr.runtimeDetail
+                    : c.missing}
+              </small>
             </div>
             <div>
               <span className={asr?.modelCached ? "status-dot ready" : "status-dot"} />
@@ -814,7 +823,7 @@ export function SettingsView({ lang }: Props) {
           </div>
 
           <div className="settings-save asr-actions">
-            {settings.asrEngine === "local" && !asr?.runtimeReady && (
+            {settings.asrEngine === "local" && !asr?.runtimeReady && asr?.localEngineSupported !== false && (
               <button className="button-primary" disabled={asrAction !== null} onClick={installAsr}>
                 {asrAction === "install" ? c.installingRuntime : c.installRuntime}
               </button>

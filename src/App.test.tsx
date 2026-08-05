@@ -788,6 +788,7 @@ beforeEach(() => {
           selectedReady: asrReady,
           cloudConfigured: false,
           pythonPath: "/Users/example/.lumen-cut/runtime/bin/python3",
+          localEngineSupported: true,
           runtimeReady: asrReady,
           runtimeDetail: "mlx-qwen3-asr 0.3.5",
           modelId: "Qwen/Qwen3-ASR-0.6B",

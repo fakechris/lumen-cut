@@ -387,6 +387,9 @@ export interface AsrStatus {
   selectedReady: boolean;
   cloudConfigured: boolean;
   pythonPath: string | null;
+  /** False when this OS cannot run the local MLX engine at all — the
+   *  install action would fail rather than fill in a missing step. */
+  localEngineSupported: boolean;
   runtimeReady: boolean;
   runtimeDetail: string;
   modelId: string;

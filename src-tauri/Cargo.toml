@@ -40,7 +40,6 @@ eventsource-stream = "0.2"
 futures = "0.3"
 dashmap = "6"
 rand = "0.8"
-libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 tracing-appender = "0.2"
 # Shared Lumen model discovery: reuse Qwen3-ASR weights installed by lumen-asr
@@ -51,6 +50,22 @@ lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef
 # ("Import from Navi/Voice"). Same suite rev as lumen-models so the two
 # git dependencies resolve to a single checkout.
 lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef449465d18865d3d819309a64b1e723ae329817" }
+
+[target.'cfg(unix)'.dependencies]
+# Process-group signalling for managed sidecar teardown.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Job objects give a managed child the same "terminate the whole tree"
+# semantics a Unix process group provides.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # CreateJobObjectW takes SECURITY_ATTRIBUTES; the extended limit struct
+    # embeds IO_COUNTERS from Threading.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

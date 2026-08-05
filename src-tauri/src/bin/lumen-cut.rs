@@ -405,7 +405,7 @@ enum Cmd {
         #[command(subcommand)]
         action: McpCmd,
     },
-    /// Record audio (macOS avfoundation via ffmpeg) → <pid>/audio.wav.
+    /// Record audio from the default microphone via ffmpeg → <pid>/audio.wav.
     Record {
         pid: String,
         #[arg(long, default_value = "30")]
@@ -1877,10 +1877,8 @@ async fn run_cli() -> AppResult<()> {
         Cmd::Model { action } => {
             match action {
                 ModelCmd::List => {
-                    let home = std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_default();
-                    let hub = home.join(".cache/huggingface/hub");
+                    let home = lumen_cut::paths::home_dir();
+                    let hub = lumen_cut::data::modelconfig::hugging_face_cache_root(&home);
                     let mut models: Vec<String> = std::fs::read_dir(&hub)
                         .map(|rd| {
                             rd.filter_map(|e| e.ok())
@@ -2018,13 +2016,11 @@ async fn run_cli() -> AppResult<()> {
             let dir = PathBuf::from(&pid);
             std::fs::create_dir_all(&dir)?;
             let wav = dir.join("audio.wav");
+            let input = lumen_cut::capture::microphone_input().await?;
             let st = std::process::Command::new("ffmpeg")
+                .args(["-y"])
+                .args(&input)
                 .args([
-                    "-y",
-                    "-f",
-                    "avfoundation",
-                    "-i",
-                    ":0",
                     "-t",
                     &seconds.to_string(),
                     "-ac",
@@ -2037,7 +2033,7 @@ async fn run_cli() -> AppResult<()> {
                 .arg(&wav)
                 .status()
                 .map_err(|e| {
-                    AppError::Io(std::io::Error::other(format!("ffmpeg avfoundation: {e}")))
+                    AppError::Io(std::io::Error::other(format!("ffmpeg microphone: {e}")))
                 })?;
             if st.success() {
                 emit!(
@@ -2048,7 +2044,7 @@ async fn run_cli() -> AppResult<()> {
                 );
             } else {
                 return Err(AppError::Schema(
-                    "ffmpeg avfoundation recording failed".into(),
+                    "ffmpeg microphone recording failed".into(),
                 ));
             }
         }
@@ -2740,11 +2736,12 @@ fn project_open(
     let url = format!("lumencut://project/{pid}");
     let mut revealed = false;
     if reveal {
-        let status = std::process::Command::new("open")
-            .arg(&path)
+        let (program, args) = lumen_cut::paths::reveal_command(std::path::Path::new(&path));
+        let status = std::process::Command::new(program)
+            .args(args)
             .status()
             .map_err(|error| AppError::Schema(format!("failed to reveal project: {error}")))?;
-        if !status.success() {
+        if lumen_cut::paths::REVEAL_REPORTS_EXIT_STATUS && !status.success() {
             return Err(AppError::Schema(
                 "failed to reveal project in the file manager".into(),
             ));
@@ -4036,16 +4033,23 @@ mod tests {
         sample_doc().save(&dir).unwrap();
 
         // Stub "python": prints a diarize_out.v1 payload, ignores args.
-        let stub = tmp.path().join("stub_python.sh");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\nprintf '%s' '{\"schema_version\":1,\"segments\":[{\"speaker\":\"SPEAKER_A\",\"start\":0.0,\"end\":2.0},{\"speaker\":\"SPEAKER_B\",\"start\":4.0,\"end\":8.0}]}'\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // Windows has no execute bit and no `#!`, so the stub is a batch
+        // file; `std::process::Command` routes those through `cmd.exe`.
+        const PAYLOAD: &str = "{\"schema_version\":1,\"segments\":[{\"speaker\":\"SPEAKER_A\",\"start\":0.0,\"end\":2.0},{\"speaker\":\"SPEAKER_B\",\"start\":4.0,\"end\":8.0}]}";
+        let stub = if cfg!(windows) {
+            let stub = tmp.path().join("stub_python.bat");
+            std::fs::write(&stub, format!("@echo off\r\necho {PAYLOAD}\r\n")).unwrap();
+            stub
+        } else {
+            let stub = tmp.path().join("stub_python.sh");
+            std::fs::write(&stub, format!("#!/bin/sh\nprintf '%s' '{PAYLOAD}'\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            stub
+        };
         std::env::set_var("LUMEN_CUT_PYTHON", &stub);
         std::env::set_var("LUMEN_CUT_DIARIZE_SCRIPT", &stub);
 

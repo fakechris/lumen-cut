@@ -12,7 +12,130 @@ use tokio::process::Command as TokioCommand;
 use crate::error::{AppError, AppResult};
 
 const STDERR_TAIL_BYTES: usize = 256 * 1024;
-static ACTIVE_PROCESS_GROUPS: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+static ACTIVE_PROCESS_GROUPS: OnceLock<Mutex<std::collections::HashMap<u32, ProcessGroup>>> =
+    OnceLock::new();
+
+/// Windows `CREATE_NO_WINDOW`. Console-subsystem tools (ffmpeg, yt-dlp,
+/// python) otherwise flash a console window for every managed job.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Windows counterpart of a Unix process group: a job object that owns the
+/// child and every descendant it spawns, so one call tears down ffmpeg's
+/// helper processes too. `KILL_ON_JOB_CLOSE` makes the teardown survive a
+/// forgotten explicit terminate.
+#[cfg(windows)]
+mod job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct Job(HANDLE);
+
+    // SAFETY: a job object handle is a kernel handle with no thread affinity.
+    // Every use below is a single Win32 call that the kernel serialises.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        /// Create an anonymous kill-on-close job and put `process` in it.
+        /// Returns `None` when either step fails, in which case the caller
+        /// falls back to killing the direct child only.
+        pub fn containing(process: HANDLE) -> Option<Self> {
+            // SAFETY: null attributes and name request the documented
+            // anonymous-job default.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let job = Self(handle);
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                // SAFETY: the struct is a plain-old-data limit descriptor.
+                unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `limits` outlives the call and its size is exact.
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of!(limits).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                return None;
+            }
+            // SAFETY: both handles are owned and open for the duration.
+            if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+                return None;
+            }
+            Some(job)
+        }
+
+        pub fn terminate(&self) {
+            // SAFETY: the handle is owned and still open.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // Closing the last handle kills whatever is still in the job.
+            // SAFETY: the handle is owned and closed exactly once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// The teardown handle for one managed child. Unix identifies a process group
+/// by pid; Windows owns a job object instead.
+#[derive(Default)]
+struct ProcessGroup {
+    #[cfg(windows)]
+    job: Option<job::Job>,
+}
+
+impl ProcessGroup {
+    /// Ask the child and everything it spawned to stop. Best effort: a
+    /// process that already exited is not an error here.
+    fn terminate(&self, pid: u32) {
+        #[cfg(unix)]
+        // Every managed child starts a fresh process group whose id equals
+        // its pid. A negative pid targets that complete group.
+        self.signal(pid, libc::SIGTERM);
+        #[cfg(windows)]
+        {
+            let _ = pid;
+            // Job termination is unconditional on Windows; there is no
+            // graceful-then-forceful pair to escalate through.
+            if let Some(job) = &self.job {
+                job.terminate();
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = pid;
+    }
+
+    /// Escalation for a group that ignored [`ProcessGroup::terminate`].
+    fn kill(&self, pid: u32) {
+        #[cfg(unix)]
+        self.signal(pid, libc::SIGKILL);
+        #[cfg(not(unix))]
+        self.terminate(pid);
+    }
+
+    #[cfg(unix)]
+    fn signal(&self, pid: u32, signal: i32) {
+        // SAFETY: `kill` is async-signal-safe and a stale pid only returns
+        // ESRCH, which this teardown path deliberately ignores.
+        unsafe {
+            libc::kill(-(pid as i32), signal);
+        }
+    }
+}
 
 tokio::task_local! {
     static CANCEL_FLAG: Arc<AtomicBool>;
@@ -34,21 +157,33 @@ pub fn cancellation_requested() -> bool {
         .unwrap_or(false)
 }
 
-fn active_process_groups() -> &'static Mutex<std::collections::HashSet<u32>> {
-    ACTIVE_PROCESS_GROUPS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+fn active_process_groups() -> &'static Mutex<std::collections::HashMap<u32, ProcessGroup>> {
+    ACTIVE_PROCESS_GROUPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 struct ProcessGroupRegistration(Option<u32>);
 
 impl ProcessGroupRegistration {
-    fn new(pid: Option<u32>) -> Self {
-        if let Some(pid) = pid {
-            active_process_groups()
-                .lock()
-                .expect("active subprocess state poisoned")
-                .insert(pid);
-        }
-        Self(pid)
+    fn new(child: &tokio::process::Child) -> Self {
+        let Some(pid) = child.id() else {
+            return Self(None);
+        };
+        #[cfg(windows)]
+        let group = ProcessGroup {
+            // `process_group` has no Windows equivalent, so containment is
+            // established after the spawn. The window where the child could
+            // start a descendant first is a few microseconds wide.
+            job: child
+                .raw_handle()
+                .and_then(|handle| job::Job::containing(handle as _)),
+        };
+        #[cfg(not(windows))]
+        let group = ProcessGroup::default();
+        active_process_groups()
+            .lock()
+            .expect("active subprocess state poisoned")
+            .insert(pid, group);
+        Self(Some(pid))
     }
 }
 
@@ -68,20 +203,13 @@ impl Drop for ProcessGroupRegistration {
 /// covers application quit, when Tauri exits the process without unwinding all
 /// in-flight async tasks.
 pub fn terminate_all_processes() {
-    #[cfg(unix)]
-    {
-        let groups = active_process_groups()
-            .lock()
-            .expect("active subprocess state poisoned")
-            .drain()
-            .collect::<Vec<_>>();
-        for pid in groups {
-            // Every managed child starts a fresh process group whose id equals
-            // its pid. A negative pid targets that complete group.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
-        }
+    let groups = active_process_groups()
+        .lock()
+        .expect("active subprocess state poisoned")
+        .drain()
+        .collect::<Vec<_>>();
+    for (pid, group) in groups {
+        group.terminate(pid);
     }
 }
 
@@ -148,11 +276,14 @@ async fn run_with_env_and_progress(
     command.kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    // Console-subsystem sidecars would otherwise flash a window per job.
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command.spawn().map_err(|e| AppError::Sidecar {
         sidecar: label(bin),
         message: format!("spawn: {e}"),
     })?;
-    let _process_group = ProcessGroupRegistration::new(child.id());
+    let _process_group = ProcessGroupRegistration::new(&child);
 
     let stdout = child
         .stdout
@@ -247,28 +378,35 @@ async fn run_with_env_and_progress(
 async fn terminate_process_tree(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            let group = format!("-{pid}");
-            let _ = TokioCommand::new("/bin/kill")
-                .args(["-TERM", &group])
-                .status()
-                .await;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    return Ok(status);
+    if let Some(pid) = child.id() {
+        // Ask the whole tree to stop first: ffmpeg and yt-dlp both spawn
+        // helpers that keep the output file locked if only the direct child
+        // dies. On Unix that is a SIGTERM to the process group; on Windows it
+        // is `TerminateJobObject` on the job the child was placed in.
+        let signal = |escalate: bool| {
+            if let Some(group) = active_process_groups()
+                .lock()
+                .expect("active subprocess state poisoned")
+                .get(&pid)
+            {
+                if escalate {
+                    group.kill(pid);
+                } else {
+                    group.terminate(pid);
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    let _ = TokioCommand::new("/bin/kill")
-                        .args(["-KILL", &group])
-                        .status()
-                        .await;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             }
+        };
+        signal(false);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                signal(true);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         }
     }
     let _ = child.kill().await;
@@ -289,6 +427,37 @@ fn label(bin: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Interpreter for the small scripts these tests run. `sh` and PowerShell
+    /// are the two shells that ship with their platform and behave
+    /// predictably under redirected stdio.
+    fn shell() -> (&'static str, &'static [&'static str]) {
+        if cfg!(windows) {
+            (
+                "powershell.exe",
+                &["-NoProfile", "-NonInteractive", "-Command"],
+            )
+        } else {
+            ("/bin/sh", &["-c"])
+        }
+    }
+
+    /// Run `script` in the platform shell. `unix` and `windows` express the
+    /// same behaviour, so each test still asserts one contract.
+    async fn run_script(unix: &str, windows: &str) -> AppResult<String> {
+        run_script_with_env(unix, windows, &[]).await
+    }
+
+    async fn run_script_with_env(
+        unix: &str,
+        windows: &str,
+        environment: &[(&str, &str)],
+    ) -> AppResult<String> {
+        let (bin, prefix) = shell();
+        let mut args = prefix.to_vec();
+        args.push(if cfg!(windows) { windows } else { unix });
+        run_with_env(bin, &args, environment).await
+    }
 
     #[test]
     fn process_termination_does_not_spawn_synchronous_commands() {
@@ -311,27 +480,27 @@ mod tests {
 
     #[tokio::test]
     async fn run_captures_stdout() {
-        let out = run("/bin/echo", &["hello"]).await.unwrap();
+        let out = run_script("printf hello", "[Console]::Out.Write('hello')")
+            .await
+            .unwrap();
         assert_eq!(out.trim(), "hello");
     }
 
     #[tokio::test]
     async fn managed_processes_receive_eof_instead_of_terminal_input() {
-        let out = run(
-            "/bin/sh",
-            &[
-                "-c",
-                "if read -r _value; then printf input; else printf eof; fi",
-            ],
+        let out = run_script(
+            "if read -r _value; then printf input; else printf eof; fi",
+            "if ($null -eq [Console]::In.ReadLine()) { [Console]::Out.Write('eof') } \
+             else { [Console]::Out.Write('input') }",
         )
         .await
         .unwrap();
-        assert_eq!(out, "eof");
+        assert_eq!(out.trim(), "eof");
     }
 
     #[tokio::test]
     async fn run_surfaces_failure() {
-        let err = run("/usr/bin/false", &[]).await.unwrap_err();
+        let err = run_script("exit 1", "exit 1").await.unwrap_err();
         match err {
             AppError::Sidecar { message, .. } => assert!(message.contains("exit")),
             other => panic!("unexpected error: {other:?}"),
@@ -340,12 +509,10 @@ mod tests {
 
     #[tokio::test]
     async fn failure_output_keeps_a_bounded_tail() {
-        let err = run(
-            "/bin/sh",
-            &[
-                "-c",
-                "yes x | head -c 1048576 >&2; printf 'TAIL_MARKER' >&2; exit 1",
-            ],
+        let err = run_script(
+            "yes x | head -c 1048576 >&2; printf 'TAIL_MARKER' >&2; exit 1",
+            "[Console]::Error.Write('x' * 1048576); \
+             [Console]::Error.Write('TAIL_MARKER'); exit 1",
         )
         .await
         .unwrap_err();
@@ -360,31 +527,36 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_env_passes_an_explicit_value() {
-        let out = run_with_env(
-            "/bin/sh",
-            &["-c", "printf '%s' \"$LUMEN_CUT_PROC_TEST\""],
+        let out = run_script_with_env(
+            "printf '%s' \"$LUMEN_CUT_PROC_TEST\"",
+            "[Console]::Out.Write($env:LUMEN_CUT_PROC_TEST)",
             &[("LUMEN_CUT_PROC_TEST", "scoped")],
         )
         .await
         .unwrap();
-        assert_eq!(out, "scoped");
+        assert_eq!(out.trim(), "scoped");
     }
 
     #[tokio::test]
     async fn run_with_progress_streams_stderr_lines() {
         let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = lines.clone();
+        let (bin, prefix) = shell();
+        let mut args = prefix.to_vec();
+        args.push(if cfg!(windows) {
+            "[Console]::Error.WriteLine('LUMEN_CUT_PROGRESS {\"progress\":64}'); \
+             [Console]::Out.Write('done')"
+        } else {
+            "printf 'LUMEN_CUT_PROGRESS {\"progress\":64}\n' >&2; printf done"
+        });
         let out = run_with_progress(
-            "/bin/sh",
-            &[
-                "-c",
-                "printf 'LUMEN_CUT_PROGRESS {\"progress\":64}\n' >&2; printf done",
-            ],
+            bin,
+            &args,
             Arc::new(move |line| captured.lock().unwrap().push(line)),
         )
         .await
         .unwrap();
-        assert_eq!(out, "done");
+        assert_eq!(out.trim(), "done");
         assert_eq!(
             lines.lock().unwrap().as_slice(),
             ["LUMEN_CUT_PROGRESS {\"progress\":64}"]
@@ -400,7 +572,7 @@ mod tests {
             trigger.store(true, Ordering::Relaxed);
         });
         let started = std::time::Instant::now();
-        let error = with_cancellation(flag, run("/bin/sleep", &["10"]))
+        let error = with_cancellation(flag, run_script("sleep 10", "Start-Sleep -Seconds 10"))
             .await
             .unwrap_err();
         assert!(matches!(error, AppError::Cancelled));

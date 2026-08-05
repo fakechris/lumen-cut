@@ -2,8 +2,9 @@
 //! touches (ASR / diarize / forced-aligner / LLM), so the GUI's "models"
 //! view and the sidecars agree.
 //!
-//! Persists to `~/.lumen-cut/settings.json` alongside the LLM fields. Sidecars
-//! read their model ids from this shared configuration.
+//! Persists to the platform settings file (`crate::paths::settings_file`)
+//! alongside the LLM fields. Sidecars read their model ids from this shared
+//! configuration.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +24,14 @@ fn defaults() -> ModelConfig {
         // memory machines even though the two stages also run in isolation.
         asr_model: "mlx-community/Qwen3-ASR-0.6B-8bit".into(),
         asr_aligner: "mlx-community/Qwen3-ForcedAligner-0.6B-4bit".into(),
-        asr_engine: AsrEngine::Local,
+        // The local engine runs on Apple MLX. Where that cannot exist, a
+        // default the user can never make ready is worse than pointing at
+        // the engine that does work everywhere.
+        asr_engine: if crate::asr::local_engine_supported() {
+            AsrEngine::Local
+        } else {
+            AsrEngine::OpenaiCompatible
+        },
         asr_cloud_endpoint: "https://api.openai.com/v1/audio/transcriptions".into(),
         asr_cloud_api_key: String::new(),
         asr_cloud_model: "whisper-1".into(),
@@ -59,62 +67,58 @@ impl Default for ModelConfig {
     }
 }
 
-/// Load from `~/.lumen-cut/settings.json`, merged over the defaults (so a
+/// Load from the platform settings file, merged over the defaults (so a
 /// partial file still resolves every field).
 pub fn load() -> ModelConfig {
     let mut cfg = ModelConfig::default();
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Ok(raw) =
-            std::fs::read_to_string(std::path::Path::new(&home).join(".lumen-cut/settings.json"))
-        {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(s) = v.get("asrModel").and_then(|x| x.as_str()) {
-                    cfg.asr_model = s.into();
-                }
-                if let Some(engine) = v
-                    .get("asrEngine")
-                    .and_then(|value| serde_json::from_value(value.clone()).ok())
-                {
-                    cfg.asr_engine = engine;
-                }
-                if let Some(s) = v.get("asrCloudEndpoint").and_then(|x| x.as_str()) {
-                    cfg.asr_cloud_endpoint = s.into();
-                }
-                if let Some(s) = v.get("asrCloudApiKey").and_then(|x| x.as_str()) {
-                    cfg.asr_cloud_api_key = s.into();
-                }
-                if let Some(s) = v.get("asrCloudModel").and_then(|x| x.as_str()) {
-                    cfg.asr_cloud_model = s.into();
-                }
-                if let Some(s) = v.get("diarizeModel").and_then(|x| x.as_str()) {
-                    cfg.diarize_model = match s {
-                        // Community-1 requires the incompatible pyannote 4.x
-                        // runtime. Keep persisted prerelease settings on the
-                        // only pipeline this build installs and validates.
-                        "pyannote/speaker-diarization-community-1" => {
-                            "pyannote/speaker-diarization-3.1".into()
-                        }
-                        _ => s.into(),
-                    };
-                }
-                if let Some(s) = v.get("hfToken").and_then(|x| x.as_str()) {
-                    cfg.hf_token = s.into();
-                }
-                if let Some(s) = v.get("asrAligner").and_then(|x| x.as_str()) {
-                    cfg.asr_aligner = s.into();
-                }
-                if let Some(s) = v.get("llmEndpoint").and_then(|x| x.as_str()) {
-                    cfg.llm_endpoint = s.into();
-                }
-                if let Some(s) = v.get("llmApiKey").and_then(|x| x.as_str()) {
-                    cfg.llm_api_key = s.into();
-                }
-                if let Some(s) = v.get("llmModel").and_then(|x| x.as_str()) {
-                    cfg.llm_model = s.into();
-                }
-                if let Some(n) = v.get("workerCount").and_then(|x| x.as_u64()) {
-                    cfg.worker_count = n as u32;
-                }
+    if let Ok(raw) = std::fs::read_to_string(crate::paths::settings_file()) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(s) = v.get("asrModel").and_then(|x| x.as_str()) {
+                cfg.asr_model = s.into();
+            }
+            if let Some(engine) = v
+                .get("asrEngine")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+            {
+                cfg.asr_engine = engine;
+            }
+            if let Some(s) = v.get("asrCloudEndpoint").and_then(|x| x.as_str()) {
+                cfg.asr_cloud_endpoint = s.into();
+            }
+            if let Some(s) = v.get("asrCloudApiKey").and_then(|x| x.as_str()) {
+                cfg.asr_cloud_api_key = s.into();
+            }
+            if let Some(s) = v.get("asrCloudModel").and_then(|x| x.as_str()) {
+                cfg.asr_cloud_model = s.into();
+            }
+            if let Some(s) = v.get("diarizeModel").and_then(|x| x.as_str()) {
+                cfg.diarize_model = match s {
+                    // Community-1 requires the incompatible pyannote 4.x
+                    // runtime. Keep persisted prerelease settings on the
+                    // only pipeline this build installs and validates.
+                    "pyannote/speaker-diarization-community-1" => {
+                        "pyannote/speaker-diarization-3.1".into()
+                    }
+                    _ => s.into(),
+                };
+            }
+            if let Some(s) = v.get("hfToken").and_then(|x| x.as_str()) {
+                cfg.hf_token = s.into();
+            }
+            if let Some(s) = v.get("asrAligner").and_then(|x| x.as_str()) {
+                cfg.asr_aligner = s.into();
+            }
+            if let Some(s) = v.get("llmEndpoint").and_then(|x| x.as_str()) {
+                cfg.llm_endpoint = s.into();
+            }
+            if let Some(s) = v.get("llmApiKey").and_then(|x| x.as_str()) {
+                cfg.llm_api_key = s.into();
+            }
+            if let Some(s) = v.get("llmModel").and_then(|x| x.as_str()) {
+                cfg.llm_model = s.into();
+            }
+            if let Some(n) = v.get("workerCount").and_then(|x| x.as_u64()) {
+                cfg.worker_count = n as u32;
             }
         }
     }
@@ -253,7 +257,14 @@ mod tests {
         let c = ModelConfig::default();
         assert_eq!(c.asr_model, "mlx-community/Qwen3-ASR-0.6B-8bit");
         assert_eq!(c.asr_aligner, "mlx-community/Qwen3-ForcedAligner-0.6B-4bit");
-        assert_eq!(c.asr_engine, AsrEngine::Local);
+        assert_eq!(
+            c.asr_engine,
+            if cfg!(target_os = "macos") {
+                AsrEngine::Local
+            } else {
+                AsrEngine::OpenaiCompatible
+            }
+        );
         assert_eq!(
             c.asr_cloud_endpoint,
             "https://api.openai.com/v1/audio/transcriptions"
@@ -286,21 +297,23 @@ mod tests {
 
     #[test]
     fn load_merges_over_defaults() {
-        let _g = ();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".lumen-cut")).unwrap();
         std::fs::write(
-            dir.path().join(".lumen-cut/settings.json"),
+            dir.path().join("settings.json"),
             r#"{"asrModel":"custom-asr","llmEndpoint":"https://e"}"#,
         )
         .unwrap();
-        std::env::set_var("HOME", dir.path());
+        let previous = std::env::var_os(crate::paths::ENV_STATE_DIR);
+        std::env::set_var(crate::paths::ENV_STATE_DIR, dir.path());
         let c = load();
+        match previous {
+            Some(value) => std::env::set_var(crate::paths::ENV_STATE_DIR, value),
+            None => std::env::remove_var(crate::paths::ENV_STATE_DIR),
+        }
         assert_eq!(c.asr_model, "custom-asr");
         assert_eq!(c.llm_endpoint, "https://e");
         // untouched fields keep defaults
         assert_eq!(c.diarize_model, "pyannote/speaker-diarization-3.1");
-        std::env::remove_var("HOME");
     }
 
     #[test]
