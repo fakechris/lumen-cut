@@ -8,13 +8,18 @@ speaker-alignment work to Stage 4 (the `align-speakers` audit).
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
-import resource
 import subprocess
 import sys
 import time
 from typing import Any, TextIO
+
+try:
+    import resource
+except ModuleNotFoundError:  # Windows has no rusage; psapi is read instead.
+    resource = None  # type: ignore[assignment]
 
 DEFAULT_MODEL = "pyannote/speaker-diarization-3.1"
 PROGRESS_PREFIX = "LUMEN_CUT_PROGRESS "
@@ -22,6 +27,78 @@ CPU_THREAD_LIMIT = 4
 DEFAULT_MEMORY_LIMIT_MB = 6144
 PHYSICAL_MEMORY_FRACTION = 0.55
 MIN_MEMORY_LIMIT_MB = 2048
+
+
+class MEMORYSTATUSEX(ctypes.Structure):
+    """Win32 `MEMORYSTATUSEX`. Only `ullTotalPhys` is read; the rest of the
+    layout still has to be declared so the struct size matches."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    """Win32 `PROCESS_MEMORY_COUNTERS`. Only `PeakWorkingSetSize` is read."""
+
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("PageFaultCount", ctypes.c_uint32),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def windows_physical_memory_mb() -> int | None:
+    """Installed RAM on Windows, where `os.sysconf` does not exist."""
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(status)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return int(status.ullTotalPhys) // (1024 * 1024)
+
+
+def windows_peak_rss_mb() -> float:
+    """Peak working set of this process — the Windows analogue of
+    `ru_maxrss`. Read straight from psapi rather than pulling in psutil,
+    which would be a large dependency for a single counter."""
+    counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(counters)
+    try:
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        # The current-process pseudo-handle is (HANDLE)-1. Without an explicit
+        # restype ctypes would truncate it to 32 bits on x64.
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            ctypes.c_uint32,
+        ]
+        if not psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return 0.0
+    except (AttributeError, OSError):
+        return 0.0
+    return int(counters.PeakWorkingSetSize) / (1024 * 1024)
 
 
 def physical_memory_mb() -> int | None:
@@ -33,6 +110,8 @@ def physical_memory_mb() -> int | None:
             return (pages * page_size) // (1024 * 1024)
     except (AttributeError, OSError, TypeError, ValueError):
         pass
+    if sys.platform == "win32":
+        return windows_physical_memory_mb()
     if sys.platform == "darwin":
         try:
             output = subprocess.run(
@@ -94,6 +173,8 @@ class ResourceMonitor:
 
     @staticmethod
     def peak_memory_mb() -> float:
+        if resource is None:
+            return windows_peak_rss_mb()
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         # macOS reports bytes while Linux reports KiB.
         divisor = 1024 * 1024 if sys.platform == "darwin" else 1024

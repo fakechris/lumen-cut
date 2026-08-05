@@ -22,6 +22,12 @@ class SidecarFormattingTests(unittest.TestCase):
         self.assertGreaterEqual(limit, ASR.MIN_MEMORY_LIMIT_MB)
         self.assertLess(limit, ASR.DEFAULT_MEMORY_LIMIT_MB)
 
+    def test_memory_guardrail_survives_a_platform_without_rusage(self) -> None:
+        # `resource` is Unix-only. Importing this module used to fail outright
+        # on Windows; the guardrail must now degrade to psapi instead.
+        with mock.patch.object(ASR, "resource", None):
+            self.assertGreaterEqual(ASR.MlxResourceMonitor.peak_rss_mb(), 0.0)
+
     def test_mlx_memory_policy_caps_unified_memory_and_cache(self) -> None:
         calls: list[tuple[str, int]] = []
         fake_mx = types.SimpleNamespace(

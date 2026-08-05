@@ -119,50 +119,50 @@ async fn dshow_devices() -> AppResult<Vec<DshowDevice>> {
     )))
 }
 
-/// The `-f <backend> -i <device>` pair for the default microphone.
+/// The default microphone as an ffmpeg `-i` value.
 ///
-/// On Windows there is no positional "first device" syntax, so the device is
-/// enumerated. macOS and Linux name their default input directly.
+/// DirectShow has no positional "first device" syntax, so the device has to be
+/// enumerated before it can be named.
+#[cfg(windows)]
+async fn default_input_device() -> AppResult<String> {
+    let devices = dshow_devices().await?;
+    let device = devices.first().ok_or_else(|| {
+        crate::error::AppError::Schema(
+            "no DirectShow audio input device was found; check Settings → Privacy \
+             → Microphone and that a microphone is connected"
+                .into(),
+        )
+    })?;
+    Ok(device.input_argument())
+}
+
+/// The default microphone as an ffmpeg `-i` value. AVFoundation and PulseAudio
+/// both name their default input directly, so nothing has to be enumerated.
+#[cfg(not(windows))]
+async fn default_input_device() -> AppResult<String> {
+    Ok(if cfg!(target_os = "macos") {
+        ":0" // AVFoundation "no video, first audio device".
+    } else {
+        "default"
+    }
+    .to_string())
+}
+
+/// The `-f <backend> -i <device>` pair for the default microphone.
 pub async fn microphone_input() -> AppResult<Vec<String>> {
     let backend = std::env::var(ENV_AUDIO_BACKEND)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_backend().to_string());
 
-    if let Some(input) = std::env::var(ENV_AUDIO_INPUT)
+    let device = match std::env::var(ENV_AUDIO_INPUT)
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        return Ok(vec!["-f".into(), backend, "-i".into(), input]);
-    }
-
-    #[cfg(windows)]
-    {
-        let devices = dshow_devices().await?;
-        let device = devices.first().ok_or_else(|| {
-            crate::error::AppError::Schema(
-                "no DirectShow audio input device was found; check Settings → Privacy \
-                 → Microphone and that a microphone is connected"
-                    .into(),
-            )
-        })?;
-        return Ok(vec![
-            "-f".into(),
-            backend,
-            "-i".into(),
-            device.input_argument(),
-        ]);
-    }
-
-    #[cfg(not(windows))]
-    {
-        let device = if cfg!(target_os = "macos") {
-            ":0" // AVFoundation "no video, first audio device".
-        } else {
-            "default"
-        };
-        Ok(vec!["-f".into(), backend, "-i".into(), device.into()])
-    }
+        Some(input) => input,
+        None => default_input_device().await?,
+    };
+    Ok(vec!["-f".into(), backend, "-i".into(), device])
 }
 
 #[cfg(test)]
