@@ -1548,6 +1548,11 @@ mod tests {
     use super::*;
     use crate::data::{CutKind, MediaRef, Meta, Paragraph, Sentence, Word};
 
+    /// `LUMEN_CUT_VIDEO_ENCODER` is process-global state that encoder
+    /// selection reads. Tests that set it and tests that observe the default
+    /// must not interleave.
+    static ENCODER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn doc() -> Doc {
         Doc {
             id: "demo".into(),
@@ -2473,6 +2478,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
 
     #[test]
     fn export_mode_makes_the_speed_quality_tradeoff_explicit() {
+        let _guard = ENCODER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(encoder_for_mode(Some("quality")).unwrap(), "libx264");
         let fast = encoder_for_mode(Some("fast")).unwrap();
         if cfg!(target_os = "macos") {
@@ -2527,6 +2533,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
 
     #[test]
     fn encoder_override_rejects_names_the_arg_builder_cannot_handle() {
+        let _guard = ENCODER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("LUMEN_CUT_VIDEO_ENCODER");
         std::env::set_var("LUMEN_CUT_VIDEO_ENCODER", "h264_totally_made_up");
         let bogus = selected_encoder();
@@ -2542,6 +2549,7 @@ scale=w=960:h=540,pad=1920:1080:960:270:color=black[vbase];"
 
     #[test]
     fn professional_presets_select_the_expected_encoders_and_audio_codecs() {
+        let _guard = ENCODER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h264 = VideoExportSettings {
             encoding_speed: ExportEncodingSpeed::Quality,
             ..Default::default()

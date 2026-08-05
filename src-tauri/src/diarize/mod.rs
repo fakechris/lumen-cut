@@ -196,21 +196,21 @@ mod tests {
     /// stub is a batch file; `std::process::Command` routes those through
     /// `cmd.exe` for us.
     fn write_stub(dir: &Path, unix_body: &str, windows_body: &str) -> PathBuf {
-        if cfg!(windows) {
-            let path = dir.join("stub_python.bat");
-            std::fs::write(&path, windows_body).unwrap();
-            return path;
-        }
+        // Selecting with `cfg!` rather than `#[cfg]` keeps both bodies live on
+        // every target, so neither parameter reads as unused.
+        let (name, body) = if cfg!(windows) {
+            ("stub_python.bat", windows_body)
+        } else {
+            ("stub_python.sh", unix_body)
+        };
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let path = dir.join("stub_python.sh");
-            std::fs::write(&path, unix_body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
         }
-        #[cfg(not(unix))]
-        unreachable!("write_stub covers unix and windows")
+        path
     }
 
     #[tokio::test]
