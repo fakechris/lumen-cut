@@ -293,14 +293,32 @@ fn write_broll_video(out: &mut String, item: &FcpBroll<'_>, width: u32, height: 
     let _ = writeln!(out, "              </video>");
 }
 
+/// RFC 8089 `file:` URL for a media asset.
+///
+/// FCPXML is read by Resolve and Premiere on Windows as well as Final Cut on
+/// macOS, so the Windows shape has to be right: an empty authority, forward
+/// slashes, and a literal drive-letter colon — `file:///C:/Media/clip.mp4`.
+/// A Unix path already begins with `/`, so it passes through unchanged.
 fn file_url(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
+    let text = absolute.to_string_lossy().replace('\\', "/");
     let mut output = String::from("file://");
-    for byte in absolute.to_string_lossy().as_bytes() {
+    let bytes = text.as_bytes();
+    // `C:/…` has no leading slash of its own, and percent-encoding the colon
+    // makes editors treat the drive letter as a host name.
+    let rest = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        output.push('/');
+        output.push(bytes[0] as char);
+        output.push(':');
+        &text[2..]
+    } else {
+        &text[..]
+    };
+    for byte in rest.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'_' | b'.' | b'~') {
             output.push(*byte as char);
         } else {
@@ -356,12 +374,26 @@ mod tests {
     use chrono::Utc;
     use std::path::PathBuf;
 
+    /// An absolute media path on the host. `file_url` falls back to the
+    /// current directory for relative input, and a bare `/tmp/...` is not
+    /// absolute on Windows — it needs a drive letter.
+    fn media_path(name: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) { "C:/tmp/" } else { "/tmp/" }).join(name)
+    }
+
+    /// `file:` URL prefix matching [`media_path`].
+    const URL_ROOT: &str = if cfg!(windows) {
+        "file:///C:/tmp/"
+    } else {
+        "file:///tmp/"
+    };
+
     fn doc() -> Doc {
         Doc {
             id: "p".into(),
             schema: 1,
             media: MediaRef {
-                path: PathBuf::from("/tmp/x.mp4"),
+                path: media_path("x.mp4"),
                 duration_seconds: 2.0,
                 sample_rate: None,
                 channels: None,
@@ -432,7 +464,7 @@ mod tests {
     fn fcpxml_embeds_broll_as_editable_connected_video() {
         let placement = crate::data::broll::BrollPlacement {
             id: "br-1".into(),
-            file: PathBuf::from("/tmp/keyboard closeup & detail.png"),
+            file: media_path("keyboard closeup & detail.png"),
             start: 0.25,
             end: 0.75,
             mode: crate::data::broll::PlacementMode::Pip,
@@ -450,7 +482,9 @@ mod tests {
         };
         let xml = to_fcpxml_with_broll(&doc(), &[], &[placement], 1920, 1080);
         assert!(xml.contains("<asset id=\"r2\""));
-        assert!(xml.contains("src=\"file:///tmp/keyboard%20closeup%20%26%20detail.png\""));
+        assert!(xml.contains(&format!(
+            "src=\"{URL_ROOT}keyboard%20closeup%20%26%20detail.png\""
+        )));
         assert!(xml.contains(
             "<video ref=\"r2\" lane=\"1\" offset=\"0.250s\" start=\"1.500s\" duration=\"0.500s\""
         ));
@@ -472,7 +506,7 @@ mod tests {
         };
         let xml = to_fcpxml_with_broll(&doc(), &[cut], &[], 1920, 1080);
         assert!(xml.contains("<asset id=\"rMain\""));
-        assert!(xml.contains("src=\"file:///tmp/x.mp4\""));
+        assert!(xml.contains(&format!("src=\"{URL_ROOT}x.mp4\"")));
         assert!(xml.contains("<spine lane=\"0\" offset=\"0s\">"));
         assert!(xml.contains(
             "<asset-clip ref=\"rMain\" offset=\"0.000s\" start=\"0.500s\" duration=\"1.500s\""

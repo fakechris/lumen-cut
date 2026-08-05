@@ -482,9 +482,11 @@ mod tests {
             ..Default::default()
         };
         let output = to_ass_with_style(&fixture(), &[], &style, 1920, 1080);
-        // Serif preset exports as Songti SC — present on every macOS install,
-        // unlike Noto Serif SC which fontconfig silently fell back from.
-        assert!(output.contains("Style: Default,Songti SC,52,&H004C9DB8,"));
+        // The serif preset must name a face the host actually ships, or
+        // libass silently substitutes: Songti SC on macOS (unlike Noto Serif
+        // SC, which fontconfig fell back from), SimSun on Windows.
+        let serif = if cfg!(windows) { "SimSun" } else { "Songti SC" };
+        assert!(output.contains(&format!("Style: Default,{serif},52,&H004C9DB8,")));
     }
 
     #[test]
