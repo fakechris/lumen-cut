@@ -101,6 +101,7 @@ import {
   TranscriptIcon,
 } from "../components/Icons";
 import type { Lang } from "../i18n";
+import { shortcutLabel } from "../platform";
 import type {
   Doc,
   AsrStatus,
@@ -3389,8 +3390,8 @@ export function TranscriptView({
               <h2>{lang === "zh" ? "编辑提示" : "Editing tip"}</h2>
               <p>
                 {lang === "zh"
-                  ? "点词去掉画面，点划线词恢复；改文字后按 ⌘↵ 保存。批量操作可一次撤销。"
-                  : "Click a word to cut its media, or a struck-through word to restore it; press ⌘↵ to save text edits. Batch cuts undo as one step."}
+                  ? `点词去掉画面，点划线词恢复；改文字后按 ${shortcutLabel("↵")} 保存。批量操作可一次撤销。`
+                  : `Click a word to cut its media, or a struck-through word to restore it; press ${shortcutLabel("↵")} to save text edits. Batch cuts undo as one step.`}
               </p>
             </section>
           </aside>

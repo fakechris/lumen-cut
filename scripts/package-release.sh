@@ -10,7 +10,8 @@ OUTPUT_DIR="${1:-$ROOT_DIR/build}"
 VERSION="$(node -p "require('$ROOT_DIR/package.json').version")"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Release packaging currently supports macOS only." >&2
+  echo "This script packages the macOS release." >&2
+  echo "On Windows run scripts/windows/collect-release-asset.ps1 instead." >&2
   exit 1
 fi
 

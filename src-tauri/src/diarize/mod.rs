@@ -191,12 +191,25 @@ mod tests {
         std::env::remove_var("LUMEN_CUT_DIARIZE_SCRIPT");
     }
 
-    /// A stand-in for the python interpreter: runs `body`, ignoring args.
-    fn write_stub(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("stub_python.sh");
+    /// A stand-in for the python interpreter: runs the platform's script,
+    /// ignoring args. Windows has no execute bit and no `#!` support, so the
+    /// stub is a batch file; `std::process::Command` routes those through
+    /// `cmd.exe` for us.
+    fn write_stub(dir: &Path, unix_body: &str, windows_body: &str) -> PathBuf {
+        // Selecting with `cfg!` rather than `#[cfg]` keeps both bodies live on
+        // every target, so neither parameter reads as unused.
+        let (name, body) = if cfg!(windows) {
+            ("stub_python.bat", windows_body)
+        } else {
+            ("stub_python.sh", unix_body)
+        };
+        let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         path
     }
 
@@ -208,6 +221,7 @@ mod tests {
         let stub = write_stub(
             tmp.path(),
             "#!/bin/sh\nprintf '%s' '{\"schema_version\":1,\"segments\":[{\"speaker\":\"SPEAKER_00\",\"start\":0.0,\"end\":1.5},{\"speaker\":\"SPEAKER_01\",\"start\":1.5,\"end\":3.0}]}'\n",
+            "@echo off\r\necho {\"schema_version\":1,\"segments\":[{\"speaker\":\"SPEAKER_00\",\"start\":0.0,\"end\":1.5},{\"speaker\":\"SPEAKER_01\",\"start\":1.5,\"end\":3.0}]}\r\n",
         );
         std::env::set_var("LUMEN_CUT_PYTHON", &stub);
         std::env::set_var("LUMEN_CUT_DIARIZE_SCRIPT", &stub);
@@ -260,6 +274,7 @@ mod tests {
         let stub = write_stub(
             tmp.path(),
             "#!/bin/sh\necho 'lumen_cut_diarize: requires a HuggingFace token' >&2\nexit 2\n",
+            "@echo off\r\necho lumen_cut_diarize: requires a HuggingFace token 1>&2\r\nexit /b 2\r\n",
         );
         std::env::set_var("LUMEN_CUT_PYTHON", &stub);
         std::env::set_var("LUMEN_CUT_DIARIZE_SCRIPT", &stub);
@@ -288,7 +303,11 @@ mod tests {
         let _env = lock_env().await;
         clear_env();
         let tmp = tempfile::tempdir().unwrap();
-        let stub = write_stub(tmp.path(), "#!/bin/sh\necho 'not json'\n");
+        let stub = write_stub(
+            tmp.path(),
+            "#!/bin/sh\necho 'not json'\n",
+            "@echo off\r\necho not json\r\n",
+        );
         std::env::set_var("LUMEN_CUT_PYTHON", &stub);
         std::env::set_var("LUMEN_CUT_DIARIZE_SCRIPT", &stub);
         let err = diarize_file(Path::new("x.wav")).await.unwrap_err();

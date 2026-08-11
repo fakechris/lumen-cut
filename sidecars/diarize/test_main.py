@@ -58,6 +58,12 @@ class DiarizeProgressTests(unittest.TestCase):
         self.assertGreaterEqual(limit, DIARIZE.MIN_MEMORY_LIMIT_MB)
         self.assertLess(limit, DIARIZE.DEFAULT_MEMORY_LIMIT_MB)
 
+    def test_memory_guardrail_survives_a_platform_without_rusage(self) -> None:
+        # `resource` is Unix-only. Importing this module used to fail outright
+        # on Windows; the guardrail must now degrade to psapi instead.
+        with mock.patch.object(DIARIZE, "resource", None):
+            self.assertGreaterEqual(DIARIZE.ResourceMonitor.peak_memory_mb(), 0.0)
+
     def test_progress_normalizes_numpy_style_integer_counters(self) -> None:
         class IntLike:
             def __init__(self, value: int) -> None:

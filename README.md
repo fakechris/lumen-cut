@@ -64,20 +64,32 @@ lumen-cut-cli project open talk --root ./projects
 
 ## Requirements
 
-- macOS 14 or newer on Apple silicon
+- macOS 14 or newer on Apple silicon, or Windows 10/11 x64
 - `ffmpeg` and `ffprobe` on `PATH`
 - [`uv`](https://docs.astral.sh/uv/) for the one-click local transcription setup
 - `yt-dlp` when importing media URLs
 
-The app creates an isolated Python 3.12 runtime under `~/.lumen-cut/runtime`
-and downloads selected model files into the Hugging Face cache. Neither is
-stored in this repository. Qwen3-ASR weights already installed by another
-Lumen app (for example lumen-asr's
+The app creates an isolated Python 3.12 runtime under its state directory
+(`~/.lumen-cut/runtime` on macOS, `%LOCALAPPDATA%\lumen-cut\runtime` on
+Windows) and downloads selected model files into the Hugging Face cache.
+Neither is stored in this repository. Qwen3-ASR weights already installed by
+another Lumen app (for example lumen-asr's
 `~/Library/Application Support/LumenAsr/models` directory or an existing
 Hugging Face cache snapshot) are discovered through the shared
 [`lumen-models`](https://github.com/fakechris/lumen-suite) crate and reused
 instead of being downloaded again. Node.js 20+ and Rust stable are development-only
 requirements.
+
+### Windows notes
+
+Local transcription runs on Apple MLX and is macOS-only. On Windows, choose
+the OpenAI-compatible engine under **Settings → Speech & models**; every other
+part of the pipeline — cutting, captions, translation, B-roll, export — runs
+natively. Hardware video encoding uses NVENC, Quick Sync or AMF when the
+machine has a supporting GPU and falls back to `libx264` otherwise. Installers
+are currently unsigned, so SmartScreen shows a warning on first run. See
+[docs/WINDOWS_PORT_STATUS.md](docs/WINDOWS_PORT_STATUS.md) for the full state
+of the port.
 
 ## Development
 

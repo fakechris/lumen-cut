@@ -429,6 +429,69 @@ fn export_srt_flag_writes_only_selected_output_path() {
 }
 
 #[test]
+fn video_output_never_reuses_the_internal_ass_sidecar_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let media = temp.path().join("input.mp4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24",
+            "-t",
+            "0.2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&media)
+        .status()
+        .expect("ffmpeg is a required runtime dependency");
+    assert!(generated.success(), "failed to generate test video");
+
+    std::fs::write(
+        temp.path().join("doc.json"),
+        format!(
+            r#"{{
+              "id":"demo","schema":1,
+              "media":{{"path":{},"durationSeconds":0.2,"sampleRate":null,"channels":null}},
+              "meta":{{"title":"demo","description":"","language":"en",
+                "createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}},
+              "paragraphs":[],"translations":{{}}
+            }}"#,
+            serde_json::to_string(&media).unwrap()
+        ),
+    )
+    .expect("write doc");
+
+    let video = temp.path().join("rendered.mp4");
+    let output = cli()
+        .args(["--json", "export"])
+        .arg(temp.path())
+        .args(["--video", "-o"])
+        .arg(&video)
+        .env("LUMEN_CUT_VIDEO_ENCODER", "libx264")
+        .output()
+        .expect("export video");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("export json");
+    assert_eq!(value["artifacts"]["video"], serde_json::json!(video));
+    assert_ne!(
+        value["artifacts"]["ass"], value["artifacts"]["video"],
+        "the burn-in sidecar and output video must have distinct paths"
+    );
+    assert!(video.metadata().unwrap().len() > 0);
+}
+
+#[test]
 fn speakers_view_renders_png_without_mutating_labels() {
     let temp = tempfile::tempdir().expect("tempdir");
     let wav = temp.path().join("audio.wav");

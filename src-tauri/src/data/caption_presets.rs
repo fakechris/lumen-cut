@@ -253,13 +253,19 @@ pub fn caption_preset(id: &str) -> Option<&'static CaptionPreset> {
     CAPTION_PRESETS.iter().find(|p| p.id == id)
 }
 
-/// ASS fontname for a preset font. These must resolve under libass/fontconfig
-/// at export time, so they name fonts every macOS install ships (the app is
-/// Mac-only): serif matches the preview's Songti SC exactly; mono takes Menlo
-/// because the preview's bundled IBM Plex Mono ships only as woff2, which
-/// freetype/fontconfig cannot load.
+/// ASS fontname for a preset font. These must resolve under libass at export
+/// time, so each platform names fonts its own installs always ship: the
+/// preview's bundled IBM Plex Mono is woff2-only, which freetype cannot load,
+/// so mono maps to a system monospace face instead.
+///
+/// * macOS — Songti SC matches the preview exactly; Menlo for mono.
+/// * Windows — SimSun is the equivalent always-present CJK serif; Consolas
+///   for mono. Neither Songti SC nor Menlo exists there, and libass silently
+///   falls back to an arbitrary face when a name does not resolve.
 pub fn preset_fontname(preset: &CaptionPreset) -> Option<&'static str> {
     match preset.font {
+        Some(PresetFont::Serif) if cfg!(windows) => Some("SimSun"),
+        Some(PresetFont::Mono) if cfg!(windows) => Some("Consolas"),
         Some(PresetFont::Serif) => Some("Songti SC"),
         Some(PresetFont::Mono) => Some("Menlo"),
         None => None,

@@ -16,7 +16,7 @@ use crate::agent::allocate::Allocator;
 use crate::agent::bridge::{AgentBridge, BridgeCall, BridgeConfig, Provider};
 use crate::agent::PendingCall;
 
-/// Load the LLM bridge config from `~/.lumen-cut/settings.json` (written by
+/// Load the LLM bridge config from the platform settings file (written by
 /// `settings_export`). Returns `None` when the endpoint is missing/empty,
 /// in which case the caller skips spawning built-in workers.
 pub fn load_bridge_config() -> Option<BridgeConfig> {
@@ -251,27 +251,28 @@ mod tests {
     fn load_bridge_config_none_when_endpoint_missing() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", dir.path());
-        assert!(load_bridge_config().is_none());
-        std::env::remove_var("HOME");
+        std::env::set_var(crate::paths::ENV_STATE_DIR, dir.path());
+        let config = load_bridge_config();
+        std::env::remove_var(crate::paths::ENV_STATE_DIR);
+        assert!(config.is_none());
     }
 
     #[test]
     fn load_bridge_config_parses_settings() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".lumen-cut")).unwrap();
         std::fs::write(
-            dir.path().join(".lumen-cut/settings.json"),
+            dir.path().join("settings.json"),
             r#"{"llmEndpoint":"https://api.x.com","llmApiKey":"k","llmModel":"m","workerCount":2}"#,
         )
         .unwrap();
-        std::env::set_var("HOME", dir.path());
-        let cfg = load_bridge_config().unwrap();
+        std::env::set_var(crate::paths::ENV_STATE_DIR, dir.path());
+        let cfg = load_bridge_config();
+        std::env::remove_var(crate::paths::ENV_STATE_DIR);
+        let cfg = cfg.unwrap();
         assert_eq!(cfg.endpoint, "https://api.x.com");
         assert_eq!(cfg.model, "m");
         assert_eq!(cfg.api_key.as_deref(), Some("k"));
-        std::env::remove_var("HOME");
     }
 
     #[test]

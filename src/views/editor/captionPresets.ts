@@ -8,6 +8,7 @@
  */
 import type { CSSProperties } from "react";
 import type { Lang } from "../../i18n";
+import { isWindows } from "../../platform";
 import type { SubtitleStyle } from "../../types";
 import {
   CAPTION_PRESETS,
@@ -60,21 +61,27 @@ export function captionPresetsForMode(mode: CaptionMode): CaptionPreset[] {
 }
 
 /** Preset font → CSS font-family. IBM Plex Mono ships with the app; serif
- *  falls back to the platform serif (no serif webfont is bundled). */
+ *  falls back to the platform serif (no serif webfont is bundled). The
+ *  Windows list leads with SimSun so the WYSIWYG canvas burn-in matches what
+ *  libass will draw for the same preset. */
 export function captionPresetFontFamily(preset: CaptionPreset): string | undefined {
-  if (preset.font === "serif") return `"Songti SC","Noto Serif SC",serif`;
+  if (preset.font === "serif") {
+    return isWindows()
+      ? `"SimSun","Noto Serif SC",serif`
+      : `"Songti SC","Noto Serif SC",serif`;
+  }
   if (preset.font === "mono") return `"IBM Plex Mono",ui-monospace,monospace`;
   return undefined;
 }
 
-/** ASS fontname for export. Must resolve under libass/fontconfig, so these
- *  are fonts every macOS install ships: serif matches the preview (Songti SC);
- *  mono is Menlo — the preview's bundled IBM Plex Mono is woff2-only, which
- *  freetype/fontconfig cannot load. Keep in sync with preset_fontname in
- *  src-tauri/src/data/caption_presets.rs. */
+/** ASS fontname for export. Must resolve under libass, so these name fonts
+ *  the host platform always ships: serif matches the preview (Songti SC on
+ *  macOS, SimSun on Windows); mono is Menlo/Consolas — the preview's bundled
+ *  IBM Plex Mono is woff2-only, which freetype cannot load. Keep in sync with
+ *  preset_fontname in src-tauri/src/data/caption_presets.rs. */
 export function captionPresetAssFont(preset: CaptionPreset): string | undefined {
-  if (preset.font === "serif") return "Songti SC";
-  if (preset.font === "mono") return "Menlo";
+  if (preset.font === "serif") return isWindows() ? "SimSun" : "Songti SC";
+  if (preset.font === "mono") return isWindows() ? "Consolas" : "Menlo";
   return undefined;
 }
 

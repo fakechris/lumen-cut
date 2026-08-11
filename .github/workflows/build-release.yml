@@ -181,20 +181,122 @@ jobs:
           path: build/*
           if-no-files-found: error
 
+  build-windows-x64:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run frontend tests
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Test Python sidecars
+        run: python -m unittest sidecars/asr/test_main.py sidecars/diarize/test_main.py
+
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [[ "$GITHUB_REF_NAME" != "$expected" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $expected" >&2
+            exit 1
+          fi
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Install native test dependencies
+        shell: pwsh
+        run: |
+          # The subtitle burn-in tests need an ffmpeg built with libass.
+          choco install ffmpeg-full --no-progress --yes
+          $filters = & ffmpeg -hide_banner -filters 2>&1 | Out-String
+          if ($filters -notmatch '(^|\s)ass(\s|$)') {
+            throw 'The installed ffmpeg has no ass filter; subtitle burn-in cannot be tested.'
+          }
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+
+      - name: Build unsigned NSIS installer
+        run: pnpm build:desktop:windows
+
+      - name: Collect release assets
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          ./scripts/windows/collect-release-asset.ps1 `
+            -BundleDirectory src-tauri/target/release/bundle `
+            -ReleaseDirectory src-tauri/target/release `
+            -Version $version `
+            -OutputDirectory build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: lumen-cut-windows-x64-${{ github.sha }}
+          path: build/*
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-macos-arm64
+    needs:
+      - build-macos-arm64
+      - build-windows-x64
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download build artifacts
+      - name: Download macOS build artifacts
         uses: actions/download-artifact@v8
         with:
           name: lumen-cut-macos-arm64-${{ github.sha }}
-          path: release-assets
+          path: platform-assets/macos
+
+      - name: Download Windows build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: lumen-cut-windows-x64-${{ github.sha }}
+          path: platform-assets/windows
+
+      - name: Merge assets and regenerate checksums
+        shell: bash
+        run: |
+          # Each platform ships its own SHA256SUMS.txt, which would collide in
+          # a shared directory. Drop them and publish one list covering
+          # everything the release actually contains.
+          mkdir -p release-assets
+          find platform-assets -type f ! -name 'SHA256SUMS.txt' \
+            -exec cp {} release-assets/ \;
+          cd release-assets
+          sha256sum lumen-cut* > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
 
       - name: Publish release
         env:

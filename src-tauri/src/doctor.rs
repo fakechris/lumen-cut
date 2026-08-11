@@ -1,21 +1,43 @@
 //! Shared environment probes for the CLI and GUI.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
 
-/// Finder-launched macOS apps receive `/usr/bin:/bin:…`, not the interactive
-/// shell PATH. Add the standard user and Homebrew locations once at startup.
+use crate::paths;
+
+/// Directories prepended to `PATH` so a GUI launch finds the same tools an
+/// interactive shell does. Pure so the platform choice stays testable.
+fn tool_search_paths() -> Vec<PathBuf> {
+    let home = paths::home_dir();
+    let runtime = paths::managed_runtime_dir();
+    if cfg!(windows) {
+        // Explorer-launched apps inherit the machine PATH, which usually
+        // predates a per-user winget/scoop install of ffmpeg or Python.
+        let mut candidates = vec![runtime.join("Scripts")];
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            candidates.push(local.join("Microsoft").join("WindowsApps"));
+            candidates.push(local.join("Programs").join("Python").join("Launcher"));
+        }
+        candidates.push(home.join("scoop").join("shims"));
+        candidates
+    } else {
+        // Finder-launched macOS apps receive `/usr/bin:/bin:…`, not the
+        // interactive shell PATH.
+        vec![
+            runtime.join("bin"),
+            home.join(".local/bin"),
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ]
+    }
+}
+
+/// Normalize `PATH` once at startup, before any ffmpeg/Python health check.
 pub fn configure_process_path() {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    let mut paths = vec![
-        home.join(".lumen-cut/runtime/bin"),
-        home.join(".local/bin"),
-        std::path::PathBuf::from("/opt/homebrew/bin"),
-        std::path::PathBuf::from("/usr/local/bin"),
-    ];
+    let mut paths = tool_search_paths();
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
@@ -23,6 +45,30 @@ pub fn configure_process_path() {
     if let Ok(joined) = std::env::join_paths(paths) {
         std::env::set_var("PATH", joined);
     }
+}
+
+/// Windows `CREATE_NO_WINDOW`: probes must not flash a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A `Command` that never blocks on stdin and, on Windows, never flashes a
+/// console window. Every synchronous probe in the app builds on this.
+pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// [`quiet_command`] with output discarded — for "does this exist" probes.
+fn silent_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = quiet_command(program);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    command
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,13 +87,30 @@ pub fn probe_args(command: &str) -> &'static [&'static str] {
 }
 
 pub fn command_available(command: &str) -> bool {
-    Command::new(command)
+    silent_command(command)
         .args(probe_args(command))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// Interpreter names to probe for a usable CPython, most specific first.
+/// Windows installers register `python` and the `py` launcher; `python3` is
+/// only a Microsoft Store alias that opens the Store when unresolved.
+pub fn python_commands() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python", "py"]
+    } else {
+        &["python3"]
+    }
+}
+
+/// The first interpreter from [`python_commands`] that answers its probe.
+pub fn python_command() -> Option<&'static str> {
+    python_commands()
+        .iter()
+        .copied()
+        .find(|command| command_available(command))
 }
 
 /// Prefer the current Hugging Face Hub CLI (`hf`); accept the legacy
@@ -64,7 +127,6 @@ pub fn checks() -> Vec<Check> {
         ("ffmpeg", "ffmpeg"),
         ("ffprobe", "ffprobe"),
         ("yt-dlp", "yt-dlp"),
-        ("python3", "python3"),
     ] {
         let ok = command_available(command);
         output.push(Check {
@@ -77,6 +139,16 @@ pub fn checks() -> Vec<Check> {
             },
         });
     }
+    // The check keeps the `python3` name across platforms so the diagnostics
+    // UI and its tests stay stable; the detail names the executable found.
+    let python = python_command();
+    output.push(Check {
+        name: "python3".into(),
+        ok: python.is_some(),
+        detail: python
+            .map(|command| format!("available via `{command}`"))
+            .unwrap_or_else(|| "unavailable or failed its probe".into()),
+    });
     let hub_cli = huggingface_cli();
     output.push(Check {
         name: "hf".into(),
@@ -117,9 +189,7 @@ pub fn checks() -> Vec<Check> {
             "unset (gated models need it)".into()
         },
     });
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
+    let home = paths::home_dir();
     for (name, model) in [
         ("Qwen3-ASR", config.asr_model.as_str()),
         ("ForcedAligner", config.asr_aligner.as_str()),
@@ -167,6 +237,39 @@ mod tests {
         assert_eq!(probe_args("hf"), ["--help"]);
         assert_eq!(probe_args("huggingface-cli"), ["--help"]);
         assert_eq!(probe_args("python3"), ["--version"]);
+        assert_eq!(probe_args("python"), ["--version"]);
+        assert_eq!(probe_args("py"), ["--version"]);
+    }
+
+    #[test]
+    fn python_probe_skips_the_windows_store_alias() {
+        // `python3` on Windows is a Store stub that opens the Store rather
+        // than running an interpreter, so it must never be probed there.
+        if cfg!(windows) {
+            assert_eq!(python_commands(), ["python", "py"]);
+        } else {
+            assert_eq!(python_commands(), ["python3"]);
+        }
+    }
+
+    #[test]
+    fn path_seeds_target_this_platforms_user_tool_locations() {
+        let seeds = tool_search_paths();
+        assert!(!seeds.is_empty());
+        let joined = seeds
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("|");
+        if cfg!(windows) {
+            assert!(joined.contains("Scripts"));
+            assert!(!joined.contains("homebrew"));
+        } else {
+            assert!(joined.contains("/opt/homebrew/bin"));
+        }
+        // The managed virtualenv must be searched before anything the system
+        // installed, so an app-managed runtime wins over a stale global one.
+        assert!(seeds[0].starts_with(paths::managed_runtime_dir()));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isWindows } from "../../platform";
 import {
   CAPTION_PRESETS,
   getCaptionPreset,
@@ -112,12 +113,16 @@ describe("captionPresetLineCss (preset → CSS)", () => {
   });
 
   it("maps italic and fonts", () => {
+    // The serif and mono faces are platform-specific: they must name a font
+    // the host actually ships, or libass silently substitutes at export.
+    const serif = isWindows() ? "SimSun" : "Songti SC";
+    const mono = isWindows() ? "Consolas" : "Menlo";
     expect(captionPresetLineCss(getCaptionPreset("ln-white")).fontStyle).toBe("italic");
-    expect(captionPresetFontFamily(getCaptionPreset("ln-navy"))).toContain("Songti SC");
+    expect(captionPresetFontFamily(getCaptionPreset("ln-navy"))).toContain(serif);
     expect(captionPresetFontFamily(getCaptionPreset("ln-red"))).toContain("IBM Plex Mono");
     expect(captionPresetFontFamily(getCaptionPreset("ln-clean"))).toBeUndefined();
-    expect(captionPresetAssFont(getCaptionPreset("em-gold-serif"))).toBe("Songti SC");
-    expect(captionPresetAssFont(getCaptionPreset("ln-red"))).toBe("Menlo");
+    expect(captionPresetAssFont(getCaptionPreset("em-gold-serif"))).toBe(serif);
+    expect(captionPresetAssFont(getCaptionPreset("ln-red"))).toBe(mono);
     expect(captionPresetAssFont(getCaptionPreset("ln-clean"))).toBeUndefined();
   });
 });
