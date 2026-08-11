@@ -94,6 +94,9 @@ build and run on Windows 10/11 x64.
 
 - `src-tauri/tauri.windows.conf.json` selects the NSIS bundle, a per-user
   install (no elevation), and the WebView2 download bootstrapper.
+- The Windows product name is `Lumen Cut`, so the per-user installer lives in
+  `%LOCALAPPDATA%\Lumen Cut` instead of colliding with the application state
+  and default projects under `%LOCALAPPDATA%\lumen-cut`.
 - `src-tauri/tauri.conf.json` now lists `icon.ico` and the PNG icon set, not
   only `icon.icns`.
 - `scripts/windows/collect-release-asset.ps1` is the Windows counterpart of
@@ -140,27 +143,41 @@ gate the macOS job runs:
 macOS 14 on Apple silicon passes the same set, so the port did not cost the
 existing platform anything.
 
-### Still needs real Windows hardware
+### Passing on real Windows 11 hardware
+
+The release build and NSIS package were also exercised on an Intel Windows 11
+x64 workstation:
+
+- the installer completed as a current-user install, included both Python
+  sidecars, and the installed desktop executable opened a responsive window
+- a real DirectShow microphone with a non-English friendly name was enumerated
+  through its ASCII device moniker and recorded a two-second 16 kHz mono WAV
+- an imported H.264/AAC sample exported to a valid two-second H.264/AAC MP4;
+  the encoder probe selected and successfully used Intel Quick Sync (`h264_qsv`)
+- frontend tests (163), Python sidecar tests (16), Rust tests (514), the
+  production frontend build, release Rust binaries and NSIS packaging passed
+
+The end-to-end export found and fixed a CLI-only path collision where an
+explicit MP4 output was incorrectly reused for the internal ASS subtitle
+sidecar. A regression test now renders a real video and asserts that the two
+artifact paths remain distinct.
+
+### Still needs broader Windows coverage
 
 CI runs headless on a GPU-less VM, so these cannot be proven there:
 
-1. **Hardware encoder selection.** CI has no NVIDIA/Intel/AMD GPU, so the
-   probe always falls through to `libx264`. The nvenc/qsv/amf argument
-   builders are unit-tested but have never produced a real file. Check the
-   export logs on a machine with each vendor's GPU.
-2. **Microphone capture.** No DirectShow audio device exists on the runner,
-   so `dshow_devices()` has never parsed real `-list_devices` output. Verify
-   against a built-in mic, a USB interface and a Bluetooth headset, and with a
-   non-English device name (the moniker path exists for exactly that case).
-3. **Installer behaviour.** SmartScreen warnings, the per-user install
-   location, the WebView2 bootstrapper on a machine without WebView2, and
-   uninstall.
+1. **Other hardware encoders.** Intel Quick Sync has produced a real file;
+   NVIDIA NVENC and AMD AMF still need equivalent hardware checks.
+2. **Other microphone classes.** The built-in non-English DirectShow device
+   passes; USB interfaces and Bluetooth headsets remain to be checked.
+3. **Installer variants.** The per-user install and launch pass. SmartScreen,
+   the WebView2 bootstrapper on a machine without WebView2, and uninstall with
+   the optional app-data checkbox still need dedicated checks.
 4. **Job-object teardown under load.** Cancelling a long export should leave
    no orphaned `ffmpeg.exe` in Task Manager.
 5. **Speaker diarization.** `pyannote.audio` + torch is CPU-portable in
    principle but has never been installed or run on Windows.
-6. End-to-end pass: import media, cloud transcription, word-level cutting,
-   caption preset rendering, subtitle export, video export,
-   reveal-in-Explorer, diagnostics panel.
+6. Remaining end-to-end features: cloud transcription, word-level cutting,
+   caption preset variants, reveal-in-Explorer, and the diagnostics panel.
 
 Record failures here until they are resolved.

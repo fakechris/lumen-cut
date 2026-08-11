@@ -3396,7 +3396,16 @@ async fn run_export_command(cmd: ExportCommand<'_>) -> AppResult<()> {
     let style = lumen_cut::data::substyle::SubStyle::load(&dir)?;
     let mut ass_path_for_video: Option<PathBuf> = None;
     if want_ass {
-        let path = resolve(&format!("{export_stem}.ass"), "ass");
+        // `--video -o output.mp4` selects one public artifact, but video
+        // export still needs an internal ASS sidecar for burn-in. Do not run
+        // that sidecar through `resolve`: for a single selected format it
+        // would resolve to the same `output.mp4` path and make ffmpeg read its
+        // output file as an ASS script.
+        let path = if cmd.video && !cmd.ass {
+            dir.join(format!("{export_stem}.ass"))
+        } else {
+            resolve(&format!("{export_stem}.ass"), "ass")
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

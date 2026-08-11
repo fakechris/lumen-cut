@@ -1,5 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Lumen Cut",
   "bundle": {
     "targets": ["nsis"],
     "windows": {

@@ -28,9 +28,16 @@ if ($Version -notmatch '^\d+\.\d+\.\d+') {
 }
 
 $bundle = (Resolve-Path -LiteralPath (Join-Path $BundleDirectory 'nsis')).Path
-$installers = @(Get-ChildItem -LiteralPath $bundle -File -Filter '*-setup.exe')
-if ($installers.Count -ne 1) {
-    throw "Expected exactly one NSIS installer in $bundle, found $($installers.Count)"
+$preferredInstaller = Join-Path $bundle "Lumen Cut_${Version}_x64-setup.exe"
+if (Test-Path -LiteralPath $preferredInstaller -PathType Leaf) {
+    $installer = Get-Item -LiteralPath $preferredInstaller
+}
+else {
+    $installers = @(Get-ChildItem -LiteralPath $bundle -File -Filter '*-setup.exe')
+    if ($installers.Count -ne 1) {
+        throw "Expected $preferredInstaller or exactly one NSIS installer in $bundle, found $($installers.Count)"
+    }
+    $installer = $installers[0]
 }
 
 $cli = Join-Path (Resolve-Path -LiteralPath $ReleaseDirectory).Path 'lumen-cut-cli.exe'
@@ -44,7 +51,7 @@ if (Test-Path -LiteralPath $OutputDirectory) {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
 $installerAsset = Join-Path $OutputDirectory "lumen-cut_${Version}_x64-setup.exe"
-Copy-Item -LiteralPath $installers[0].FullName -Destination $installerAsset -Force
+Copy-Item -LiteralPath $installer.FullName -Destination $installerAsset -Force
 
 # The CLI ships zipped so browsers do not flag a bare .exe download.
 $cliAsset = Join-Path $OutputDirectory "lumen-cut-cli_${Version}_x86_64-pc-windows-msvc.zip"
