@@ -1,8 +1,20 @@
 # lumen-cut
 
+[![Release](https://img.shields.io/github/v/release/fakechris/lumen-cut)](https://github.com/fakechris/lumen-cut/releases)
+[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%7C%20Windows%2010%2F11-blue)](#requirements)
+[![License: AGPL--3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
+
+[English](README.md) | [中文](README.zh.md)
+
 lumen-cut is an open-source desktop editor for turning spoken audio and video
 into editable transcripts, subtitles, translations, and finished exports.
 It is built with Rust, Tauri 2, React, and TypeScript.
+
+**Quick start**: grab the DMG or installer from
+[Releases](https://github.com/fakechris/lumen-cut/releases) (v0.3.1 is the
+latest), make sure `ffmpeg` / `ffprobe` are on `PATH`, then drop in a media
+file — local ASR models are set up one-click from Settings. Or drive the
+pipeline headless with the CLI below.
 
 ## Features
 
