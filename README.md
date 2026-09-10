@@ -61,7 +61,7 @@ lumen-cut-cli export ./projects/talk --srt --start 10 --end 90 -o clip.srt
 # Keep a claim/submit HTTP endpoint for external workers
 lumen-cut-cli task serve translate talk --lang zh --root ./projects --port 0
 # Workers: GET http://127.0.0.1:<port>/agent/next
-#          POST http://127.0.0.1:<port>/agent/submit  { "lease_id", "answer": { "text": "..." } }
+#          POST http://127.0.0.1:<port>/agent/submit  { "lease_id": "00000000-0000-0000-0000-000000000000", "answer": { "text": "..." } }
 
 # Speakers: assign / review proposal / apply
 lumen-cut-cli speakers ./projects/talk assign --speaker Host --paragraph 1
@@ -150,7 +150,8 @@ scripts/         Local release packaging helpers
 ```
 
 Project data is stored under
-`~/Library/Application Support/lumen-cut/Projects/<project-id>/`. Original media
+`~/Library/Application Support/lumen-cut/Projects/<project-id>/` (Windows:
+`%LOCALAPPDATA%\lumen-cut\Projects\<project-id>`). Original media
 files are referenced in place and are never deleted when a project is removed.
 
 ## AI configuration

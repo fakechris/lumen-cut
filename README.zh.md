@@ -16,7 +16,7 @@ lumen-cut 是一个开源桌面编辑器，把口播音频和视频变成可编�
 - 在设置中准备、选择并校验本地 Qwen3-ASR 与词级对齐模型。
 - 跟踪长转写进度，安全取消，中断后可重试。
 - 编辑、拆分、合并、隐藏、搜索、替换字幕条。
-- 识别、预览、指派、重命名、重识别、合并说话人，并附带带时间戳的媒体证据。
+- 识别、预览、指派、重命名、重识别、合并说话人，并附带时间戳的媒体证据。
 - 通过 OpenAI 兼容或 Anthropic API 做翻译、润色、标点修复、章节生成、B-roll 建议。
 - 管理 B-roll 建议与本地素材，并在剪辑中预览。
 - 在可拖动的媒体时间线上审阅和还原可逆的语音清理剪辑。
@@ -50,7 +50,7 @@ lumen-cut-cli export ./projects/talk --srt --start 10 --end 90 -o clip.srt
 # 保留 claim/submit HTTP 端点给外部 worker
 lumen-cut-cli task serve translate talk --lang zh --root ./projects --port 0
 # Worker：GET http://127.0.0.1:<port>/agent/next
-#         POST http://127.0.0.1:<port>/agent/submit  { "lease_id", "answer": { "text": "..." } }
+#         POST http://127.0.0.1:<port>/agent/submit  { "lease_id": "00000000-0000-0000-0000-000000000000", "answer": { "text": "..." } }
 
 # 说话人：指派 / 审阅提案 / 应用
 lumen-cut-cli speakers ./projects/talk assign --speaker Host --paragraph 1
@@ -111,7 +111,7 @@ task-specs/      后台 AI 任务的 JSON 响应规范
 scripts/         本地发布打包助手
 ```
 
-项目数据存放在 `~/Library/Application Support/lumen-cut/Projects/<project-id>/`。原始媒体文件原地引用，删除项目时永不删除。
+项目数据存放在 `~/Library/Application Support/lumen-cut/Projects/<project-id>/`（Windows：`%LOCALAPPDATA%\lumen-cut\Projects\<project-id>`）。原始媒体文件原地引用，删除项目时永不删除。
 
 ## AI 配置
 
